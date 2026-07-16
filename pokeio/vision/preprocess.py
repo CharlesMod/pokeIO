@@ -103,8 +103,33 @@ class ObsBuilder:
 
         <=`shades` distinct values -> rank map onto evenly spaced levels
         (4 shades -> {0, 1/3, 2/3, 1}); otherwise fall back to /255.
+
+        The ranking is per-frame (n distinct present -> k/(n-1)), so a static
+        palette LUT cannot reproduce it. Instead of ``np.unique`` (a full
+        O(n log n) sort every frame) we detect the present values with an O(n)
+        ``bincount`` presence histogram and build a 256-entry byte->level LUT
+        from the *same* ``levels`` array the old code used, so the output is
+        bit-for-bit identical while avoiding the sort.
         """
         g = np.asarray(screen_gray)
+        if g.dtype == np.uint8:
+            # Presence histogram over the 256 possible byte values (counting
+            # sort, no comparison sort). present[v] == True iff v occurs in g.
+            present = np.bincount(g.ravel(), minlength=256) > 0
+            n = int(present.sum())
+            if 1 < n <= self.shades:
+                # rank (0-based) of a present value v == (#present values <= v) - 1.
+                ranks = np.cumsum(present) - 1  # length 256; valid for present v
+                # Identical construction to the old searchsorted path.
+                levels = (np.arange(n, dtype=np.float32) / (n - 1)).astype(np.float32)
+                lut = levels[np.clip(ranks, 0, n - 1)]  # byte -> normalized level
+                return lut[g]
+            if n == 1:
+                # A single flat shade is ambiguous; treat it as darkest.
+                return np.zeros(g.shape, dtype=np.float32)
+            return g.astype(np.float32) / 255.0
+
+        # Generic fallback for non-uint8 inputs (e.g. a GBC/color buffer).
         uniq = np.unique(g)
         n = uniq.size
         if 1 < n <= self.shades:
