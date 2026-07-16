@@ -103,6 +103,11 @@ determinism holds, GLM answers on card 0 with card 1 free, telemetry schema froz
 - [ ] `emu/env.py`: gym-like `reset(from_state)` / `step(action)`; frame-skip ≈ 24 ticks, button held
       ~8 frames, `render=False` during skip.
 - [ ] Action space `Discrete(8)`: ↑ ↓ ← → A B START SELECT (SELECT/START pruneable later).
+- [ ] **Action abstraction for the console ladder** (build the seam now, even if unused at fs=1 GB): a
+      pluggable action head so the output layer can grow discrete-8 → more buttons → **continuous/analog
+      (stick X/Y) + camera** without a rewrite. Action space is the biggest genuine change going up the
+      ladder — drive env action-application and the evo output-node count from an action-spec, not a
+      hardcoded 8. (See console-ladder §.)
 - [ ] RAM feature extractor (generic byte reads → normalized vector; addresses come from manifest later,
       raw-dump mode for the miner now).
 
@@ -182,16 +187,28 @@ finalized and documented; states seed/restore correctly.
 
 ### Lane B — ES-HyperNEAT (the real vision encoder)
 - [ ] `evo/cppn.py`: CPPN genome (the visible genotype), evolved by NEAT.
+- [ ] **Canonical CPPN inputs — NO egocentric priors.** Query `CPPN(x1,y1, x2,y2, bias)` on the SOURCE
+      and TARGET substrate coordinates of each connection. Do NOT feed hand-picked `center dist` / radial
+      `r` / `phase` — those are 2D-egocentric priors that won't transfer up the ladder (see console-ladder
+      §). Let evolution DISCOVER radial/symmetry structure via gauss/sin nodes only where a game rewards it.
+      (Replaces the demo CPPN's toy single-point inputs; update the dashboard labels when this lands.)
 - [ ] `evo/substrate.py`: substrate layout — input sheet = screen grid (matches obs geometry), hidden
       sheet(s), output = 8 buttons; **RAM aux inputs as a distinct coordinate region**.
 - [ ] Query CPPN → phenotype weights (batched); convolution-like receptive fields should emerge.
 - [ ] **ES-HyperNEAT:** evolve hidden-node placement (density adapts to information).
 - [ ] Verify a CPPN can express spatial features (sanity task: detect sprite / respond to motion).
 
-### Lane C — parallel autoencoder retina (non-NEAT competitor)
+### Lane C — learned-encoder retina (non-NEAT competitor + THE 3D / console-ladder path)
+*Makes zero geometric assumptions about the world → the forward-compatible lane. Going up the ladder we
+shift weight from Lane B (2D-geometric) toward this one; we don't rebuild the architecture.*
 - [ ] `evo/retina.py`: self-supervised autoencoder trained by gradient on the game's own frames
       (no external data) → compact features → evolved controller on top (ERL-Re² pattern).
+- [ ] **3D-from-2D readiness:** feed the encoder temporal input (motion channel + short frame history)
+      and give the controller evolved recurrence, so depth/perspective is inferred from motion — the
+      mechanism that carries us to Mode-7 GBA and N64 with NO substrate change.
 - [ ] Shares the exploration archive with Lanes A/B; the lanes **race** on the same telemetry.
+- [ ] **Milestone:** validate Lane C on a pseudo-3D / perspective game (a Mode-7 GBA title) BEFORE N64,
+      to prove the "2D substrate + temporal inference" thesis on a real 3D-ish world.
 
 ### Novelty backbone (fitness that works day one)
 - [ ] Behavior characterization = set of visited screen-hash / RAM-state cells.
@@ -333,6 +350,23 @@ rewrites:
 
 *Implication for today:* N-channel/color-ready vision, arbitrary-size RAM handling, action-space
 abstraction, and manifest generality are the forward-compatibility bets we're already making.
+
+### 2D-vs-3D — the optical substrate never changes (design principle)
+The **observation space is always a 2D framebuffer** (a screen is 2D), even for 3D worlds (Mario 64,
+Mode-7 GBA). The agent, like a human, infers 3D from the 2D projection. So **3D is a temporal +
+representation problem, NOT a substrate-geometry problem** — recovered via the motion channel + evolved
+recurrence + learned features, never a "3D substrate." Consequences:
+- [ ] **Do NOT hand the CPPN egocentric priors** (`center dist`, radial `r`, and the demo-only `phase`).
+      Use canonical HyperNEAT inputs — source+target substrate coords `CPPN(x1,y1,x2,y2,bias)` — and let
+      evolution DISCOVER radial/symmetry structure (via gauss/sin nodes) only where a game rewards it.
+      (The dashboard's "screen x / center dist / phase / bias" labels are the DEMO CPPN's toy inputs, not
+      the real query — replace when the real evo core drives the panels.)
+- [ ] **The learned-encoder lane (autoencoder retina / conv + evolved controller) is the 3D path.** It
+      makes zero geometric assumptions; going up the ladder we shift weight from the geometric HyperNEAT
+      lane toward it, rather than rebuilding. HyperNEAT-2D stays great for 2D games.
+- [ ] What actually changes up the ladder: **action space** (analog stick + camera → continuous/more
+      outputs — the biggest real delta), **color** (front-end already channel-agnostic), **emulation speed**
+      (N64 GPU-rendered + slow). None require abandoning the 2D optical substrate.
 
 ---
 

@@ -11,6 +11,7 @@ Endpoints
 * ``GET /``                      → wall.html
 * ``GET /api/runs``              → {"runs": [{"id","generations","mtime"}, ...]}  newest first
 * ``GET /api/telemetry?run=ID``  → {"run", "records":[...], "host":{cpu,gpu}}  (tail of records)
+* ``GET /api/live?run=ID``       → parsed runs/<run-or-newest>/live.json (real frames + champion net) or {}
 * ``GET /api/host``              → {"cpu_pct","cpu_per_core":[...],"gpu":[...]}
 
 Dependency-light: stdlib + psutil (+ orjson via the telemetry reader). Never 500s
@@ -35,6 +36,7 @@ DASH_DIR = Path(__file__).resolve().parent
 REPO_ROOT = DASH_DIR.parents[1]
 RUNS_DIR = REPO_ROOT / "runs"
 WALL_HTML = DASH_DIR / "wall.html"
+LIVE_FILENAME = "live.json"  # real live-frame payload (frames + champion net), written ~3 Hz
 MAX_RECORDS = 200  # tail length returned to the page
 
 # prime psutil's per-interval counters so the first real call is non-blocking
@@ -121,6 +123,40 @@ def _resolve_run(run: str | None) -> Path | None:
     return dirs[0] if dirs else None
 
 
+def _resolve_live_run(run: str | None) -> Path | None:
+    """Resolve the run dir whose ``live.json`` we should serve.
+
+    A live run may only have ``live.json`` (e.g. a synthetic sample with no
+    telemetry yet), so this keys off ``LIVE_FILENAME`` rather than telemetry.
+    """
+    if run:
+        d = RUNS_DIR / run
+        return d if (d / LIVE_FILENAME).is_file() else None
+    if not RUNS_DIR.is_dir():
+        return None
+    live_dirs = [
+        d for d in RUNS_DIR.iterdir() if d.is_dir() and (d / LIVE_FILENAME).is_file()
+    ]
+    if not live_dirs:
+        return None
+    return max(live_dirs, key=lambda d: (d / LIVE_FILENAME).stat().st_mtime)
+
+
+def _live(run: str | None) -> dict:
+    """Parsed ``runs/<run-or-newest>/live.json`` or ``{}`` if absent/partial.
+
+    Never raises: a missing, truncated, or mid-write (invalid JSON) file yields
+    ``{}`` so the page falls back to the demo animation instead of erroring.
+    """
+    d = _resolve_live_run(run)
+    if d is None:
+        return {}
+    try:
+        return json.loads((d / LIVE_FILENAME).read_bytes())
+    except Exception:
+        return {}
+
+
 def _telemetry(run: str | None) -> dict:
     d = _resolve_run(run)
     host = _host_stats()
@@ -166,6 +202,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/telemetry":
                 run = (parse_qs(u.query).get("run") or [None])[0]
                 self._json(_telemetry(run))
+            elif path == "/api/live":
+                run = (parse_qs(u.query).get("run") or [None])[0]
+                self._json(_live(run))
             elif path == "/api/host":
                 self._json(_host_stats())
             elif path == "/healthz":

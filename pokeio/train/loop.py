@@ -41,6 +41,7 @@ from pokeio.evo.genome import InnovationTracker, Population, make_genome
 from pokeio.evo.ops import MutationRates, Speciation, reproduce
 from pokeio.reward.archive import NoveltyArchive
 from pokeio.reward.novelty import WaveNovelty
+from pokeio.train.live import ChampionShowcase, LiveStreamer
 from pokeio.telemetry.schema import (
     ChampionStep,
     GenerationRecord,
@@ -161,6 +162,8 @@ def evaluate_wave(
     max_nodes: int,
     max_conns: int,
     reset_state: str,
+    streamer: LiveStreamer | None = None,
+    gen: int = 0,
 ) -> int:
     """Evaluate one wave of genomes in lockstep; sets genome.fitness in place.
 
@@ -175,6 +178,7 @@ def evaluate_wave(
         obs = envs[i].reset(reset_state)
         screens.append(obs)
         wrams.append(envs[i].raw_wram())
+    dead = [False] * n
 
     pop = Population.from_genomes(genomes, max_nodes=max_nodes, max_conns=max_conns)
     cp = pop.compile(device)
@@ -188,10 +192,15 @@ def evaluate_wave(
         actions = out[:, 0, :].argmax(dim=1).cpu().numpy()
 
         for i in range(n):
-            screen, wram, _done, _info = envs[i].step(int(actions[i]))
+            screen, wram, done, _info = envs[i].step(int(actions[i]))
             screens[i] = screen
             wrams[i] = wram
+            dead[i] = dead[i] or bool(done)
             wave.observe(i, screen, wram)
+
+        # Stream a live sample ~3 Hz (throttled internally; cheap when not due).
+        if streamer is not None:
+            streamer.maybe_write(gen, screens, wave.fitness, dead)
 
     for i, g in enumerate(genomes):
         g.fitness = float(wave.fitness[i])
@@ -246,6 +255,7 @@ def train(
     config: Config,
     device_str: str = "cuda:1",
     champion_steps: int = 48,
+    live: bool = True,
 ) -> Path:
     device = pick_device(device_str)
     rng = np.random.default_rng(config.run.seed)
@@ -296,6 +306,31 @@ def train(
     ]
     reset_state = config.emu.reset_state
 
+    # Live streaming: a dedicated showcase env that continuously plays the
+    # best-genome-so-far, plus a throttled atomic writer for runs/<id>/live.json.
+    streamer: LiveStreamer | None = None
+    showcase_env: PokeEnv | None = None
+    if live:
+        showcase_env = PokeEnv(
+            rom,
+            frame_skip=config.emu.frame_skip,
+            hold_frames=config.emu.button_hold_frames,
+        )
+        showcase = ChampionShowcase(
+            showcase_env,
+            encoder,
+            device,
+            reset_state,
+            forward_steps=FORWARD_STEPS,
+            max_nodes=max_nodes,
+            max_conns=max_conns,
+        )
+        streamer = LiveStreamer(run_dir, showcase, run_id, hz=3.0)
+        # Seed the showcase with an initial champion so the very first wave has a
+        # live network to stream (replaced by the real champion each generation).
+        streamer.set_champion(genomes[0], "init")
+        print(f"[train] live streaming ON -> {run_dir / 'live.json'} (~3 Hz)")
+
     proc = psutil.Process()
     proc.cpu_percent(None)  # prime the psutil counter
     run_start = time.perf_counter()
@@ -319,11 +354,19 @@ def train(
                     max_nodes,
                     max_conns,
                     reset_state,
+                    streamer=streamer,
+                    gen=gen,
                 )
 
             fits = np.array([g.fitness for g in genomes], dtype=np.float64)
             champ_idx = int(fits.argmax())
             champion = genomes[champ_idx]
+
+            # Update the showcase to this generation's real champion and push a
+            # fresh live frame at the generation boundary.
+            if streamer is not None:
+                streamer.set_champion(champion, f"gen{gen}_g{champ_idx}")
+                streamer.force_write(gen)
 
             gen_dt = time.perf_counter() - gen_t0
             cpu_pct = psutil.cpu_percent(None)
@@ -377,6 +420,8 @@ def train(
 
     for e in envs:
         e.close()
+    if showcase_env is not None:
+        showcase_env.close()
     print(f"[train] done. telemetry -> {run_dir / 'telemetry.jsonl'}")
     return run_dir
 
@@ -410,6 +455,10 @@ def main() -> None:
                     help="ticks advanced per agent step (must hold buttons to register)")
     ap.add_argument("--hold-frames", type=int, default=8,
                     help="frames a button is held within a step (< frame-skip)")
+    ap.add_argument("--live", dest="live", action="store_true", default=True,
+                    help="stream runs/<id>/live.json for the dashboard (default ON)")
+    ap.add_argument("--no-live", dest="live", action="store_false",
+                    help="disable live streaming")
     args = ap.parse_args()
 
     cfg = build_config(args)
@@ -422,6 +471,7 @@ def main() -> None:
         run_id=args.run_id,
         config=cfg,
         device_str=args.device,
+        live=args.live,
     )
 
 
