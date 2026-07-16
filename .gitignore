@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+roms/*.gb
+roms/*.gbc
+roms/*.state
+runs/
+*.state
+*.gguf
+.pytest_cache/
+roms/*.ram
+roms/*.sav
