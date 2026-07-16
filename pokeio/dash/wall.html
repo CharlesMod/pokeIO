@@ -402,7 +402,7 @@
     </header>
     <div class="bodyp" style="padding:0;flex:1"><div class="gtwrap"><canvas id="pn-net"></canvas></div></div>
     <div class="foot" style="padding:7px 12px;border-top:1px solid var(--line);letter-spacing:.04em">
-      real forward pass · input nodes = the champion's live pixels above · neurons exist only where the painted field has structure (ES-HyperNEAT) · ghost rings = unexpressed slots · strongest 7 wires per neuron drawn
+      real forward pass · input nodes = the champion's live pixels above · each neuron is its receptive field (the weights the CPPN painted) · neurons exist only where the field has structure (ES-HyperNEAT) · ghost boxes = unexpressed · wires sampled across each field
     </div>
   </div>
   </div>
@@ -1481,6 +1481,7 @@ function fitP(){const r=pn.parentElement.getBoundingClientRect();
 const PIN_W=14,PIN_H=12,PIN=PIN_W*PIN_H,NCAND=14,NOUT=8;
 const BSYM=['↑','↓','←','→','A','B','St','Se'];
 const Wp=new Float32Array(NCAND*PIN);
+const tileCv=[];
 const W2=[];(function(){let seed=7;const R=()=>{seed=(seed*16807)%2147483647;return seed/2147483647*2-1;};
   for(let k=0;k<NOUT;k++){W2[k]=[];for(let j=0;j<NCAND;j++)W2[k][j]=R()*1.2;}})();
 let expressed=new Array(NCAND).fill(true), bornFlash=new Float32Array(NCAND);
@@ -1501,7 +1502,14 @@ function repaintPhenotype(){
     for(let p=0;p<PIN;p++){const d=Wp[j*PIN+p]-mean; vv+=d*d;}
     varr[j]=vv/PIN;
   }
-  for(let p=0;p<NCAND*PIN;p++)Wp[p]/=gmax;                 /* GLOBAL normalization */
+  for(let p=0;p<NCAND*PIN;p++)Wp[p]/=gmax;
+  for(let j=0;j<NCAND;j++){let cv=tileCv[j];if(!cv){cv=document.createElement('canvas');cv.width=PIN_W;cv.height=PIN_H;tileCv[j]=cv;}
+    const cx=cv.getContext('2d'),img=cx.createImageData(PIN_W,PIN_H),d=img.data;
+    for(let p=0;p<PIN;p++){const v=Wp[j*PIN+p];let r,g,b;
+      if(v>=0){const t=Math.pow(Math.min(1,v),0.8);r=26+198*t;g=23+145*t;b=18+38*t;}
+      else{const t=Math.pow(Math.min(1,-v),0.8);r=26+37*t;g=23+158*t;b=18+189*t;}
+      d[p*4]=r|0;d[p*4+1]=g|0;d[p*4+2]=b|0;d[p*4+3]=255;}
+    cx.putImageData(img,0,0);}                 /* GLOBAL normalization */
   /* ES-HyperNEAT-style expression: a neuron exists where its field has structure */
   const maxVar=Math.max(...varr), prevExpr=expressed.slice();
   expressed=varr.map(v=>v>0.33*maxVar);
@@ -1511,12 +1519,15 @@ function repaintPhenotype(){
   let flips=0;
   for(let j=0;j<NCAND;j++){ if(expressed[j]!==prevExpr[j]){flips++; if(expressed[j])bornFlash[j]=1;} }
   /* strongest wires per expressed neuron, with change diff */
-  topWires=[]; const newKeys=new Set(); let fresh=0;
+  topWires=[]; const newKeys=new Set(); let fresh=0; const GX=4,GY=3;
   for(let j=0;j<NCAND;j++){ if(!expressed[j])continue;
-    const idx=[...Array(PIN).keys()].sort((a,b)=>Math.abs(Wp[j*PIN+b])-Math.abs(Wp[j*PIN+a])).slice(0,7);
-    idx.forEach(i=>{const key=i+':'+j; newKeys.add(key);
-      const isNew=!prevKeys.has(key); if(isNew)fresh++;
-      topWires.push({i,j,w:Wp[j*PIN+i],fresh:isNew});});}
+    let nmax=1e-4; for(let p=0;p<PIN;p++)nmax=Math.max(nmax,Math.abs(Wp[j*PIN+p]));
+    for(let by=0;by<GY;by++)for(let bxk=0;bxk<GX;bxk++){
+      const x0=Math.floor(bxk*PIN_W/GX),x1=Math.floor((bxk+1)*PIN_W/GX),y0=Math.floor(by*PIN_H/GY),y1=Math.floor((by+1)*PIN_H/GY);
+      let besti=-1,bestv=0;
+      for(let gy=y0;gy<y1;gy++)for(let gxx=x0;gxx<x1;gxx++){const p=gy*PIN_W+gxx,av=Math.abs(Wp[j*PIN+p]);if(av>bestv){bestv=av;besti=p;}}
+      if(besti>=0&&bestv>0.3*nmax){const key=besti+':'+j;newKeys.add(key);const isNew=!prevKeys.has(key);if(isNew)fresh++;
+        topWires.push({i:besti,j,w:Wp[j*PIN+besti],fresh:isNew});}}}
   prevKeys=newKeys;
   const nE=expressed.filter(Boolean).length;
   lastChangeTxt='⟳ mutation — '+fresh+' wires rerouted'+(flips>0?' · '+flips+' neuron'+(flips>1?'s':'')+' flipped':'')+' · '+nE+' expressed';
@@ -1546,9 +1557,10 @@ function renderPheno(dt,time){
   const hx=w*0.58, hys=[]; for(let j=0;j<NCAND;j++)hys.push(padT+(j+0.5)*(h-padT-padB)/NCAND);
   const bx=w-52, bys=[]; for(let k=0;k<NOUT;k++)bys.push(padT+(k+0.5)*(h-padT-padB)/NOUT);
   const cellCx=i=>gx0+(i%PIN_W)*cs+cs/2, cellCy=i=>gy0+((i/PIN_W)|0)*cs+cs/2;
+  const rowH=(h-padT-padB)/NCAND, tH=Math.max(9,Math.min(rowH-4,22)), tW=tH*PIN_W/PIN_H, nLeft=hx-tW/2, nRight=hx+tW/2;
   topWires.forEach(tw=>{
     const sig=eye[tw.i]*tw.w, col=tw.w>=0?'139,171,62':'198,90,62';
-    const ax=cellCx(tw.i),ay=cellCy(tw.i),bx2=hx-11,by=hys[tw.j],mx=(ax+bx2)/2;
+    const ax=cellCx(tw.i),ay=cellCy(tw.i),bx2=nLeft-3,by=hys[tw.j],mx=(ax+bx2)/2;
     px2.beginPath();px2.moveTo(ax,ay);px2.bezierCurveTo(mx,ay,mx,by,bx2,by);
     px2.strokeStyle=`rgba(${col},${0.05+Math.min(0.5,Math.abs(sig))})`;
     px2.lineWidth=0.4+Math.abs(tw.w)*2.6;px2.stroke();
@@ -1560,24 +1572,26 @@ function renderPheno(dt,time){
       px2.beginPath();px2.arc(X,Y,1.5,0,7);px2.fillStyle=`rgba(${col},0.8)`;px2.fill();}});
   for(let k=0;k<NOUT;k++)for(let j=0;j<NCAND;j++){if(!expressed[j])continue;const wv=W2[k][j];if(Math.abs(wv)<0.45)continue;
     const sig=wv*hAct[j], col=wv>=0?'139,171,62':'198,90,62';
-    const ax=hx+11,ay=hys[j],bx2=bx-6,by=bys[k],mx=(ax+bx2)/2;
+    const ax=nRight+3,ay=hys[j],bx2=bx-6,by=bys[k],mx=(ax+bx2)/2;
     px2.beginPath();px2.moveTo(ax,ay);px2.bezierCurveTo(mx,ay,mx,by,bx2,by);
     px2.strokeStyle=`rgba(${col},${0.04+Math.min(0.45,Math.abs(sig)*1.6)})`;px2.lineWidth=0.5+Math.abs(wv)*0.9;px2.stroke();}
   for(let p=0;p<PIN;p++){const v=eye[p];
     px2.fillStyle=`rgb(${32+v*137|0},${41+v*153|0},${26+v*34|0})`;
     px2.fillRect(gx0+(p%PIN_W)*cs,gy0+((p/PIN_W)|0)*cs,cs-1,cs-1);}
   px2.strokeStyle='rgba(139,171,62,0.5)';px2.lineWidth=1.2;px2.strokeRect(gx0-1,gy0-1,gw+1,gh+1);
+  px2.imageSmoothingEnabled=false;
   for(let j=0;j<NCAND;j++){
     if(bornFlash[j]>0)bornFlash[j]=Math.max(0,bornFlash[j]-dt*0.9);
+    const cy=hys[j], lx=hx-tW/2, ty=cy-tH/2;
     if(!expressed[j]){  /* ghost slot: a neuron COULD exist here */
-      px2.beginPath();px2.arc(hx,hys[j],6,0,7);px2.setLineDash([2,3]);
-      px2.strokeStyle='rgba(111,102,86,0.35)';px2.lineWidth=1;px2.stroke();px2.setLineDash([]);continue;}
+      px2.setLineDash([2,3]);px2.strokeStyle='rgba(111,102,86,0.3)';px2.lineWidth=1;
+      px2.strokeRect(lx,ty,tW,tH);px2.setLineDash([]);continue;}
     const a=hAct[j],mag=Math.abs(a),col=a>=0?'224,168,56':'63,181,207';
-    if(bornFlash[j]>0){px2.beginPath();px2.arc(hx,hys[j],11+10*(1-bornFlash[j]),0,7);
-      px2.strokeStyle=`rgba(169,139,224,${bornFlash[j]*0.7})`;px2.lineWidth=2;px2.stroke();}
-    px2.beginPath();px2.arc(hx,hys[j],9+mag*4,0,7);px2.fillStyle=`rgba(${col},${0.10+mag*0.35})`;px2.fill();
-    px2.beginPath();px2.arc(hx,hys[j],8,0,7);px2.fillStyle=`rgba(${col},${0.25+mag*0.45})`;px2.fill();
-    px2.lineWidth=1.4;px2.strokeStyle=`rgba(${col},${0.5+mag*0.5})`;px2.stroke();}
+    px2.fillStyle=`rgba(${col},${0.08+mag*0.4})`;px2.fillRect(lx-3,ty-3,tW+6,tH+6);
+    if(bornFlash[j]>0){const e=6*(1-bornFlash[j]);px2.strokeStyle=`rgba(169,139,224,${bornFlash[j]*0.7})`;px2.lineWidth=2;
+      px2.strokeRect(lx-2-e,ty-2-e,tW+4+2*e,tH+4+2*e);}
+    if(tileCv[j])px2.drawImage(tileCv[j],lx,ty,tW,tH);
+    px2.lineWidth=1.2;px2.strokeStyle=`rgba(${col},${0.45+mag*0.55})`;px2.strokeRect(lx,ty,tW,tH);}
   for(let k=0;k<NOUT;k++){const v=oAct[k],on=v>0.62;
     px2.beginPath();
     if(px2.roundRect)px2.roundRect(bx,bys[k]-9,36,18,4);else px2.rect(bx,bys[k]-9,36,18);
@@ -1588,7 +1602,7 @@ function renderPheno(dt,time){
     px2.fillText(BSYM[k],bx+18,bys[k]+3);}
   px2.fillStyle='rgba(111,102,86,0.95)';px2.font='8px ui-monospace,monospace';px2.textAlign='center';
   px2.fillText('LIVE PIXELS',gx0+gw/2,padT-9);
-  px2.fillText('PAINTED NEURONS',hx,padT-9);
+  px2.fillText('RECEPTIVE FIELDS',hx,padT-9);
   px2.fillText('BUTTONS',bx+18,padT-9);
   if(pnRewireFlash>0.02&&lastChangeTxt){px2.fillStyle=`rgba(169,139,224,${Math.min(1,pnRewireFlash*1.6)})`;
     px2.font='9px ui-monospace,monospace';px2.textAlign='left';px2.fillText(lastChangeTxt,16,14);}
