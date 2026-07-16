@@ -1427,6 +1427,11 @@ function renderGraph(dt,time){
   const px=n=>padL+n.x*(w-padL-padR), py=n=>padT+n.y*(h-padT-padB);
   genome.nodes.forEach(n=>{n.x=lerp(n.x,n.tx,0.12);n.y=lerp(n.y,n.ty,0.12);});
   sweepT+=dt*0.55; if(sweepT>1.6)sweepT-=1.9;
+  // live sample of the CPPN's output weight, queried at a moving pixel
+  let liveOut=0;
+  try{const vv=new Float32Array(genome.nextId+2);vv[4]=1;vv[0]=Math.sin(time*0.6);vv[1]=Math.cos(time*0.47);
+    vv[2]=Math.sqrt(vv[0]*vv[0]+vv[1]*vv[1])*1.3-0.9;vv[3]=Math.sin(time*0.4)*1.2;liveOut=evalCPPN(vv);}catch(e){}
+  const oCol=liveOut>=0?'224,168,56':'63,181,207', oMag=Math.min(1,Math.abs(liveOut));
   const byId=genome.byId,depth=genome.depth,maxd=genome.maxd;
   genome.conns.forEach(c=>{if(!byId[c.from]||!byId[c.to])return;const a=byId[c.from],b=byId[c.to];
     const ax=px(a),ay=py(a),bx=px(b),by=py(b),mag=Math.min(1,Math.abs(c.w)/2.4),col=c.w>=0?'139,171,62':'198,90,62',mx=(ax+bx)/2;
@@ -1445,12 +1450,26 @@ function renderGraph(dt,time){
     gx.beginPath();gx.arc(x,y,rr+3+sweep*4,0,7);gx.fillStyle=`rgba(${base},${0.10+sweep*0.28+(n._flash||0)*0.3})`;gx.fill();
     gx.beginPath();gx.arc(x,y,rr,0,7);gx.fillStyle=`rgba(${base},${0.20+sweep*0.20})`;gx.fill();
     gx.lineWidth=1.5;gx.strokeStyle=`rgba(${base},${0.75+sweep*0.25})`;gx.stroke();
-    actGlyph(gx,x,y,rr,n.act,n.kind==='input'?'rgba(240,233,216,0.5)':`rgba(${base},0.95)`);
-    gx.font='8.5px ui-monospace,monospace';
-    if(n.kind==='input'){gx.fillStyle='rgba(168,157,136,0.9)';gx.textAlign='right';gx.fillText(n.label,x-rr-8,y+3);}
-    else if(n.kind==='output'){gx.fillStyle='rgba(224,168,56,0.9)';gx.textAlign='left';gx.fillText(n.label,x+rr+8,y+3);}});
+    if(n.kind==='output'){
+      // the node holds the live weight value (colour = sign, brightness = magnitude)
+      gx.beginPath();gx.arc(x,y,rr-3,0,7);gx.fillStyle=`rgba(${oCol},${0.4+oMag*0.55})`;gx.fill();
+      // ...which streams out to the right and paints every pixel of the network
+      const ex=w-8;
+      gx.strokeStyle=`rgba(${oCol},${0.16+oMag*0.4})`;gx.lineWidth=1+oMag*2.2;
+      gx.beginPath();gx.moveTo(x+rr,y);gx.lineTo(ex-6,y);gx.stroke();
+      const nps=2+Math.round(oMag*4);
+      for(let i=0;i<nps;i++){const t3=((time*0.9)+i/nps)%1;const X=x+rr+t3*(ex-6-x-rr);
+        gx.beginPath();gx.arc(X,y,1.3+oMag*1.5,0,7);gx.fillStyle=`rgba(${oCol},${0.4+oMag*0.5})`;gx.fill();}
+      gx.beginPath();gx.moveTo(ex,y);gx.lineTo(ex-7,y-4);gx.lineTo(ex-7,y+4);gx.closePath();gx.fillStyle=`rgba(${oCol},0.85)`;gx.fill();
+      gx.font='700 9px ui-monospace,monospace';gx.textAlign='center';gx.fillStyle=`rgba(${oCol},0.95)`;
+      gx.fillText('weight = '+(liveOut>=0?'+':'')+liveOut.toFixed(2),(x+ex)/2,y-8);
+    } else {
+      actGlyph(gx,x,y,rr,n.act,n.kind==='input'?'rgba(240,233,216,0.5)':`rgba(${base},0.95)`);
+      gx.font='8.5px ui-monospace,monospace';
+      if(n.kind==='input'){gx.fillStyle='rgba(168,157,136,0.9)';gx.textAlign='right';gx.fillText(n.label,x-rr-8,y+3);}
+    }});
   gx.fillStyle='rgba(111,102,86,0.9)';gx.font='8px ui-monospace,monospace';gx.textAlign='center';
-  gx.fillText('COORDINATES IN',padL,h-8);gx.fillText('EVOLVED FUNCTION',(padL+w-padR)/2,h-8);gx.fillText('ANSWER',w-padR,h-8);
+  gx.fillText('COORDINATES IN',padL,h-8);gx.fillText('EVOLVED FUNCTION',(padL+w-padR)/2,h-8);gx.fillText('WEIGHT OUT →',w-padR,h-8);
 }
 
 /* ---- THE NETWORK IT PAINTS (live phenotype, ES-HyperNEAT expression) ---- */
