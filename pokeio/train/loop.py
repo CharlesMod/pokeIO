@@ -38,8 +38,9 @@ from pokeio.config import Config
 from pokeio.emu.env import PokeEnv
 from pokeio.evo.forward import population_forward_sparse
 from pokeio.evo.genome import InnovationTracker, Population, make_genome
-from pokeio.evo.ops import MutationRates, Speciation, reproduce
+from pokeio.evo.ops import MutationRates, Speciation, compatibility_distance, reproduce
 from pokeio.reward.archive import NoveltyArchive
+from pokeio.reward.goexplore import GoExplore
 from pokeio.reward.novelty import WaveNovelty
 from pokeio.train.live import ChampionShowcase, LiveStreamer
 from pokeio.telemetry.schema import (
@@ -164,18 +165,38 @@ def evaluate_wave(
     reset_state: str,
     streamer: LiveStreamer | None = None,
     gen: int = 0,
+    novelty_mode: str = "rarity",
+    novelty_floor: float = 0.1,
+    goexplore: GoExplore | None = None,
+    restore_prob: float = 0.5,
 ) -> int:
     """Evaluate one wave of genomes in lockstep; sets genome.fitness in place.
 
+    With ``goexplore`` supplied, a fraction (``restore_prob``) of players start
+    the episode from a sampled frontier cell (Go-Explore cell-restore) instead of
+    the fixed new-game state, and the emulator state of every newly-discovered
+    cell is captured for future restarts.
+
     Returns the number of agent-steps performed (n_genomes * episode_steps)."""
     n = len(genomes)
-    wave = WaveNovelty(archive, n)
+    wave = WaveNovelty(archive, n, mode=novelty_mode, floor=novelty_floor)
 
-    # reset each player's emulator to the canonical new-game state
+    # reset each player: either restore from a promising frontier cell (go-explore)
+    # or fall back to the canonical new-game state.
     screens = []
     wrams = []
     for i in range(n):
-        obs = envs[i].reset(reset_state)
+        entry = None
+        if (
+            goexplore is not None
+            and goexplore.size > 0
+            and goexplore.rng.random() < restore_prob
+        ):
+            entry = goexplore.sample()
+        if entry is not None:
+            obs = goexplore.restore(envs[i], entry)
+        else:
+            obs = envs[i].reset(reset_state)
         screens.append(obs)
         wrams.append(envs[i].raw_wram())
     dead = [False] * n
@@ -183,7 +204,7 @@ def evaluate_wave(
     pop = Population.from_genomes(genomes, max_nodes=max_nodes, max_conns=max_conns)
     cp = pop.compile(device)
 
-    for _ in range(episode_steps):
+    for t in range(episode_steps):
         X = np.empty((n, encoder.dim), dtype=np.float32)
         for i in range(n):
             X[i] = encoder.encode(screens[i], wrams[i])
@@ -197,6 +218,12 @@ def evaluate_wave(
             wrams[i] = wram
             dead[i] = dead[i] or bool(done)
             wave.observe(i, screen, wram)
+            # Capture the state of every fresh frontier cell for later restarts.
+            if goexplore is not None and wave.last_key[i] is not None:
+                goexplore.note(
+                    wave.last_key[i], envs[i], depth=t,
+                    globally_new=wave.last_new[i],
+                )
 
         # Stream a live sample ~3 Hz (throttled internally; cheap when not due).
         if streamer is not None:
@@ -243,6 +270,78 @@ def replay_champion(
 
 
 # --------------------------------------------------------------------------
+# adaptive speciation threshold
+# --------------------------------------------------------------------------
+def _greedy_species_count(
+    genomes, thr: float, c1: float, c2: float, c3: float
+) -> int:
+    """Count species formed by fresh greedy speciation at compatibility ``thr``."""
+    reps: list = []
+    for g in genomes:
+        if not any(
+            compatibility_distance(g, r, c1, c2, c3) < thr for r in reps
+        ):
+            reps.append(g)
+    return len(reps)
+
+
+def fit_species_threshold(
+    genomes,
+    c1: float,
+    c2: float,
+    c3: float,
+    target: int,
+    rng: np.random.Generator,
+    sample_cap: int = 96,
+    iters: int = 24,
+) -> float:
+    """Binary-search a compatibility threshold that yields ~``target`` species.
+
+    At gen 0 every genome shares the same innovation baseline, so the
+    compatibility distance is dominated by the (tiny, tightly-clustered) mean
+    weight difference and the fixed default threshold (3.0) lumps the whole
+    population into one species.  Species count is monot- decreasing in the
+    threshold, so a binary search reliably lands on a value that splits the
+    population into ``target`` species — restoring real speciation pressure.
+
+    Purely a loop-side tuning of the threshold fed to :class:`Speciation`; no
+    change to ``evo/`` internals.
+    """
+    n = len(genomes)
+    if n <= 1:
+        return 1.0
+    if n > sample_cap:
+        idx = rng.choice(n, size=sample_cap, replace=False)
+        sample = [genomes[int(i)] for i in idx]
+    else:
+        sample = list(genomes)
+
+    # bound the search with the max pairwise distance over the sample.
+    hi = 0.0
+    for a in range(len(sample)):
+        for b in range(a + 1, len(sample)):
+            d = compatibility_distance(sample[a], sample[b], c1, c2, c3)
+            if d > hi:
+                hi = d
+    if hi <= 0.0:
+        return 1.0  # genomes identical; nothing to split
+    lo = 0.0
+    hi = hi + 1e-6
+    target = max(2, min(target, len(sample)))
+    best = hi
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        k = _greedy_species_count(sample, mid, c1, c2, c3)
+        if k >= target:
+            # too many species -> raise threshold (merge)
+            best = mid
+            lo = mid
+        else:
+            hi = mid
+    return float(best)
+
+
+# --------------------------------------------------------------------------
 # training loop
 # --------------------------------------------------------------------------
 def train(
@@ -256,6 +355,12 @@ def train(
     device_str: str = "cuda:1",
     champion_steps: int = 48,
     live: bool = True,
+    novelty_mode: str = "rarity",
+    goexplore: bool = False,
+    restore_prob: float = 0.5,
+    goexplore_capacity: int = 2048,
+    auto_species: bool = True,
+    species_target: int = 6,
 ) -> Path:
     device = pick_device(device_str)
     rng = np.random.default_rng(config.run.seed)
@@ -292,6 +397,19 @@ def train(
     )
     spec = Speciation(threshold=config.evo.species_threshold, c1=1.0, c2=1.0, c3=0.4)
     archive = NoveltyArchive()
+    go = (
+        GoExplore(
+            capacity=goexplore_capacity,
+            rng=np.random.default_rng(config.run.seed + 1),
+        )
+        if goexplore
+        else None
+    )
+    print(
+        f"[train] novelty_mode={novelty_mode} goexplore={'on' if go else 'off'} "
+        f"(restore_prob={restore_prob}, cap={goexplore_capacity}) "
+        f"auto_species={'on' if auto_species else 'off'} (target={species_target})"
+    )
 
     # Create the emulator pool once; reused across every wave/generation.
     rom = config.emu.rom_path
@@ -339,6 +457,8 @@ def train(
         for gen in range(gens):
             gen_t0 = time.perf_counter()
             archive.begin_generation()
+            if go is not None:
+                go.begin_generation(gen)
             psutil.cpu_percent(None)
 
             steps_done = 0
@@ -356,6 +476,10 @@ def train(
                     reset_state,
                     streamer=streamer,
                     gen=gen,
+                    novelty_mode=novelty_mode,
+                    novelty_floor=config.reward.novelty_floor,
+                    goexplore=go,
+                    restore_prob=restore_prob,
                 )
 
             fits = np.array([g.fitness for g in genomes], dtype=np.float64)
@@ -379,7 +503,22 @@ def train(
                 max_nodes, max_conns, reset_state,
             )
 
+            # Adaptive speciation threshold: without it the gen-0 population
+            # shares one innovation baseline and collapses to a single species.
+            # Re-fit the threshold to the current genome spread and re-speciate
+            # from scratch so the population actually splits (loop-side only).
+            if auto_species:
+                spec.threshold = fit_species_threshold(
+                    genomes, spec.c1, spec.c2, spec.c3, species_target, rng
+                )
+                spec.reps.clear()
             species = spec.assign(genomes, rng)
+
+            reward_terms = {"novelty": float(fits.max())}
+            if auto_species:
+                reward_terms["species_threshold"] = float(spec.threshold)
+            if go is not None:
+                reward_terms.update(go.stats())
             rec = GenerationRecord(
                 gen=gen,
                 wall_time=time.perf_counter() - run_start,
@@ -391,7 +530,7 @@ def train(
                 archive_delta=archive.generation_delta,
                 champion_id=f"gen{gen}_g{champ_idx}",
                 champion_genome_ref=f"gen{gen}:idx{champ_idx}",
-                reward_terms={"novelty": float(fits.max())},
+                reward_terms=reward_terms,
                 throughput_sps=sps,
                 cpu_pct=cpu_pct,
                 gpu=query_gpu(),
@@ -459,6 +598,25 @@ def main() -> None:
                     help="stream runs/<id>/live.json for the dashboard (default ON)")
     ap.add_argument("--no-live", dest="live", action="store_false",
                     help="disable live streaming")
+    # -- Go-Explore + speciation ------------------------------------------
+    ap.add_argument("--goexplore", dest="goexplore", action="store_true",
+                    default=False,
+                    help="restart episodes from sampled frontier cells (Go-Explore)")
+    ap.add_argument("--restore-prob", type=float, default=0.5,
+                    help="per-player prob of restoring from a frontier cell")
+    ap.add_argument("--goexplore-capacity", type=int, default=2048,
+                    help="max stored emulator states (memory bound)")
+    ap.add_argument("--novelty-mode", choices=("rarity", "per_gen", "global"),
+                    default="rarity",
+                    help="rarity: rarity-weighted distinct-cell coverage (default); "
+                         "per_gen: only cells new this generation; global: legacy")
+    ap.add_argument("--auto-species", dest="auto_species", action="store_true",
+                    default=True,
+                    help="adaptively fit the speciation threshold (default ON)")
+    ap.add_argument("--no-auto-species", dest="auto_species", action="store_false",
+                    help="use the fixed config species_threshold instead")
+    ap.add_argument("--species-target", type=int, default=6,
+                    help="target species count for the adaptive threshold")
     args = ap.parse_args()
 
     cfg = build_config(args)
@@ -472,6 +630,12 @@ def main() -> None:
         config=cfg,
         device_str=args.device,
         live=args.live,
+        novelty_mode=args.novelty_mode,
+        goexplore=args.goexplore,
+        restore_prob=args.restore_prob,
+        goexplore_capacity=args.goexplore_capacity,
+        auto_species=args.auto_species,
+        species_target=args.species_target,
     )
 
 

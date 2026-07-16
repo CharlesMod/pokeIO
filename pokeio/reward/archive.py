@@ -81,6 +81,12 @@ class NoveltyArchive:
         self._row_mat = _area_matrix(_SCREEN_H, rows)
         self._col_mat = _area_matrix(_SCREEN_W, cols).T
         self._gen_start_size = 0
+        # Cells first discovered *during the current generation* — the moving
+        # per-generation frontier used for per-generation novelty credit.
+        self._gen_new: set[bytes] = set()
+        # Whole-run visit counts per cell — drives rarity-weighted novelty
+        # (rare / unseen cells are worth more than well-trodden ones).
+        self._visits: dict[bytes, int] = {}
 
     # ------------------------------------------------------------------ keys
     def _screen_digest(self, screen: np.ndarray) -> np.ndarray:
@@ -105,20 +111,45 @@ class NoveltyArchive:
 
     # --------------------------------------------------------------- updates
     def add(self, key: bytes) -> bool:
-        """Insert a cell key; return True iff it was newly discovered globally."""
+        """Insert a cell key; return True iff it was newly discovered globally.
+
+        A newly-discovered key is also recorded in the per-generation frontier
+        (:attr:`_gen_new`) so :meth:`is_gen_new` can drive per-generation credit.
+        """
         if key in self.seen:
             return False
         self.seen.add(key)
+        self._gen_new.add(key)
         return True
 
     def observe(self, screen: np.ndarray, wram: np.ndarray) -> bool:
         """Convenience: build the key and add it. True iff globally new."""
         return self.add(self.cell_key(screen, wram))
 
+    def visit(self, key: bytes) -> int:
+        """Record a visit to ``key``; return the visit count *before* this one.
+
+        A prior count of 0 means this is the cell's first-ever sighting, so
+        rarity-weighted novelty gives it the maximum weight."""
+        prior = self._visits.get(key, 0)
+        self._visits[key] = prior + 1
+        return prior
+
+    def is_gen_new(self, key: bytes) -> bool:
+        """True iff ``key`` was first discovered during the current generation.
+
+        This is the basis of per-generation novelty credit: a genome earns for a
+        cell that belongs to *this generation's* new frontier, regardless of
+        which genome opened it — so genomes that reach fresh ground are rewarded
+        even when the whole-run archive already contains the start-area cells.
+        """
+        return key in self._gen_new
+
     # ----------------------------------------------------------- generation
     def begin_generation(self) -> None:
-        """Snapshot the frontier size so :meth:`generation_delta` is meaningful."""
+        """Snapshot the frontier size + reset the per-generation frontier set."""
         self._gen_start_size = len(self.seen)
+        self._gen_new = set()
 
     @property
     def generation_delta(self) -> int:
