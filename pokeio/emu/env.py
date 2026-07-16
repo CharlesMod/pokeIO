@@ -7,6 +7,19 @@ Phase 0 contract (see TODO.md):
   * render=False during skipped frames; only the final frame of an action renders
   * done is always False for now (no episode-termination logic yet)
 
+Input models (selected via ``sticky_input``):
+  * sticky  (default): the chosen button is pressed and HELD DOWN across ticks;
+    it is only released when the agent selects a DIFFERENT action. On an action
+    change we release the previously-held button then press the new one. This is
+    what makes frame_skip=1 register input at all: a held button spans a full
+    frame boundary, whereas a press+release inside a single tick is invisible to
+    the game. All 8 actions are buttons, so every action is "held-until-changed";
+    there is no dedicated no-op/release action (see ``release_all`` if one is
+    ever needed).
+  * pulsed (sticky_input=False): the legacy behavior — press, hold hold_frames,
+    release, coast the remainder. Requires hold_frames < frame_skip and only
+    registers input when hold_frames >= 1 (so it is broken at frame_skip=1).
+
 Determinism: given a save-state + a fixed action sequence, replay is identical.
 Any queued input is flushed before a save so state snapshots are reproducible.
 """
@@ -30,12 +43,23 @@ MAP_ID_ADDR = 0xD35E  # current map id (Pokemon Yellow); handy for state docs
 class PokeEnv:
     """A single headless PyBoy instance with a gym-flavoured step/reset API."""
 
-    def __init__(self, rom_path: str, frame_skip: int = 24, hold_frames: int = 8):
-        if hold_frames >= frame_skip:
+    def __init__(
+        self,
+        rom_path: str,
+        frame_skip: int = 24,
+        hold_frames: int = 8,
+        sticky_input: bool = True,
+    ):
+        # hold_frames only governs the legacy "pulsed" path; it is irrelevant
+        # (and unconstrained) in sticky mode, so only validate when it applies.
+        if not sticky_input and hold_frames >= frame_skip:
             raise ValueError("hold_frames must be < frame_skip")
         self.rom_path = rom_path
         self.frame_skip = int(frame_skip)
         self.hold_frames = int(hold_frames)
+        self.sticky_input = bool(sticky_input)
+        # Name of the currently-held button in sticky mode (None == nothing held).
+        self._held: str | None = None
         self.pyboy = PyBoy(rom_path, window="null", sound_emulated=False)
 
     # ------------------------------------------------------------------ obs
@@ -55,6 +79,9 @@ class PokeEnv:
         if state_path is not None:
             with open(state_path, "rb") as fh:
                 self.pyboy.load_state(fh)
+        # A loaded state carries no held input; drop any bookkeeping so the first
+        # sticky action re-presses cleanly.
+        self._held = None
         # settle one rendered frame so the returned obs is valid
         self.pyboy.tick(1, True)
         return self._obs()
@@ -63,9 +90,42 @@ class PokeEnv:
         """Apply one action over `frame_skip` ticks. Returns (obs, ram, done, info)."""
         name = ACTIONS[action_idx]
 
+        if self.sticky_input:
+            self._advance_sticky(name)
+        else:
+            self._advance_pulsed(name)
+
+        obs = self._obs()
+        ram = self.raw_wram()
+        done = False
+        info = {"action": name, "map_id": self.pyboy.memory[MAP_ID_ADDR]}
+        return obs, ram, done, info
+
+    def _advance_sticky(self, name: str) -> None:
+        """Hold `name` down across frame_skip ticks; only re-press on a change.
+
+        On an action change we release the previously-held button and press the
+        new one *before* ticking, so the newly-pressed button is down for the
+        whole span (>= 1 full frame boundary) and the game actually reads it.
+        A repeat of the same action leaves the button held — no release/press —
+        which is exactly the continuous-hold movement the overworld needs.
+        """
+        if name != self._held:
+            if self._held is not None:
+                self.pyboy.button_release(self._held)
+            self.pyboy.button_press(name)
+            self._held = name
+        # Advance the frame(s) with the button still held; render only the last.
+        if self.frame_skip > 1:
+            self.pyboy.tick(self.frame_skip - 1, False)
+        self.pyboy.tick(1, True)
+
+    def _advance_pulsed(self, name: str) -> None:
+        """Legacy press/hold/release model (broken at frame_skip=1, hold=0)."""
         # Hold the button for hold_frames (skipped frames -> render=False).
         self.pyboy.button_press(name)
-        self.pyboy.tick(self.hold_frames, False)
+        if self.hold_frames > 0:
+            self.pyboy.tick(self.hold_frames, False)
         self.pyboy.button_release(name)
 
         # Coast the remaining frames; render only the very last one.
@@ -74,17 +134,16 @@ class PokeEnv:
             self.pyboy.tick(remaining - 1, False)
         self.pyboy.tick(1, True)
 
-        obs = self._obs()
-        ram = self.raw_wram()
-        done = False
-        info = {"action": name, "map_id": self.pyboy.memory[MAP_ID_ADDR]}
-        return obs, ram, done, info
-
     # ----------------------------------------------------------------- state io
-    def _flush_input(self) -> None:
-        """Clear any queued/held input so a following save_state is deterministic."""
+    def release_all(self) -> None:
+        """Release every button (sticky no-op) and forget the held action."""
         for name in ACTIONS:
             self.pyboy.button_release(name)
+        self._held = None
+
+    def _flush_input(self) -> None:
+        """Clear any queued/held input so a following save_state is deterministic."""
+        self.release_all()
         # A single tick drains PyBoy's internal input queue into a settled state.
         self.pyboy.tick(1, False)
 
