@@ -73,6 +73,19 @@ class PokeEnv:
         block = self.pyboy.memory[WRAM_START:WRAM_END]
         return np.frombuffer(bytes(block), dtype=np.uint8)
 
+    def wram_strided(self, stride: int = 64) -> np.ndarray:
+        """A strided slice of the WRAM block: ``memory[0xC000:0xE000:stride]``.
+
+        The hot path (novelty cell key + obs RAM bytes) only ever samples WRAM at
+        a stride, so reading the full 8 KB and slicing wastes ~0.38 ms/step. The
+        emulator's strided read materialises ~128 bytes directly (~0.01 ms). The
+        default stride matches :attr:`NoveltyArchive.wram_stride`, so the returned
+        vector is exactly ``raw_wram()[::stride]`` — the compact/full paths agree
+        byte-for-byte.
+        """
+        block = self.pyboy.memory[WRAM_START:WRAM_END:stride]
+        return np.frombuffer(bytes(block), dtype=np.uint8)
+
     # ---------------------------------------------------------------- lifecycle
     def reset(self, state_path: str | None = None) -> np.ndarray:
         """Reset to a canonical state (if given) or boot fresh; return the observation."""
@@ -100,6 +113,22 @@ class PokeEnv:
         done = False
         info = {"action": name, "map_id": self.pyboy.memory[MAP_ID_ADDR]}
         return obs, ram, done, info
+
+    def step_fast(self, action_idx: int, wram_stride: int = 64):
+        """Slim hot-path step: advance one action, return ``(obs, wram64, done)``.
+
+        Identical dynamics to :meth:`step` but (a) reads WRAM strided instead of
+        the full 8 KB block and (b) skips the per-step ``info`` dict allocation.
+        Used by the parallel worker fleet where map-id / action name are not
+        needed on the hot path (measured ~3.10 ms -> ~2.41 ms/step on this box
+        under load). ``done`` is always ``False`` for now (see class docstring).
+        """
+        name = ACTIONS[action_idx]
+        if self.sticky_input:
+            self._advance_sticky(name)
+        else:
+            self._advance_pulsed(name)
+        return self._obs(), self.wram_strided(wram_stride), False
 
     def _advance_sticky(self, name: str) -> None:
         """Hold `name` down across frame_skip ticks; only re-press on a change.

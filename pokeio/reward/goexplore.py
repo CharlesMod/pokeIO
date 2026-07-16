@@ -140,6 +140,43 @@ class GoExplore:
             gen_seen=self.cur_gen,
         )
 
+    def revisit(self, key: bytes) -> bool:
+        """Bump visit/recency bookkeeping for an already-stored cell.
+
+        Returns True if ``key`` was a known frontier cell (bookkeeping applied),
+        False otherwise.  Split out of :meth:`note` for the parallel loop, where
+        the parent knows ``globally_new`` and whether a state was captured in a
+        worker, and only needs the revisit branch here.
+        """
+        entry = self.cells.get(key)
+        if entry is None:
+            return False
+        entry.visits += 1
+        entry.gen_seen = self.cur_gen
+        return True
+
+    def store_captured(self, key: bytes, state: bytes, depth: int) -> None:
+        """Store a state blob captured in a worker for a freshly-discovered cell.
+
+        The parallel fleet captures the emulator state inside the worker that
+        first reached ``key`` (one barrier round after the cell is flagged
+        globally-new, i.e. while the worker still sits in that exact state), then
+        hands the bytes to the parent, which calls this.  Mirrors the capture
+        branch of :meth:`note` (capacity-bounded, evicts the least-useful entry).
+        """
+        if key in self.cells:  # already stored (e.g. flagged twice); keep first
+            return
+        self.n_captured += 1
+        if len(self.cells) >= self.capacity:
+            self._evict_one()
+        self.cells[key] = CellEntry(
+            key=key,
+            state=state,
+            depth=int(depth),
+            gen_added=self.cur_gen,
+            gen_seen=self.cur_gen,
+        )
+
     # ---------------------------------------------------------------- weight
     def _weight(self, e: CellEntry) -> float:
         """Sampling weight: rare, recent, deep and seldom-restarted cells win."""

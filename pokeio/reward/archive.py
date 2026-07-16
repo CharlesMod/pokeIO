@@ -109,6 +109,28 @@ class NoveltyArchive:
         wd = self._wram_digest(wram).tobytes()
         return sd + b"|" + wd
 
+    def _wram_digest_compact(self, wram_strided: np.ndarray) -> np.ndarray:
+        """Quantize an ALREADY-strided WRAM slice (``wram[::wram_stride]``).
+
+        The parallel workers read WRAM strided at :attr:`wram_stride` directly
+        (``env.wram_strided()``), so the input is the digest's stride slice with
+        no further subsampling — quantize it in place.
+        """
+        step = max(1, 256 // self.wram_levels)
+        return (wram_strided // step).astype(np.uint8)
+
+    def cell_key_compact(self, screen: np.ndarray, wram_strided: np.ndarray) -> bytes:
+        """Cell key from a screen + a pre-strided WRAM slice.
+
+        Byte-identical to :meth:`cell_key` when ``wram_strided ==
+        raw_wram()[::wram_stride]`` — the compact path the workers use produces
+        exactly the same fingerprint as the full-block path used by the parent
+        showcase/replay, so novelty accounting is consistent across both.
+        """
+        sd = self._screen_digest(screen).tobytes()
+        wd = self._wram_digest_compact(wram_strided).tobytes()
+        return sd + b"|" + wd
+
     # --------------------------------------------------------------- updates
     def add(self, key: bytes) -> bool:
         """Insert a cell key; return True iff it was newly discovered globally.

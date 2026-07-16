@@ -36,6 +36,7 @@ for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
     os.environ.setdefault(_v, "1")
 
 import multiprocessing as mp  # noqa: E402
+import time  # noqa: E402
 from multiprocessing import shared_memory  # noqa: E402
 
 import numpy as np  # noqa: E402
@@ -53,6 +54,9 @@ NUMA_NODES = {
 
 # Field dtype for all obs sheets.
 _DTYPE = np.float32
+
+# 0xC000..0xE000 == 8192 bytes of WRAM (see emu/env.py).
+WRAM_END_LEN = 8192
 _ACK_TIMEOUT = 30.0  # seconds to wait for a worker ack before declaring it dead
 
 
@@ -355,4 +359,431 @@ class VecFleet:
             pass
 
 
-__all__ = ["VecFleet", "NUMA_NODES"]
+# ==========================================================================
+# ObsEncoder — small screen+RAM observation encoder (numpy-only, torch-free)
+# ==========================================================================
+# Lives here (not train/loop.py) so the barrier workers can import it WITHOUT
+# pulling torch into 32 spawned processes. loop.py re-imports it from here.
+_SCREEN_H = 144
+_SCREEN_W = 160
+
+
+def _area_matrix(in_size: int, out_size: int) -> np.ndarray:
+    """(out_size, in_size) row-normalized area-overlap resample matrix."""
+    m = np.zeros((out_size, in_size), dtype=np.float64)
+    scale = in_size / out_size
+    for i in range(out_size):
+        lo, hi = i * scale, (i + 1) * scale
+        j0, j1 = int(np.floor(lo)), int(np.ceil(hi))
+        for j in range(j0, min(j1, in_size)):
+            overlap = min(hi, j + 1) - max(lo, j)
+            if overlap > 0:
+                m[i, j] = overlap
+        s = m[i].sum()
+        if s > 0:
+            m[i] /= s
+    return m
+
+
+class ObsEncoder:
+    """Raw (144,160) uint8 screen -> flat [obs_res*obs_res + n_ram] float32 obs."""
+
+    def __init__(self, res: int, n_ram: int) -> None:
+        self.res = int(res)
+        self.n_ram = int(n_ram)
+        self._row = _area_matrix(_SCREEN_H, self.res)  # (res, H)
+        self._col = _area_matrix(_SCREEN_W, self.res).T  # (W, res)
+        self.dim = self.res * self.res + self.n_ram
+
+    def encode(self, screen: np.ndarray, wram: np.ndarray) -> np.ndarray:
+        small = self._row @ screen.astype(np.float64) @ self._col  # (res,res) 0..255
+        vis = (small / 255.0).astype(np.float32).ravel()
+        if self.n_ram > 0:
+            stride = max(1, wram.size // self.n_ram)
+            ram = (wram[::stride][: self.n_ram].astype(np.float32)) / 255.0
+            if ram.size < self.n_ram:  # pad if short
+                ram = np.concatenate([ram, np.zeros(self.n_ram - ram.size, np.float32)])
+            return np.concatenate([vis, ram])
+        return vis
+
+    def encode_compact(self, screen: np.ndarray, wram_strided: np.ndarray) -> np.ndarray:
+        """Encode from a pre-strided WRAM slice (the worker hot path).
+
+        Byte-identical to :meth:`encode` when ``wram_strided`` is
+        ``raw_wram()[::wram_stride]`` and ``wram_stride`` divides the encoder's
+        own RAM stride (true for the defaults: obs samples every 1024th byte,
+        the archive every 64th, and 1024 % 64 == 0).
+        """
+        small = self._row @ screen.astype(np.float64) @ self._col
+        vis = (small / 255.0).astype(np.float32).ravel()
+        if self.n_ram > 0:
+            stride = max(1, wram_strided.size // self.n_ram)
+            ram = (wram_strided[::stride][: self.n_ram].astype(np.float32)) / 255.0
+            if ram.size < self.n_ram:
+                ram = np.concatenate([ram, np.zeros(self.n_ram - ram.size, np.float32)])
+            return np.concatenate([vis, ram])
+        return vis
+
+
+# ==========================================================================
+# BarrierFleet — shared-memory, spin-barrier, in-worker hashing/encoding
+# ==========================================================================
+# Ops signalled to workers via the shared control block.
+_OP_STEP = 0
+_OP_RESET = 1
+_OP_SHUTDOWN = 2
+
+# Per-env emulator save_state blob is ~200 KB; bound the shared capture/restore
+# buffers a little above that. (Go-Explore state transport.)
+_MAX_STATE = 262144  # 256 KiB
+
+
+def _spin_wait(pred, spin_budget: int = 3000, nap: float = 5e-5) -> None:
+    """Wait on ``pred`` (a cheap shm read): brief busy spin, then yield.
+
+    The barrier flags live in shared memory, so the wait is a tight numpy read
+    rather than a blocking pipe round-trip (which caps the pipe-based VecFleet at
+    ~2.9k steps/s).  Lockstep means that whenever one side is waiting the OTHER
+    side is doing the actual work (a ~2 ms step or forward), so a long busy spin
+    would just steal cores from the active side — costly on a shared box (live1 +
+    sibling agents).  A short spin keeps hand-off latency low, then we sleep a
+    few tens of µs so a waiting process frees its core.
+    """
+    i = 0
+    while not pred():
+        i += 1
+        if i >= spin_budget:
+            time.sleep(nap)
+
+
+def _barrier_worker_main(
+    slice_lo, slice_hi, rom_path, frame_skip, hold_frames, reset_state,
+    obs_res, obs_ram, wram_stride, arch_kwargs, goexplore,
+    shm_names, n_envs, obs_dim, key_len, core,
+):
+    """Worker process: owns envs ``[slice_lo:slice_hi]``; hashes + encodes locally.
+
+    Per barrier round the worker advances each of its envs one agent-step, writes
+    the compact obs + the novelty cell key (both computed here, off the parent's
+    critical path) into shared memory, then flips its barrier flag.  For
+    Go-Explore it (a) restores a provided state at reset and (b) captures its
+    current state on request (one round after the parent flags a globally-new
+    cell, while the env still sits in that exact state).
+    """
+    # Late imports so the child starts clean under 'spawn' (torch is never
+    # imported in a worker — only numpy / pyboy / the reward hashing).
+    import io as _io
+
+    from pokeio.emu.env import PokeEnv
+    from pokeio.reward.archive import NoveltyArchive
+
+    try:
+        if core is not None:
+            psutil.Process().cpu_affinity([core])
+    except Exception:
+        pass
+
+    encoder = ObsEncoder(obs_res, obs_ram)
+    archive = NoveltyArchive(**arch_kwargs)  # used only as a stateless key hasher
+
+    def _attach(name, shape, dtype):
+        shm = shared_memory.SharedMemory(name=name)
+        return shm, np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+
+    shms = []
+
+    def reg(name, shape, dtype):
+        shm, arr = _attach(shm_names[name], shape, dtype)
+        shms.append(shm)
+        return arr
+
+    obs = reg("obs", (n_envs, obs_dim), np.float32)
+    screens = reg("screens", (n_envs, _SCREEN_H, _SCREEN_W), np.uint8)
+    keys = reg("keys", (n_envs, key_len), np.uint8)
+    actions = reg("actions", (n_envs,), np.int32)
+    dones = reg("dones", (n_envs,), np.uint8)
+    cap_flag = reg("cap_flag", (n_envs,), np.uint8)
+    cap_done = reg("cap_done", (n_envs,), np.uint8)
+    cap_state = reg("cap_state", (n_envs, _MAX_STATE), np.uint8)
+    cap_len = reg("cap_len", (n_envs,), np.int32)
+    res_flag = reg("res_flag", (n_envs,), np.uint8)
+    res_state = reg("res_state", (n_envs, _MAX_STATE), np.uint8)
+    res_len = reg("res_len", (n_envs,), np.int32)
+    ctl = reg("ctl", (2 + n_envs,), np.int64)  # [0]=go_round [1]=op [2+i]=wdone_i
+
+    envs = [
+        PokeEnv(rom_path, frame_skip=frame_skip, hold_frames=hold_frames)
+        for _ in range(slice_lo, slice_hi)
+    ]
+
+    def _emit(local_i, global_i, screen, w64):
+        screens[global_i] = screen
+        obs[global_i] = encoder.encode_compact(screen, w64)
+        k = archive.cell_key_compact(screen, w64)
+        keys[global_i] = np.frombuffer(k, dtype=np.uint8)
+
+    local_round = 1
+    try:
+        while True:
+            _spin_wait(lambda: ctl[0] >= local_round)
+            op = int(ctl[1])
+            if op == _OP_SHUTDOWN:
+                break
+            for li, gi in enumerate(range(slice_lo, slice_hi)):
+                env = envs[li]
+                if op == _OP_RESET:
+                    if goexplore and res_flag[gi]:
+                        env.load_state(bytes(res_state[gi, : int(res_len[gi])]))
+                        env.pyboy.tick(1, True)
+                        screen = env._obs()
+                        w64 = env.wram_strided(wram_stride)
+                    else:
+                        screen = env.reset(reset_state)
+                        w64 = env.wram_strided(wram_stride)
+                    dones[gi] = 0
+                    _emit(li, gi, screen, w64)
+                else:  # _OP_STEP
+                    # Deferred Go-Explore capture: save the state we are STILL in
+                    # (from last round) before applying this round's action.
+                    if goexplore and cap_flag[gi]:
+                        buf = _io.BytesIO()
+                        env.pyboy.save_state(buf)
+                        blob = buf.getvalue()
+                        n = min(len(blob), _MAX_STATE)
+                        cap_state[gi, :n] = np.frombuffer(blob[:n], dtype=np.uint8)
+                        cap_len[gi] = n
+                        cap_done[gi] = 1
+                    else:
+                        cap_done[gi] = 0
+                    screen, w64, done = env.step_fast(int(actions[gi]), wram_stride)
+                    dones[gi] = 1 if done else 0
+                    _emit(li, gi, screen, w64)
+            # signal this round complete
+            for gi in range(slice_lo, slice_hi):
+                ctl[2 + gi] = local_round
+            local_round += 1
+    finally:
+        for env in envs:
+            try:
+                env.close()
+            except Exception:
+                pass
+        for s in shms:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+class BarrierFleet:
+    """Shared-memory, spin-barrier fleet of PokeEnv workers.
+
+    Workers own contiguous slices of the ``n_envs`` emulators (``envs_per_worker``
+    each), advance them in lockstep, and hash/encode observations locally so the
+    parent's per-round work is only: one batched GPU forward, cheap archive
+    dict-ops, and (optionally) Go-Explore state transport.  The parent drives the
+    barrier with a monotonic round counter in shared memory — no per-step pickled
+    pipe round-trips.
+    """
+
+    def __init__(
+        self,
+        n_envs: int,
+        obs_dim: int,
+        obs_res: int,
+        obs_ram: int,
+        rom_path: str,
+        frame_skip: int,
+        hold_frames: int,
+        reset_state: str,
+        archive_kwargs: dict,
+        wram_stride: int = 64,
+        goexplore: bool = False,
+        envs_per_worker: int = 1,
+    ):
+        self.n_envs = int(n_envs)
+        self.obs_dim = int(obs_dim)
+        self.goexplore = bool(goexplore)
+        self.wram_stride = int(wram_stride)
+
+        # Derive the fixed cell-key length from the archive's geometry.
+        probe = _archive_key_len(archive_kwargs, wram_stride)
+        self.key_len = probe
+
+        # ------------------------------------------------------------ shm
+        self._blocks: dict[str, shared_memory.SharedMemory] = {}
+        self.arr: dict[str, np.ndarray] = {}
+
+        def alloc(name, shape, dtype):
+            nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+            shm = shared_memory.SharedMemory(create=True, size=max(1, nbytes))
+            self._blocks[name] = shm
+            self.arr[name] = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+
+        n = self.n_envs
+        alloc("obs", (n, self.obs_dim), np.float32)
+        alloc("screens", (n, _SCREEN_H, _SCREEN_W), np.uint8)
+        alloc("keys", (n, self.key_len), np.uint8)
+        alloc("actions", (n,), np.int32)
+        alloc("dones", (n,), np.uint8)
+        alloc("cap_flag", (n,), np.uint8)
+        alloc("cap_done", (n,), np.uint8)
+        alloc("cap_state", (n, _MAX_STATE), np.uint8)
+        alloc("cap_len", (n,), np.int32)
+        alloc("res_flag", (n,), np.uint8)
+        alloc("res_state", (n, _MAX_STATE), np.uint8)
+        alloc("res_len", (n,), np.int32)
+        alloc("ctl", (2 + n,), np.int64)
+
+        self._ctl = self.arr["ctl"]
+        self._ctl[:] = 0
+        self._round = 0
+        self._shm_names = {k: v.name for k, v in self._blocks.items()}
+
+        # ------------------------------------------------------------ workers
+        self._ctx = mp.get_context("spawn")
+        core_order = _numa_core_order()
+        epw = max(1, int(envs_per_worker))
+        self._procs: list = []
+        self._slices: list[tuple[int, int]] = []
+        wi = 0
+        for lo in range(0, n, epw):
+            hi = min(lo + epw, n)
+            core = core_order[wi % len(core_order)] if core_order else None
+            p = self._ctx.Process(
+                target=_barrier_worker_main,
+                args=(
+                    lo, hi, rom_path, frame_skip, hold_frames, reset_state,
+                    obs_res, obs_ram, self.wram_stride, dict(archive_kwargs),
+                    self.goexplore, self._shm_names, n, self.obs_dim,
+                    self.key_len, core,
+                ),
+                daemon=True,
+            )
+            p.start()
+            self._procs.append(p)
+            self._slices.append((lo, hi))
+            wi += 1
+        self.n_workers = len(self._procs)
+        self._closed = False
+
+    # ------------------------------------------------------------------ barrier
+    def _run_round(self, op: int) -> None:
+        self._round += 1
+        self._ctl[1] = op
+        self._ctl[0] = self._round  # release workers
+        target = self._round
+        ctl = self._ctl
+        n = self.n_envs
+        wdone = ctl[2:2 + n]
+        i = 0
+        while not bool((wdone >= target).all()):
+            i += 1
+            if i >= 3000:
+                # Liveness guard: a crashed worker can never flip its flag, so
+                # spinning forever would wedge the whole run. Check periodically.
+                if i % 20000 == 0 and any(not p.is_alive() for p in self._procs):
+                    raise RuntimeError(
+                        "BarrierFleet worker died mid-round; aborting (see stderr)"
+                    )
+                time.sleep(5e-5)
+
+    # ------------------------------------------------------------------ control
+    def reset_all(self, restore: dict[int, bytes] | None = None) -> np.ndarray:
+        """Reset all envs (optionally restoring per-index Go-Explore states).
+
+        ``restore`` maps env index -> save_state blob; those envs load the blob
+        instead of the canonical reset state.  Returns the encoded obs block
+        (a copy, safe across the next round)."""
+        self.arr["res_flag"][:] = 0
+        if restore and self.goexplore:
+            for idx, blob in restore.items():
+                b = blob[:_MAX_STATE]
+                self.arr["res_state"][idx, : len(b)] = np.frombuffer(b, dtype=np.uint8)
+                self.arr["res_len"][idx] = len(b)
+                self.arr["res_flag"][idx] = 1
+        self._run_round(_OP_RESET)
+        return self.arr["obs"].copy()
+
+    def step_all(self, actions: np.ndarray, capture_flags: np.ndarray | None = None):
+        """Advance one agent-step; return ``(obs, keys, dones, captured)``.
+
+        ``capture_flags`` (len n, uint8) requests a Go-Explore state capture for
+        the flagged envs BEFORE they apply this step's action — i.e. it captures
+        the state reported in the *previous* round.  ``captured`` maps env index
+        -> state bytes for envs that captured this round.
+        """
+        self.arr["actions"][: len(actions)] = np.asarray(actions, dtype=np.int32)
+        if self.goexplore and capture_flags is not None:
+            self.arr["cap_flag"][:] = capture_flags
+        else:
+            self.arr["cap_flag"][:] = 0
+        self._run_round(_OP_STEP)
+        obs = self.arr["obs"]
+        keys = self.arr["keys"]
+        dones = self.arr["dones"].astype(bool)
+        captured: dict[int, bytes] = {}
+        if self.goexplore:
+            cd = self.arr["cap_done"]
+            cl = self.arr["cap_len"]
+            cs = self.arr["cap_state"]
+            for i in range(self.n_envs):
+                if cd[i]:
+                    captured[i] = bytes(cs[i, : int(cl[i])])
+        return obs, keys, dones, captured
+
+    @property
+    def screens(self) -> np.ndarray:
+        """Live view of the current per-env raw screens (for the live swarm)."""
+        return self.arr["screens"]
+
+    def key_bytes(self, i: int) -> bytes:
+        return self.arr["keys"][i].tobytes()
+
+    # ------------------------------------------------------------------ shutdown
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._ctl[1] = _OP_SHUTDOWN
+            self._round += 1
+            self._ctl[0] = self._round
+        except Exception:
+            pass
+        for p in self._procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=5)
+        for shm in self._blocks.values():
+            try:
+                shm.close()
+                shm.unlink()
+            except Exception:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _archive_key_len(archive_kwargs: dict, wram_stride: int) -> int:
+    """Exact byte length of a compact cell key for the given archive geometry."""
+    from pokeio.reward.archive import NoveltyArchive
+
+    a = NoveltyArchive(**archive_kwargs)
+    dummy_screen = np.zeros((_SCREEN_H, _SCREEN_W), dtype=np.uint8)
+    dummy_w = np.zeros((WRAM_END_LEN // wram_stride,), dtype=np.uint8)
+    return len(a.cell_key_compact(dummy_screen, dummy_w))
+
+
+__all__ = ["VecFleet", "BarrierFleet", "ObsEncoder", "NUMA_NODES"]

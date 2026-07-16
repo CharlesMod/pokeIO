@@ -36,6 +36,7 @@ import torch
 
 from pokeio.config import Config
 from pokeio.emu.env import PokeEnv
+from pokeio.emu.fleet import BarrierFleet, ObsEncoder
 from pokeio.evo.forward import population_forward_sparse
 from pokeio.evo.genome import InnovationTracker, Population, make_genome
 from pokeio.evo.ops import MutationRates, Speciation, compatibility_distance, reproduce
@@ -68,45 +69,9 @@ def pick_device(prefer: str = "cuda:1") -> torch.device:
     return torch.device("cpu")
 
 
-# --------------------------------------------------------------------------
-# small observation encoder (obs_res x obs_res grayscale + a few RAM bytes)
-# --------------------------------------------------------------------------
-def _area_matrix(in_size: int, out_size: int) -> np.ndarray:
-    m = np.zeros((out_size, in_size), dtype=np.float64)
-    scale = in_size / out_size
-    for i in range(out_size):
-        lo, hi = i * scale, (i + 1) * scale
-        j0, j1 = int(np.floor(lo)), int(np.ceil(hi))
-        for j in range(j0, min(j1, in_size)):
-            overlap = min(hi, j + 1) - max(lo, j)
-            if overlap > 0:
-                m[i, j] = overlap
-        s = m[i].sum()
-        if s > 0:
-            m[i] /= s
-    return m
-
-
-class ObsEncoder:
-    """Raw (144,160) uint8 screen -> flat [obs_res*obs_res + n_ram] float32 obs."""
-
-    def __init__(self, res: int, n_ram: int) -> None:
-        self.res = int(res)
-        self.n_ram = int(n_ram)
-        self._row = _area_matrix(_SCREEN_H, self.res)  # (res, H)
-        self._col = _area_matrix(_SCREEN_W, self.res).T  # (W, res)
-        self.dim = self.res * self.res + self.n_ram
-
-    def encode(self, screen: np.ndarray, wram: np.ndarray) -> np.ndarray:
-        small = self._row @ screen.astype(np.float64) @ self._col  # (res,res) 0..255
-        vis = (small / 255.0).astype(np.float32).ravel()
-        if self.n_ram > 0:
-            stride = max(1, wram.size // self.n_ram)
-            ram = (wram[::stride][: self.n_ram].astype(np.float32)) / 255.0
-            if ram.size < self.n_ram:  # pad if short
-                ram = np.concatenate([ram, np.zeros(self.n_ram - ram.size, np.float32)])
-            return np.concatenate([vis, ram])
-        return vis
+# The observation encoder (ObsEncoder) lives in pokeio.emu.fleet so the barrier
+# worker processes can import it WITHOUT pulling torch into every child; it is
+# re-exported here for callers that historically imported it from the loop.
 
 
 # --------------------------------------------------------------------------
@@ -228,6 +193,115 @@ def evaluate_wave(
         # Stream a live sample ~3 Hz (throttled internally; cheap when not due).
         if streamer is not None:
             streamer.maybe_write(gen, screens, wave.fitness, dead)
+
+    for i, g in enumerate(genomes):
+        g.fitness = float(wave.fitness[i])
+    return n * episode_steps
+
+
+def evaluate_wave_parallel(
+    genomes,
+    fleet: BarrierFleet,
+    archive: NoveltyArchive,
+    device: torch.device,
+    episode_steps: int,
+    max_nodes: int,
+    max_conns: int,
+    streamer: LiveStreamer | None = None,
+    gen: int = 0,
+    novelty_mode: str = "rarity",
+    novelty_floor: float = 0.1,
+    goexplore: GoExplore | None = None,
+    restore_prob: float = 0.5,
+) -> int:
+    """Parallel-barrier equivalent of :func:`evaluate_wave`.
+
+    The emulators are stepped concurrently across the fleet's worker processes;
+    each worker hashes the novelty cell key and encodes the observation locally,
+    so the parent's per-round work is just one batched GPU forward plus cheap
+    archive/Go-Explore bookkeeping.  Behaviour (novelty modes, Go-Explore
+    cell-restore + capture) matches :func:`evaluate_wave`; the only intentional
+    difference is that a globally-new cell's emulator state is captured one
+    barrier round after discovery (while the worker still sits in that state),
+    and captures on the final episode step are dropped.
+    """
+    n = len(genomes)  # sub-wave size (<= fleet.n_envs)
+    wave = WaveNovelty(archive, n, mode=novelty_mode, floor=novelty_floor)
+
+    # Reset the fleet; a fraction of players restore from a sampled frontier cell.
+    restore: dict[int, bytes] = {}
+    if goexplore is not None and goexplore.size > 0:
+        for i in range(n):
+            if goexplore.rng.random() < restore_prob:
+                entry = goexplore.sample()
+                if entry is not None:
+                    restore[i] = entry.state
+        goexplore.n_restores += len(restore)
+    obs = fleet.reset_all(restore if restore else None)  # (n_envs, obs_dim)
+
+    pop = Population.from_genomes(genomes, max_nodes=max_nodes, max_conns=max_conns)
+    cp = pop.compile(device)
+
+    dead = [False] * n
+    n_envs = fleet.n_envs
+    cap_flags = np.zeros(n_envs, dtype=np.uint8)
+    pending: dict[int, tuple[bytes, int]] = {}
+    actions_full = np.zeros(n_envs, dtype=np.int32)
+
+    import os as _os
+    _prof = _os.environ.get("POKEIO_PROF") == "1"
+    _t_fwd = _t_step = _t_book = 0.0
+
+    for t in range(episode_steps):
+        _c0 = time.perf_counter() if _prof else 0.0
+        X = np.ascontiguousarray(obs[:n], dtype=np.float32)
+        xt = torch.from_numpy(X).to(device).unsqueeze(1)  # (n,1,dim)
+        out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
+        actions = out[:, 0, :].argmax(dim=1).cpu().numpy()
+        actions_full[:] = 0
+        actions_full[:n] = actions
+        if _prof:
+            _c1 = time.perf_counter()
+            _t_fwd += _c1 - _c0
+
+        obs, keys, dones, captured = fleet.step_all(
+            actions_full, cap_flags if goexplore is not None else None
+        )
+        if _prof:
+            _c2 = time.perf_counter()
+            _t_step += _c2 - _c1
+
+        # Fulfil captures requested last round (state is the cell as first reached).
+        if goexplore is not None and pending:
+            for idx, (key, depth) in pending.items():
+                blob = captured.get(idx)
+                if blob is not None:
+                    goexplore.store_captured(key, blob, depth)
+            pending = {}
+
+        cap_flags[:] = 0
+        for i in range(n):
+            key = keys[i].tobytes()
+            globally_new = archive.add(key)
+            prior = archive.visit(key)
+            wave.observe_key(i, key, globally_new, prior)
+            dead[i] = dead[i] or bool(dones[i])
+            if goexplore is not None:
+                if not goexplore.revisit(key) and globally_new:
+                    cap_flags[i] = 1
+                    pending[i] = (key, t)
+
+        if streamer is not None:
+            streamer.maybe_write(gen, fleet.screens[:n], wave.fitness, dead)
+        if _prof:
+            _t_book += time.perf_counter() - _c2
+
+    if _prof:
+        tot = _t_fwd + _t_step + _t_book
+        print(f"[prof] rounds={episode_steps} tot={tot:.2f}s  "
+              f"fwd={_t_fwd/episode_steps*1000:.2f}ms  "
+              f"step_barrier={_t_step/episode_steps*1000:.2f}ms  "
+              f"book={_t_book/episode_steps*1000:.2f}ms/round")
 
     for i, g in enumerate(genomes):
         g.fitness = float(wave.fitness[i])
@@ -361,6 +435,8 @@ def train(
     goexplore_capacity: int = 2048,
     auto_species: bool = True,
     species_target: int = 6,
+    parallel: bool = True,
+    envs_per_worker: int = 1,
 ) -> Path:
     device = pick_device(device_str)
     rng = np.random.default_rng(config.run.seed)
@@ -413,16 +489,54 @@ def train(
 
     # Create the emulator pool once; reused across every wave/generation.
     rom = config.emu.rom_path
-    print(f"[train] booting {players} PokeEnv instances (rom={rom}) ...")
-    envs = [
-        PokeEnv(
+    reset_state = config.emu.reset_state
+    archive_kwargs = dict(
+        screen_cells=archive.screen_cells,
+        screen_levels=archive.screen_levels,
+        wram_stride=archive.wram_stride,
+        wram_levels=archive.wram_levels,
+    )
+
+    fleet: BarrierFleet | None = None
+    envs: list[PokeEnv] = []
+    replay_env: PokeEnv | None = None
+    if parallel:
+        print(
+            f"[train] PARALLEL fleet: {players} PokeEnv workers "
+            f"(envs_per_worker={envs_per_worker}, rom={rom}) ..."
+        )
+        fleet = BarrierFleet(
+            n_envs=players,
+            obs_dim=encoder.dim,
+            obs_res=obs_res,
+            obs_ram=config.vision.obs_ram_bytes,
+            rom_path=rom,
+            frame_skip=config.emu.frame_skip,
+            hold_frames=config.emu.button_hold_frames,
+            reset_state=reset_state,
+            archive_kwargs=archive_kwargs,
+            wram_stride=archive.wram_stride,
+            goexplore=bool(go),
+            envs_per_worker=envs_per_worker,
+        )
+        print(f"[train] fleet up: {fleet.n_workers} worker procs")
+        # A single parent-side env for the per-generation champion replay.
+        replay_env = PokeEnv(
             rom,
             frame_skip=config.emu.frame_skip,
             hold_frames=config.emu.button_hold_frames,
         )
-        for _ in range(players)
-    ]
-    reset_state = config.emu.reset_state
+    else:
+        print(f"[train] SERIAL: booting {players} PokeEnv instances (rom={rom}) ...")
+        envs = [
+            PokeEnv(
+                rom,
+                frame_skip=config.emu.frame_skip,
+                hold_frames=config.emu.button_hold_frames,
+            )
+            for _ in range(players)
+        ]
+        replay_env = envs[0]
 
     # Live streaming: a dedicated showcase env that continuously plays the
     # best-genome-so-far, plus a throttled atomic writer for runs/<id>/live.json.
@@ -464,23 +578,40 @@ def train(
             steps_done = 0
             for a in range(0, pop_size, players):
                 wave = genomes[a : a + players]
-                steps_done += evaluate_wave(
-                    wave,
-                    envs[: len(wave)],
-                    encoder,
-                    archive,
-                    device,
-                    episode_steps,
-                    max_nodes,
-                    max_conns,
-                    reset_state,
-                    streamer=streamer,
-                    gen=gen,
-                    novelty_mode=novelty_mode,
-                    novelty_floor=config.reward.novelty_floor,
-                    goexplore=go,
-                    restore_prob=restore_prob,
-                )
+                if parallel:
+                    steps_done += evaluate_wave_parallel(
+                        wave,
+                        fleet,
+                        archive,
+                        device,
+                        episode_steps,
+                        max_nodes,
+                        max_conns,
+                        streamer=streamer,
+                        gen=gen,
+                        novelty_mode=novelty_mode,
+                        novelty_floor=config.reward.novelty_floor,
+                        goexplore=go,
+                        restore_prob=restore_prob,
+                    )
+                else:
+                    steps_done += evaluate_wave(
+                        wave,
+                        envs[: len(wave)],
+                        encoder,
+                        archive,
+                        device,
+                        episode_steps,
+                        max_nodes,
+                        max_conns,
+                        reset_state,
+                        streamer=streamer,
+                        gen=gen,
+                        novelty_mode=novelty_mode,
+                        novelty_floor=config.reward.novelty_floor,
+                        goexplore=go,
+                        restore_prob=restore_prob,
+                    )
 
             fits = np.array([g.fitness for g in genomes], dtype=np.float64)
             champ_idx = int(fits.argmax())
@@ -496,9 +627,9 @@ def train(
             cpu_pct = psutil.cpu_percent(None)
             sps = steps_done / gen_dt if gen_dt > 0 else 0.0
 
-            # short champion replay for the live feed
+            # short champion replay for the live feed (parent-side env)
             replay_champion(
-                champion, envs[0], encoder, archive, device,
+                champion, replay_env, encoder, archive, device,
                 min(champion_steps, episode_steps), writer,
                 max_nodes, max_conns, reset_state,
             )
@@ -557,8 +688,12 @@ def train(
                     c3=0.4,
                 )
 
+    if fleet is not None:
+        fleet.close()
     for e in envs:
         e.close()
+    if parallel and replay_env is not None:
+        replay_env.close()
     if showcase_env is not None:
         showcase_env.close()
     print(f"[train] done. telemetry -> {run_dir / 'telemetry.jsonl'}")
@@ -617,6 +752,13 @@ def main() -> None:
                     help="use the fixed config species_threshold instead")
     ap.add_argument("--species-target", type=int, default=6,
                     help="target species count for the adaptive threshold")
+    # -- parallelism ------------------------------------------------------
+    ap.add_argument("--parallel", dest="parallel", action="store_true", default=True,
+                    help="evaluate waves across a shared-memory worker fleet (default ON)")
+    ap.add_argument("--no-parallel", dest="parallel", action="store_false",
+                    help="single-process serial evaluation (legacy fallback)")
+    ap.add_argument("--envs-per-worker", type=int, default=1,
+                    help="emulators owned by each worker process (1 = max parallelism)")
     args = ap.parse_args()
 
     cfg = build_config(args)
@@ -636,6 +778,8 @@ def main() -> None:
         goexplore_capacity=args.goexplore_capacity,
         auto_species=args.auto_species,
         species_target=args.species_target,
+        parallel=args.parallel,
+        envs_per_worker=args.envs_per_worker,
     )
 
 

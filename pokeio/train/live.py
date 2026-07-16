@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -111,7 +112,16 @@ def build_swarm(
 # throttled atomic writer
 # --------------------------------------------------------------------------
 class LiveWriter:
-    """Throttled (~``hz``) atomic writer for ``<run_dir>/live.json``."""
+    """Throttled (~``hz``) atomic writer for ``<run_dir>/live.json``.
+
+    The serialize + disk write runs on a dedicated background thread so a slow
+    filesystem never stalls the training barrier: ``write`` just hands off the
+    (already plain-python) payload and returns immediately.  ``os.replace`` is
+    atomic on its own, so the previous inline ``os.fsync`` (~21 ms per call at
+    3 Hz — ~6% of a loop core) is dropped; a reader always sees a complete file.
+    Only the newest payload is kept — if the writer falls behind, stale frames
+    are discarded rather than queued.
+    """
 
     def __init__(self, run_dir: str | Path, hz: float = 3.0) -> None:
         rd = Path(run_dir)
@@ -120,20 +130,55 @@ class LiveWriter:
         self.tmp = rd / "live.json.tmp"
         self.interval = 1.0 / max(0.1, hz)
         self._last = 0.0
+        self._last_size = 0
+        # single-slot hand-off to the writer thread
+        self._pending: dict | None = None
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, name="live-writer", daemon=True)
+        self._thread.start()
 
     def due(self) -> bool:
         return (time.monotonic() - self._last) >= self.interval
 
     def write(self, payload: dict) -> int:
-        """Serialize + atomically replace. Returns bytes written."""
-        data = json.dumps(payload, separators=(",", ":")).encode()
-        with open(self.tmp, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(self.tmp, self.path)
+        """Hand the payload to the writer thread (non-blocking). Returns last size."""
+        with self._lock:
+            self._pending = payload
         self._last = time.monotonic()
-        return len(data)
+        self._wake.set()
+        return self._last_size
+
+    def _run(self) -> None:
+        while True:
+            self._wake.wait()
+            if self._stop and self._pending is None:
+                return
+            with self._lock:
+                payload = self._pending
+                self._pending = None
+                self._wake.clear()
+            if payload is None:
+                if self._stop:
+                    return
+                continue
+            try:
+                data = json.dumps(payload, separators=(",", ":")).encode()
+                with open(self.tmp, "wb") as fh:
+                    fh.write(data)
+                os.replace(self.tmp, self.path)
+                self._last_size = len(data)
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        self._stop = True
+        self._wake.set()
+        try:
+            self._thread.join(timeout=2)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------

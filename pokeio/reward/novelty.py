@@ -97,5 +97,45 @@ class WaveNovelty:
         self.fitness[player_idx] += self.floor + 1.0 / math.sqrt(1.0 + prior_visits)
         return True
 
+    def observe_key(
+        self,
+        player_idx: int,
+        key: bytes,
+        globally_new: bool,
+        prior_visits: int,
+    ) -> bool:
+        """Credit ``player_idx`` for a cell whose key was hashed elsewhere.
+
+        The parallel worker fleet computes ``cell_key`` (the expensive screen /
+        WRAM digest) inside each worker process and ships the key + the archive's
+        ``add``/``visit`` outcomes across the barrier, so the parent only does the
+        cheap credit bookkeeping here.  Semantics are identical to
+        :meth:`observe`; the caller must have already invoked
+        ``archive.add(key)`` (-> ``globally_new``) and ``archive.visit(key)``
+        (-> ``prior_visits``) in that order so the per-generation frontier and
+        visit counts stay consistent.
+        """
+        self.last_key[player_idx] = key
+        self.last_new[player_idx] = globally_new
+
+        if self.mode == "global":
+            if globally_new:
+                self.fitness[player_idx] += 1.0
+                return True
+            return False
+
+        if key in self._credited[player_idx]:
+            return False
+        self._credited[player_idx].add(key)
+
+        if self.mode == "per_gen":
+            if self.archive.is_gen_new(key):
+                self.fitness[player_idx] += 1.0
+                return True
+            return False
+
+        self.fitness[player_idx] += self.floor + 1.0 / math.sqrt(1.0 + prior_visits)
+        return True
+
 
 __all__ = ["WaveNovelty"]
