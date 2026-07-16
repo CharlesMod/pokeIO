@@ -179,7 +179,7 @@
   .foot{font-family:var(--mono); font-size:9px; letter-spacing:.1em; color:var(--ink-mute)}
 
   /* ---------- detail zone ---------- */
-  .dz{max-width:1580px; margin:0 auto; padding:4px 10px 26px; display:flex; flex-direction:column; gap:10px}
+  .dz{max-width:none; margin:0; padding:4px 10px 26px; display:flex; flex-direction:column; gap:10px}
   .dz-head{display:flex; align-items:center; gap:12px; padding:10px 14px;
     background:linear-gradient(180deg,var(--panel-2),var(--panel)); border:1px solid var(--line); border-radius:var(--r);
     font-family:var(--mono)}
@@ -385,7 +385,7 @@
 
   <!-- genotype + the network it paints -->
   <div style="display:grid;grid-template-columns:0.95fr 1.35fr;gap:10px">
-  <div class="panel" style="height:342px">
+  <div class="panel" style="height:clamp(260px,34vh,380px)">
     <header>
       <span class="lbl">The Genotype</span><span class="idx">// CPPN · the DNA · answers "what weight goes here?"</span>
       <span class="r"><span>gen <b id="gt-gen" style="color:var(--amber)">413</b></span><span><b id="gt-nodes">7</b> nodes</span><span><b id="gt-conns">14</b> conn</span><span id="gt-lastmut" style="color:var(--violet)">+node sin()</span></span>
@@ -395,7 +395,7 @@
       asked at every screen position — <b style="color:var(--amber)">weight out</b> paints the network at right, one answer per location
     </div>
   </div>
-  <div class="panel" style="height:342px">
+  <div class="panel" style="height:clamp(260px,34vh,380px)">
     <header>
       <span class="lbl">The Phenotype</span><span class="idx">// the live network the genotype paints</span>
       <span class="r"><span><b id="pn-n">10</b> neurons</span><span><b id="pn-w">1,760</b> painted weights</span><span style="color:var(--violet)">⟳ rewires on every mutation</span></span>
