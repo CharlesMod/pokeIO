@@ -220,7 +220,7 @@
         <div class="n">POKEMON — YELLOW</div>
         <div class="s">GB · optical + RAM · fs=1 · no priors</div>
       </div>
-      <div style="margin-left:16px" class="live"><span class="dot"></span>Training Live</div>
+      <div style="margin-left:16px" class="live" id="live-badge"><span class="dot"></span>Training Live</div>
     </div>
   </div>
 
@@ -1294,6 +1294,7 @@ window.pokeSelectAgent=function(id){
   let curFit=7418, curCells=3847, secs=38*3600+14*60+7;
 
   setInterval(()=>{
+    if(window.POKE_LIVE)return;
     const cpu=Math.round(rand(86,96)); document.getElementById('cpu-pct').textContent=cpu; document.getElementById('cpu-bar').style.width=cpu+'%';
     const g0=Math.round(rand(4,22)),g1=Math.round(rand(48,74));
     document.getElementById('g0-bar').style.width=g0+'%'; document.getElementById('g1-bar').style.width=g1+'%';
@@ -1315,6 +1316,7 @@ window.pokeSelectAgent=function(id){
   },2600);
 
   setInterval(()=>{
+    if(window.POKE_LIVE)return;
     gen++; document.getElementById('s-gen').textContent=gen;
     curFit+=ri(-20,140); if(curFit<best[best.length-1])curFit=best[best.length-1]+ri(0,30);
     best.push(curFit); med.push(curFit*rand(0.6,0.75)); nov.push(Math.max(40,nov[nov.length-1]+rand(-40,110)));
@@ -1583,5 +1585,80 @@ function loop(ts){const dt=Math.min(0.05,(ts-last)/1000||0);last=ts;time+=dt;
   if(!RM)requestAnimationFrame(loop);}
 if(RM){samplePlusFire();renderGraph(0,0);renderPheno(0,0);} else requestAnimationFrame(loop);
 if(!RM)setInterval(mutate,2600);
+})();
+</script>
+
+<script>
+/* ===== LIVE telemetry overlay (served dashboard only; artifact CSP blocks fetch) ===== */
+(function(){
+"use strict";
+const $=id=>document.getElementById(id);
+const fmt=n=>Math.round(n).toLocaleString();
+let lastGen=-1; const badge=$('live-badge');
+function setBadge(live,run){
+  if(!badge)return;
+  if(live){badge.style.color='var(--good)';badge.innerHTML='<span class="dot"></span>LIVE'+(run?' · '+run:'');}
+  else{badge.style.color='var(--warn)';badge.innerHTML='<span class="dot" style="background:var(--warn);box-shadow:none"></span>DEMO · simulated';}
+}
+function drawFitLive(recs){
+  const fig=$('fitfig'); if(!fig||!recs.length)return;
+  const W=320,H=132;
+  const best=recs.map(r=>r.fitness_best), med=recs.map(r=>r.fitness_median), nov=recs.map(r=>r.archive_cells||0);
+  const max=Math.max(1,Math.max.apply(null,best),Math.max.apply(null,nov))*1.05;
+  const path=arr=>arr.map((v,i)=>{const x=(i/Math.max(1,arr.length-1))*W;const y=H-6-(v/max)*(H-16);return (i?'L':'M')+x.toFixed(1)+' '+y.toFixed(1);}).join(' ');
+  let out='';
+  for(let g=0;g<4;g++){const y=6+g*((H-12)/3);out+='<line x1="0" y1="'+y+'" x2="'+W+'" y2="'+y+'" stroke="#2b261e" stroke-width="1"/>';}
+  const bp=path(best);
+  out+='<defs><linearGradient id="agl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#e0a838" stop-opacity="0.55"/><stop offset="1" stop-color="#e0a838" stop-opacity="0"/></linearGradient></defs>';
+  out+='<path d="'+bp+' L '+W+' '+H+' L 0 '+H+' Z" fill="url(#agl)" opacity="0.18"/>';
+  out+='<path d="'+path(nov)+'" fill="none" stroke="#9d78dd" stroke-width="1.4" stroke-dasharray="3 3" opacity="0.8"/>';
+  out+='<path d="'+path(med)+'" fill="none" stroke="#18a2c4" stroke-width="1.6"/>';
+  out+='<path d="'+bp+'" fill="none" stroke="#e0a838" stroke-width="2"/>';
+  const ly=H-6-(best[best.length-1]/max)*(H-16);
+  out+='<circle cx="'+(W-1)+'" cy="'+ly+'" r="3" fill="#e0a838" stroke="#1a1712" stroke-width="1.5"/>';
+  fig.innerHTML=out;
+}
+function paintCoresLive(perCore){
+  const el=$('cores'); if(!el||!perCore||!perCore.length)return;
+  const kids=el.children;
+  for(let i=0;i<kids.length;i++){const load=perCore[i%perCore.length]||0;
+    kids[i].style.background = load>4 ? (i%5===0?'#18a2c4':'#e0a838') : '#1d1810';
+    kids[i].style.opacity = load>4 ? (0.4+Math.min(1,load/100)*0.6) : 1;}
+}
+function pushMilestone(r){
+  const sc=$('scroller'); if(!sc)return;
+  const d=document.createElement('div'); d.className='evt'+(r.archive_delta>0?' disc':'');
+  d.innerHTML='<span class="gen">G'+r.gen+'</span><div><div class="txt">gen <b>'+r.gen+'</b> · best <b>'+fmt(r.fitness_best)+'</b> · <b>+'+(r.archive_delta||0)+'</b> new cells</div><div class="tag">frontier</div></div>';
+  sc.insertBefore(d, sc.firstChild);
+  while(sc.children.length>16) sc.removeChild(sc.lastChild);
+}
+async function poll(){
+  try{
+    const res=await fetch('/api/telemetry',{cache:'no-store'});
+    const j=await res.json();
+    const recs=j.records||[]; const host=j.host||{};
+    if(recs.length){
+      window.POKE_LIVE=true; setBadge(true,j.run);
+      const last=recs[recs.length-1];
+      if($('s-gen'))$('s-gen').textContent=last.gen;
+      if($('s-fit'))$('s-fit').textContent=fmt(last.fitness_best);
+      if($('s-spec'))$('s-spec').textContent=last.n_species;
+      if($('s-fps'))$('s-fps').innerHTML=(last.throughput_sps/1000).toFixed(1)+'<small> k steps/s</small>';
+      if($('cells'))$('cells').textContent=fmt(last.archive_cells);
+      if($('frontier'))$('frontier').textContent='+'+(last.archive_delta||0);
+      if($('fit-r'))$('fit-r').textContent='best '+fmt(last.fitness_best)+' ▲';
+      if($('evt-count'))$('evt-count').textContent=recs.length.toLocaleString()+' generations';
+      if(host.cpu_pct!=null){const c=Math.round(host.cpu_pct);if($('cpu-pct'))$('cpu-pct').textContent=c;if($('cpu-bar'))$('cpu-bar').style.width=c+'%';}
+      paintCoresLive(host.cpu_per_core);
+      const g=host.gpu||[];
+      if(g[0]){if($('g0-bar'))$('g0-bar').style.width=g[0].util+'%';if($('g0v'))$('g0v').innerHTML='<b>'+Math.round(g[0].util)+'</b>% · '+(g[0].mem_used_mb/1024).toFixed(1)+'G';}
+      if(g[1]){if($('g1-bar'))$('g1-bar').style.width=g[1].util+'%';if($('g1v'))$('g1v').innerHTML='<b>'+Math.round(g[1].util)+'</b>% · '+(g[1].mem_used_mb/1024).toFixed(1)+'G';}
+      drawFitLive(recs);
+      if(last.gen!==lastGen){ if(lastGen>=0) pushMilestone(last); lastGen=last.gen; }
+    } else { window.POKE_LIVE=false; setBadge(false); }
+  }catch(e){ window.POKE_LIVE=false; setBadge(false); }
+}
+setBadge(false);
+poll(); setInterval(poll,1500);
 })();
 </script>
