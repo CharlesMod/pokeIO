@@ -67,6 +67,10 @@ class VisionConfig:
     # games, and it stays an informative center crop in menus/battles. Padded
     # if the crop exceeds the screen bounds.
     fovea_size: int = 64  # side length of the native-resolution center crop
+    # Small square grayscale obs fed to the direct-encoded NEAT loop (train/loop.py).
+    # The full 6176-dim obs is too wide for direct NEAT; obs_res x obs_res is tractable.
+    obs_res: int = 24  # side length -> obs_res*obs_res flattened grayscale inputs
+    obs_ram_bytes: int = 8  # count of strided normalized WRAM bytes appended to obs
     # -- legacy foveal knobs (superseded by fovea_size; kept for back-compat) -
     foveal_size: int = 32  # (unused by ObsBuilder) old downscaled foveal res
     foveal_crop: int = 48  # (unused by ObsBuilder) old source-pixel crop side
