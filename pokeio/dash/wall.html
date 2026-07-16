@@ -392,7 +392,7 @@
     </header>
     <div class="bodyp" style="padding:0;flex:1"><div class="gtwrap"><canvas id="gt-graph"></canvas></div></div>
     <div class="foot" style="padding:7px 12px;border-top:1px solid var(--line);letter-spacing:.04em">
-      asked at every screen position — <b style="color:var(--amber)">weight out</b> paints the network at right, one answer per location
+      watch it build: <b style="color:var(--amber)">weight out</b>, asked at every pixel, paints one <b>receptive field</b> — the phenotype at right is full of them
     </div>
   </div>
   <div class="panel" style="height:clamp(260px,34vh,380px)">
@@ -1422,16 +1422,29 @@ function actGlyph(ctx,cx,cy,rr,act,col){ctx.save();ctx.strokeStyle=col;ctx.lineW
     const py=cy-yy*h/2; if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}
   ctx.stroke();ctx.restore();}
 let sweepT=0;
+const RFW2=12,RFH2=10,RFN2=RFW2*RFH2; let rfBuf=new Float32Array(RFN2), rfIdx=0, rfPhase=0, rfMax=0.5, rfCur=0, rfCx=0, rfCy=0;
+const rfTile=document.createElement('canvas'); rfTile.width=RFW2; rfTile.height=RFH2;
 function renderGraph(dt,time){
   const w=GW,h=GH,padL=86,padR=92,padT=18,padB=26; gx.clearRect(0,0,w,h);
   const px=n=>padL+n.x*(w-padL-padR), py=n=>padT+n.y*(h-padT-padB);
   genome.nodes.forEach(n=>{n.x=lerp(n.x,n.tx,0.12);n.y=lerp(n.y,n.ty,0.12);});
   sweepT+=dt*0.55; if(sweepT>1.6)sweepT-=1.9;
-  // live sample of the CPPN's output weight, queried at a moving pixel
-  let liveOut=0;
-  try{const vv=new Float32Array(genome.nextId+2);vv[4]=1;vv[0]=Math.sin(time*0.6);vv[1]=Math.cos(time*0.47);
-    vv[2]=Math.sqrt(vv[0]*vv[0]+vv[1]*vv[1])*1.3-0.9;vv[3]=Math.sin(time*0.4)*1.2;liveOut=evalCPPN(vv);}catch(e){}
-  const oCol=liveOut>=0?'224,168,56':'63,181,207', oMag=Math.min(1,Math.abs(liveOut));
+  // WEIGHT READOUT: sweep the query pixel across a grid; each answer paints one
+  // cell of a receptive field — exactly how every field in the phenotype is built.
+  {const step=3, vv=new Float32Array(genome.nextId+2); vv[4]=1;
+    try{for(let s=0;s<step;s++){const idx=rfIdx%RFN2, gx2=idx%RFW2, gy2=(idx/RFW2)|0;
+      const xx=(gx2/(RFW2-1))*2-1, yy=(gy2/(RFH2-1))*2-1;
+      vv[0]=xx;vv[1]=yy;vv[2]=Math.sqrt(xx*xx+yy*yy)*1.3-0.9;vv[3]=rfPhase;
+      const v=evalCPPN(vv); rfBuf[idx]=v; rfCur=v; rfCx=gx2; rfCy=gy2;
+      if(Math.abs(v)>rfMax)rfMax=Math.abs(v); rfIdx++; if(rfIdx%RFN2===0)rfPhase+=0.5;}}catch(e){}}
+  rfMax=Math.max(0.1,rfMax*0.999);
+  {const tc=rfTile.getContext('2d'), im=tc.createImageData(RFW2,RFH2), dd=im.data, painted=(rfIdx>=RFN2)?RFN2:(rfIdx%RFN2);
+    for(let p=0;p<RFN2;p++){let r,g,b; if(p>=painted){r=26;g=23;b=18;}
+      else{const v=rfBuf[p]/rfMax; if(v>=0){const t=Math.pow(Math.min(1,v),0.8);r=26+198*t;g=23+145*t;b=18+38*t;}
+        else{const t=Math.pow(Math.min(1,-v),0.8);r=26+37*t;g=23+158*t;b=18+189*t;}}
+      dd[p*4]=r|0;dd[p*4+1]=g|0;dd[p*4+2]=b|0;dd[p*4+3]=255;}
+    tc.putImageData(im,0,0);}
+  const oCol=rfCur>=0?'224,168,56':'63,181,207', oMag=Math.min(1,Math.abs(rfCur/rfMax));
   const byId=genome.byId,depth=genome.depth,maxd=genome.maxd;
   genome.conns.forEach(c=>{if(!byId[c.from]||!byId[c.to])return;const a=byId[c.from],b=byId[c.to];
     const ax=px(a),ay=py(a),bx=px(b),by=py(b),mag=Math.min(1,Math.abs(c.w)/2.4),col=c.w>=0?'139,171,62':'198,90,62',mx=(ax+bx)/2;
@@ -1451,18 +1464,23 @@ function renderGraph(dt,time){
     gx.beginPath();gx.arc(x,y,rr,0,7);gx.fillStyle=`rgba(${base},${0.20+sweep*0.20})`;gx.fill();
     gx.lineWidth=1.5;gx.strokeStyle=`rgba(${base},${0.75+sweep*0.25})`;gx.stroke();
     if(n.kind==='output'){
-      // the node holds the live weight value (colour = sign, brightness = magnitude)
       gx.beginPath();gx.arc(x,y,rr-3,0,7);gx.fillStyle=`rgba(${oCol},${0.4+oMag*0.55})`;gx.fill();
-      // ...which streams out to the right and paints every pixel of the network
-      const ex=w-8;
-      gx.strokeStyle=`rgba(${oCol},${0.16+oMag*0.4})`;gx.lineWidth=1+oMag*2.2;
-      gx.beginPath();gx.moveTo(x+rr,y);gx.lineTo(ex-6,y);gx.stroke();
-      const nps=2+Math.round(oMag*4);
-      for(let i=0;i<nps;i++){const t3=((time*0.9)+i/nps)%1;const X=x+rr+t3*(ex-6-x-rr);
-        gx.beginPath();gx.arc(X,y,1.3+oMag*1.5,0,7);gx.fillStyle=`rgba(${oCol},${0.4+oMag*0.5})`;gx.fill();}
-      gx.beginPath();gx.moveTo(ex,y);gx.lineTo(ex-7,y-4);gx.lineTo(ex-7,y+4);gx.closePath();gx.fillStyle=`rgba(${oCol},0.85)`;gx.fill();
-      gx.font='700 9px ui-monospace,monospace';gx.textAlign='center';gx.fillStyle=`rgba(${oCol},0.95)`;
-      gx.fillText('weight = '+(liveOut>=0?'+':'')+liveOut.toFixed(2),(x+ex)/2,y-8);
+      const tW=Math.min(56,w-10-(x+rr+16)), tH=tW*RFH2/RFW2, txx=x+rr+16, tyy=y-tH/2;
+      if(tW>14){
+        gx.strokeStyle=`rgba(${oCol},0.5)`;gx.lineWidth=1.4;
+        gx.beginPath();gx.moveTo(x+rr,y);gx.lineTo(txx-3,y);gx.stroke();
+        gx.beginPath();gx.moveTo(txx-3,y);gx.lineTo(txx-8,y-3);gx.lineTo(txx-8,y+3);gx.closePath();gx.fillStyle=`rgba(${oCol},0.8)`;gx.fill();
+        gx.imageSmoothingEnabled=false; gx.drawImage(rfTile,txx,tyy,tW,tH);
+        gx.lineWidth=1;gx.strokeStyle='rgba(168,157,136,0.5)';gx.strokeRect(txx,tyy,tW,tH);
+        const ccw=tW/RFW2, cch=tH/RFH2;
+        gx.strokeStyle=`rgba(${oCol},0.95)`;gx.lineWidth=1.4;gx.strokeRect(txx+rfCx*ccw,tyy+rfCy*cch,ccw,cch);
+        gx.font='700 8.5px ui-monospace,monospace';gx.textAlign='center';gx.fillStyle=`rgba(${oCol},0.95)`;
+        gx.fillText('weight = '+(rfCur>=0?'+':'')+(rfCur/rfMax).toFixed(2),txx+tW/2,tyy-4);
+        gx.fillStyle='rgba(168,157,136,0.85)';gx.font='7.5px ui-monospace,monospace';
+        gx.fillText('one answer / pixel → a receptive field',txx+tW/2,tyy+tH+9);
+      } else {
+        gx.font='700 9px ui-monospace,monospace';gx.textAlign='left';gx.fillStyle=`rgba(${oCol},0.95)`;
+        gx.fillText((rfCur>=0?'+':'')+(rfCur/rfMax).toFixed(2),x+rr+8,y+3);}
     } else {
       actGlyph(gx,x,y,rr,n.act,n.kind==='input'?'rgba(240,233,216,0.5)':`rgba(${base},0.95)`);
       gx.font='8.5px ui-monospace,monospace';
