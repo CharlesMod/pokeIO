@@ -438,17 +438,37 @@ _OP_SHUTDOWN = 2
 _MAX_STATE = 262144  # 256 KiB
 
 
+# Busy-spin by default. Counterintuitive but measured (2026-07 audit): on this
+# Broadwell-EP box a core that naps between barrier hand-offs is clamped by the
+# hardware p-state logic to its MINIMUM frequency (1.2 GHz) even at ~70% duty —
+# and the clamp survives governor=performance, min_freq pinning, EPB=0 and
+# C-state disabling. Every ~2 ms emulator step then takes ~5 ms, and the barrier
+# waits on the slowest of N such steps. Keeping waiting cores hot is worth 3.1x
+# end-to-end (P32: 1,638 -> 5,057 sps). Set POKEIO_NAP=1 to restore yielding
+# waits when sharing the box with other workloads.
+_NAP = os.environ.get("POKEIO_NAP", "") not in ("", "0")
+
+
 def _spin_wait(pred, spin_budget: int = 3000, nap: float = 5e-5) -> None:
-    """Wait on ``pred`` (a cheap shm read): brief busy spin, then yield.
+    """Wait on ``pred`` (a cheap shm read): busy spin (default) or spin-then-nap.
 
     The barrier flags live in shared memory, so the wait is a tight numpy read
     rather than a blocking pipe round-trip (which caps the pipe-based VecFleet at
-    ~2.9k steps/s).  Lockstep means that whenever one side is waiting the OTHER
-    side is doing the actual work (a ~2 ms step or forward), so a long busy spin
-    would just steal cores from the active side — costly on a shared box (live1 +
-    sibling agents).  A short spin keeps hand-off latency low, then we sleep a
-    few tens of µs so a waiting process frees its core.
+    ~2.9k steps/s).  A pure busy spin looks wasteful — the waiting side is idle
+    while the other side works — but napping instead down-clocks the core to
+    1.2 GHz and slows the WORK phases 2.6x (see ``_NAP`` above), which costs far
+    more than the spin burns.  ``POKEIO_NAP=1`` opts into the polite behaviour.
     """
+    if not _NAP:
+        i = 0
+        while not pred():
+            i += 1
+            if i % 1_000_000 == 0 and os.getppid() == 1:
+                # Parent died and we were reparented to init: a hot spin would
+                # otherwise burn this core forever (the old nap version merely
+                # leaked a sleeping process). Exit instead of orphan-spinning.
+                raise SystemExit(1)
+        return
     i = 0
     while not pred():
         i += 1
@@ -677,6 +697,17 @@ class BarrierFleet:
         n = self.n_envs
         wdone = ctl[2:2 + n]
         i = 0
+        if not _NAP:
+            # Hot wait (see _NAP): never sleep, or this core drops to 1.2 GHz and
+            # the next forward/bookkeeping phase runs 2.6x slow. Liveness guard
+            # kept on a coarse period.
+            while not bool((wdone >= target).all()):
+                i += 1
+                if i % 200000 == 0 and any(not p.is_alive() for p in self._procs):
+                    raise RuntimeError(
+                        "BarrierFleet worker died mid-round; aborting (see stderr)"
+                    )
+            return
         while not bool((wdone >= target).all()):
             i += 1
             if i >= 3000:
