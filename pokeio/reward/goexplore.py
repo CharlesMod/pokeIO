@@ -16,7 +16,8 @@ when it is **rarely visited** (low visit count), **freshly discovered** (recent)
 restart before.  The weight formula combines those into a single sampling score.
 
 Memory is bounded: at most ``capacity`` states are kept; when full, the
-least-useful entry (frequently visited, shallow, stale) is evicted.  State blobs
+least-useful entries are batch-evicted — stale never-re-reached one-offs go
+first; reproducible (multi-visit), recent, and deep cells are kept.  State blobs
 are the only heavy payload, so the cap directly bounds RAM.
 
 Capturing the state does **not** perturb the running episode: we serialize the
@@ -27,7 +28,6 @@ PyBoy core directly (``env.pyboy.save_state``) without the input-flush tick that
 from __future__ import annotations
 
 import io
-import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -61,7 +61,11 @@ class CellEntry:
 
     key: bytes
     state: bytes  # PyBoy save_state blob captured when first reached
-    depth: int  # step index within the episode when first reached (frontier depth)
+    # CUMULATIVE distance from newgame: restore-parent depth + step index
+    # within the discovering episode. Restore chains therefore accumulate —
+    # a cell 10 chains deep reads ~10*episode_steps, not its local step index
+    # — which is what lets sampling actually prefer the genuine frontier.
+    depth: int
     gen_added: int  # generation the cell was first stored
     visits: int = 1  # times the cell has been reached (any player, any gen)
     selections: int = 0  # times chosen as a restart point
@@ -88,7 +92,7 @@ class GoExplore:
         A ``numpy`` Generator for reproducible weighted sampling.
     """
 
-    capacity: int = 2048
+    capacity: int = 16384
     recency_halflife: float = 4.0
     depth_weight: float = 0.25
     caps_per_round: float = 0.0  # max captures per swarm round (0 = unlimited)
@@ -166,7 +170,7 @@ class GoExplore:
         state = capture_state(env)
         self.n_captured += 1
         if len(self.cells) >= self.capacity:
-            self._evict_one()
+            self._evict_batch()
         self.cells[key] = CellEntry(
             key=key,
             state=state,
@@ -203,7 +207,7 @@ class GoExplore:
             return
         self.n_captured += 1
         if len(self.cells) >= self.capacity:
-            self._evict_one()
+            self._evict_batch()
         self.cells[key] = CellEntry(
             key=key,
             state=state,
@@ -213,38 +217,84 @@ class GoExplore:
         )
 
     # ---------------------------------------------------------------- weight
-    def _weight(self, e: CellEntry) -> float:
-        """Sampling weight: rare, recent, deep and seldom-restarted cells win."""
-        rarity = 1.0 / math.sqrt(e.visits)
-        seldom = 1.0 / (1.0 + e.selections)
-        age = max(0, self.cur_gen - e.gen_seen)
+    def _fields(self, entries: list[CellEntry]):
+        n = len(entries)
+        v = np.fromiter((e.visits for e in entries), dtype=np.float64, count=n)
+        sel = np.fromiter((e.selections for e in entries), dtype=np.float64, count=n)
+        seen = np.fromiter((e.gen_seen for e in entries), dtype=np.float64, count=n)
+        dep = np.fromiter((e.depth for e in entries), dtype=np.float64, count=n)
+        return v, sel, seen, dep
+
+    def _weights_vec(self, entries: list[CellEntry]) -> np.ndarray:
+        """Sampling weights: rare, recent, deep, seldom-restarted cells win."""
+        v, sel, seen, dep = self._fields(entries)
+        rarity = 1.0 / np.sqrt(np.maximum(1.0, v))
+        seldom = 1.0 / (1.0 + sel)
+        age = np.maximum(0.0, self.cur_gen - seen)
         recency = 0.5 ** (age / max(1e-6, self.recency_halflife))
-        depth_bonus = 1.0 + self.depth_weight * math.log1p(max(0, e.depth))
+        depth_bonus = 1.0 + self.depth_weight * np.log1p(np.maximum(0.0, dep))
         return rarity * seldom * recency * depth_bonus
 
-    def _evict_one(self) -> None:
-        """Drop the least-useful entry (inverse of the sampling weight)."""
+    def _weight(self, e: CellEntry) -> float:
+        """Scalar sampling weight (kept for tests/telemetry)."""
+        return float(self._weights_vec([e])[0])
+
+    def _evict_batch(self) -> None:
+        """Drop the least-useful ~capacity/64 entries in one vectorized pass.
+
+        Eviction is NOT the inverse of the sampling weight: under that rule
+        one-off never-re-reached cells look maximally "rare" and survive while
+        proven-reproducible hub cells get squeezed out, so the archive decays
+        toward unreproducible noise. Instead KEEP reproducible (multi-visit),
+        recent, and deep cells; EVICT stale one-offs first. Batched because
+        the old per-eviction O(n) min-scan ran thousands of times per
+        generation once cell discovery outpaced capacity.
+        """
         if not self.cells:
             return
-        victim = min(self.cells.values(), key=self._weight)
-        del self.cells[victim.key]
-        self.n_evicted += 1
+        k = max(1, self.capacity // 64)
+        entries = list(self.cells.values())
+        v, _sel, seen, dep = self._fields(entries)
+        age = np.maximum(0.0, self.cur_gen - seen)
+        recency = 0.5 ** (age / max(1e-6, self.recency_halflife))
+        keep_score = (
+            recency
+            * (0.5 + np.log1p(v))
+            * (1.0 + self.depth_weight * np.log1p(np.maximum(0.0, dep)))
+        )
+        for i in np.argsort(keep_score)[:k]:
+            del self.cells[entries[int(i)].key]
+        self.n_evicted += min(k, len(entries))
 
     # ---------------------------------------------------------------- sample
-    def sample(self) -> CellEntry | None:
-        """Weighted-random pick of a promising frontier cell (or ``None``)."""
-        if not self.cells:
-            return None
+    def sample_many(self, k: int) -> list[CellEntry]:
+        """``k`` weighted draws (with replacement) in ONE vectorized pass.
+
+        The per-draw ``sample()`` recomputed every cell's weight per call —
+        ~n_players * capacity python-level evaluations per generation. One
+        weight pass per wave is indistinguishable statistically (selections
+        feedback within a single wave is negligible) and ~100x cheaper.
+        """
+        if not self.cells or k <= 0:
+            return []
         entries = list(self.cells.values())
-        w = np.array([self._weight(e) for e in entries], dtype=np.float64)
+        w = self._weights_vec(entries)
         s = w.sum()
         if not np.isfinite(s) or s <= 0:
-            idx = int(self.rng.integers(len(entries)))
+            idxs = self.rng.integers(len(entries), size=k)
         else:
-            idx = int(self.rng.choice(len(entries), p=w / s))
-        chosen = entries[idx]
-        chosen.selections += 1
-        return chosen
+            idxs = self.rng.choice(len(entries), size=k, p=w / s)
+        out = []
+        for i in idxs:
+            e = entries[int(i)]
+            e.selections += 1
+            out.append(e)
+        return out
+
+    def sample(self) -> CellEntry | None:
+        """Weighted-random pick of a promising frontier cell (or ``None``)."""
+        got = self.sample_many(1)
+        return got[0] if got else None
 
     def restore(self, env, entry: CellEntry) -> np.ndarray:
         """Load ``entry``'s state into ``env`` and return the fresh observation."""

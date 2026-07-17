@@ -290,6 +290,7 @@ def evaluate_wave(
     # or fall back to the canonical new-game state.
     screens = []
     wrams = []
+    base_depth = np.zeros(n, dtype=np.int64)  # cumulative chain depth per player
     for i in range(n):
         entry = None
         if (
@@ -300,6 +301,7 @@ def evaluate_wave(
             entry = goexplore.sample()
         if entry is not None:
             obs = goexplore.restore(envs[i], entry)
+            base_depth[i] = entry.depth
             if spawn_out is not None:
                 # record the champion-candidate's true spawn for the showcase
                 spawn_out[wave_offset + i] = entry.state
@@ -331,7 +333,7 @@ def evaluate_wave(
             # Capture the state of every fresh frontier cell for later restarts.
             if goexplore is not None and wave.last_key[i] is not None:
                 goexplore.note(
-                    wave.last_key[i], envs[i], depth=t,
+                    wave.last_key[i], envs[i], depth=int(base_depth[i]) + t,
                     globally_new=wave.last_new[i],
                 )
 
@@ -392,18 +394,9 @@ def evaluate_wave_parallel(
     _t = time.perf_counter()
     if streamer is not None:
         streamer.set_phase("evolving", "restoring frontier")
-    restore: dict[int, bytes] = {}
-    if goexplore is not None and goexplore.size > 0:
-        for i in range(n):
-            if goexplore.rng.random() < restore_prob:
-                entry = goexplore.sample()
-                if entry is not None:
-                    restore[i] = entry.state
-        goexplore.n_restores += len(restore)
-        if spawn_out is not None:
-            # record each candidate's true spawn for the champion showcase
-            for i, blob in restore.items():
-                spawn_out[wave_offset + i] = blob
+    restore, base_depth = _sample_restores(
+        goexplore, n, restore_prob, spawn_out, wave_offset
+    )
     _t = _mark("go_sample", _t)
     # Release the reset round, then pack/compile WHILE the workers reset.
     fleet.reset_all_begin(restore if restore else None)
@@ -484,7 +477,9 @@ def evaluate_wave_parallel(
             wave.observe_key(i, key, globally_new, prior)
             dead[i] = dead[i] or bool(dones[i])
             if goexplore is not None:
-                if not goexplore.revisit(key) and globally_new:
+                # new cells + re-capture of still-rare evicted cells (else the
+                # `seen` ratchet makes evicted cells permanently un-restorable)
+                if not goexplore.revisit(key) and (globally_new or prior < 3):
                     cap_cand.append((i, key))
         if goexplore is not None:
             # Meter the 47 ms worker-side save_states to the capture budget.
@@ -497,7 +492,7 @@ def evaluate_wave_parallel(
                     break
                 i, key = cap_cand[(off + j) % len(cap_cand)]
                 cap_flags[i] = 1
-                pending[i] = (key, t)
+                pending[i] = (key, int(base_depth[i]) + t)
 
         if streamer is not None:
             # X is the obs batch this round's actions came from (a stable copy),
@@ -520,6 +515,35 @@ def evaluate_wave_parallel(
     for i, g in enumerate(genomes):
         g.fitness = float(wave.fitness[i])
     return n * episode_steps
+
+
+def _sample_restores(
+    goexplore: GoExplore | None,
+    n: int,
+    restore_prob: float,
+    spawn_out: dict[int, bytes] | None = None,
+    wave_offset: int = 0,
+) -> tuple[dict[int, bytes], np.ndarray]:
+    """Pick each player's spawn: a Go-Explore frontier restore or newgame.
+
+    Returns ``(restore, base_depth)`` — the slot->state-blob map for the fleet
+    and each slot's CUMULATIVE chain depth (the restored entry's depth; 0 for
+    newgame spawns). Cells discovered this episode store ``base_depth + t`` so
+    restore chains accumulate distance-from-newgame instead of resetting per
+    episode (which made Go-Explore's depth preference meaningless).
+    """
+    restore: dict[int, bytes] = {}
+    base_depth = np.zeros(n, dtype=np.int64)
+    if goexplore is not None and goexplore.size > 0:
+        idxs = [i for i in range(n) if goexplore.rng.random() < restore_prob]
+        for i, entry in zip(idxs, goexplore.sample_many(len(idxs))):
+            restore[i] = entry.state
+            base_depth[i] = entry.depth
+        goexplore.n_restores += len(restore)
+        if spawn_out is not None:
+            for i, blob in restore.items():
+                spawn_out[wave_offset + i] = blob
+    return restore, base_depth
 
 
 def evaluate_wave_async(
@@ -574,17 +598,9 @@ def evaluate_wave_async(
     _t = time.perf_counter()
     if streamer is not None:
         streamer.set_phase("evolving", "restoring frontier")
-    restore: dict[int, bytes] = {}
-    if goexplore is not None and goexplore.size > 0:
-        for i in range(n):
-            if goexplore.rng.random() < restore_prob:
-                entry = goexplore.sample()
-                if entry is not None:
-                    restore[i] = entry.state
-        goexplore.n_restores += len(restore)
-        if spawn_out is not None:
-            for i, blob in restore.items():
-                spawn_out[wave_offset + i] = blob
+    restore, base_depth = _sample_restores(
+        goexplore, n, restore_prob, spawn_out, wave_offset
+    )
     _t = _mark("go_sample", _t)
     fleet.reset_all_begin(restore if restore else None)
     if callable(cp_full):
@@ -681,14 +697,19 @@ def evaluate_wave_async(
                 if (
                     goexplore is not None and k < R
                     and not cap_flag[ii] and not cap_done[ii]
-                    and not goexplore.revisit(key) and globally_new
+                    and not goexplore.revisit(key)
+                    # capture genuinely-new cells AND re-capture still-rare
+                    # cells whose stored state was evicted (or that predate
+                    # go-explore) — without this, `seen` ratchets every
+                    # evicted cell permanently un-restorable.
+                    and (globally_new or prior < 3)
                     and goexplore.admit_capture()
                 ):
                     # Worker captures obs k's state before applying its action.
                     # (While a capture is outstanding, further discoveries by
                     # the same env are not re-flagged — a rare, harmless drop.)
                     cap_flag[ii] = 1
-                    pending[ii] = (key, k)
+                    pending[ii] = (key, int(base_depth[ii]) + k)
             booked[ii] = snap[ii]
         if goexplore is not None and pending:
             for i in np.nonzero(cap_done[:n])[0]:
@@ -1849,7 +1870,7 @@ def main() -> None:
                     help="restart episodes from sampled frontier cells (Go-Explore)")
     ap.add_argument("--restore-prob", type=float, default=0.5,
                     help="per-player prob of restoring from a frontier cell")
-    ap.add_argument("--goexplore-capacity", type=int, default=2048,
+    ap.add_argument("--goexplore-capacity", type=int, default=16384,
                     help="max stored emulator states (memory bound)")
     ap.add_argument("--goexplore-caps-per-round", type=float, default=4.0,
                     help="max state captures per swarm round (0 = unlimited). "
