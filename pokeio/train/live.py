@@ -31,7 +31,9 @@ import numpy as np
 import torch
 
 from pokeio.evo.forward import apply_activation
+from pokeio.evo.genome import BIAS as NODE_BIAS
 from pokeio.evo.genome import HIDDEN as NODE_HIDDEN
+from pokeio.evo.genome import INPUT as NODE_INPUT
 from pokeio.evo.genome import OUTPUT as NODE_OUTPUT
 from pokeio.evo.genome import Population
 
@@ -229,6 +231,80 @@ def _node_kind(node_type: int) -> str:
     return "in"  # INPUT and BIAS both surface as inputs to the UI
 
 
+# Genotype-view node kinds (focus.genes) — distinct from the net-view kinds.
+_GENE_KIND = {
+    NODE_INPUT: "in",
+    NODE_BIAS: "bias",
+    NODE_OUTPUT: "out",
+    NODE_HIDDEN: "hid",
+}
+
+
+def build_genes(genome) -> dict:
+    """Raw Lane-A genotype straight off the genome object.
+
+    ``nodes``: ``[[node_id, kind, act_fn_idx], ...]`` (id-sorted;
+    kind in ``in|hid|out|bias``).  ``conns``: innovation-ordered
+    ``[[innov, in_id, out_id, weight, enabled], ...]``.
+    """
+    nodes = [
+        [int(nid), _GENE_KIND.get(ng.type, "in"), int(ng.act)]
+        for nid, ng in sorted(genome.nodes.items())
+    ]
+    conns = [
+        [int(innov), int(c.in_id), int(c.out_id), round(float(c.weight), 4),
+         bool(c.enabled)]
+        for innov, c in sorted(genome.conns.items())
+    ]
+    return {"nodes": nodes, "conns": conns}
+
+
+def build_net_view(genome) -> tuple[list[dict], list[dict], dict[int, int], set[int]]:
+    """Bounded, self-consistent net subgraph (hidden+out + strongest conns).
+
+    Returns ``(nodes, conns, id_to_slot, included_node_ids)`` where ``nodes`` /
+    ``conns`` use the champion.net schema and ``id_to_slot`` maps node id ->
+    compiled slot (node ids sorted, matching Population.from_genomes packing).
+    """
+    sorted_ids = sorted(genome.nodes)
+    id_to_slot = {nid: s for s, nid in enumerate(sorted_ids)}
+
+    # always include hidden + output nodes
+    included: set[int] = {
+        nid for nid, ng in genome.nodes.items()
+        if ng.type in (NODE_OUTPUT, NODE_HIDDEN)
+    }
+
+    enabled = [(innov, c) for innov, c in genome.conns.items() if c.enabled]
+    enabled.sort(key=lambda kc: abs(kc[1].weight), reverse=True)
+
+    conns: list[dict] = []
+    for _innov, c in enabled:
+        if len(conns) >= _CONN_CAP:
+            break
+        new_nodes = {c.in_id, c.out_id} - included
+        if new_nodes and len(included) + len(new_nodes) > _NODE_CAP:
+            continue  # keep node budget; skip conns that would add new nodes
+        included.update((c.in_id, c.out_id))
+        conns.append(
+            {
+                "from": int(c.in_id),
+                "to": int(c.out_id),
+                "w": round(float(c.weight), 4),
+                "en": True,
+            }
+        )
+
+    nodes = []
+    for nid in sorted(included):
+        ng = genome.nodes.get(nid)
+        if ng is None:
+            continue
+        nodes.append({"id": int(nid), "kind": _node_kind(ng.type)})
+    node_ids = {n["id"] for n in nodes}
+    return nodes, conns, id_to_slot, node_ids
+
+
 # --------------------------------------------------------------------------
 # champion showcase env
 # --------------------------------------------------------------------------
@@ -267,7 +343,9 @@ class ChampionShowcase:
         self.wram: np.ndarray | None = None
         self.obs_vis: np.ndarray | None = None
         self.last_action = 0
+        self.last_probs: list[float] = [0.0] * N_OUT
         self._act: dict[str, float] = {}
+        self._genes: dict = {"nodes": [], "conns": []}
 
     # -- champion swap -----------------------------------------------------
     def set_champion(self, genome, genome_id: str) -> None:
@@ -292,44 +370,12 @@ class ChampionShowcase:
 
     def _prepare_net(self) -> None:
         """Pick a bounded, self-consistent subgraph (hidden+out + strong inputs)."""
-        g = self.genome
-        sorted_ids = sorted(g.nodes)
-        self._id_to_slot = {nid: s for s, nid in enumerate(sorted_ids)}
-
-        # always include hidden + output nodes
-        included: set[int] = {
-            nid for nid, ng in g.nodes.items() if ng.type in (NODE_OUTPUT, NODE_HIDDEN)
-        }
-
-        enabled = [(innov, c) for innov, c in g.conns.items() if c.enabled]
-        enabled.sort(key=lambda kc: abs(kc[1].weight), reverse=True)
-
-        conns: list[dict] = []
-        for _innov, c in enabled:
-            if len(conns) >= _CONN_CAP:
-                break
-            new_nodes = {c.in_id, c.out_id} - included
-            if new_nodes and len(included) + len(new_nodes) > _NODE_CAP:
-                continue  # keep node budget; skip conns that would add new nodes
-            included.update((c.in_id, c.out_id))
-            conns.append(
-                {
-                    "from": int(c.in_id),
-                    "to": int(c.out_id),
-                    "w": round(float(c.weight), 4),
-                    "en": True,
-                }
-            )
-        self._net_conns = conns
-
-        nodes = []
-        for nid in sorted(included):
-            ng = g.nodes.get(nid)
-            if ng is None:
-                continue
-            nodes.append({"id": int(nid), "kind": _node_kind(ng.type)})
+        nodes, conns, id_to_slot, node_ids = build_net_view(self.genome)
         self._net_nodes = nodes
-        self._net_node_ids = {n["id"] for n in nodes}
+        self._net_conns = conns
+        self._id_to_slot = id_to_slot
+        self._net_node_ids = node_ids
+        self._genes = build_genes(self.genome)
 
     # -- stepping ----------------------------------------------------------
     def step(self, n_steps: int = 2) -> None:
@@ -344,6 +390,7 @@ class ChampionShowcase:
             out = act_state[0, 0, self.cp.n_in + 1 : self.cp.n_in + 1 + N_OUT]
             self.last_action = int(out.argmax().item())
             self.screen, self.wram, _done, _info = self.env.step(self.last_action)
+        self.last_probs = [round(float(v), 4) for v in out.tolist()]
 
         # capture per-node activations from the LAST forward (in slot space)
         vec = act_state[0, 0].detach().to("cpu").numpy()
@@ -396,7 +443,16 @@ class ChampionShowcase:
 # top-level streamer
 # --------------------------------------------------------------------------
 class LiveStreamer:
-    """Bundles the writer + showcase and emits the full live.json payload."""
+    """Bundles the writer + showcase and emits the full live.json payload.
+
+    Beyond the champion + swarm sample, it implements the *focus agent*
+    protocol: the dashboard writes ``runs/<id>/select.json`` (via
+    ``/api/select``) naming a player slot; each emit the streamer cheaply
+    stat-polls that file and streams the REAL brain of the focused agent — a
+    capture forward with that genome on that agent's current obs (activations
+    + output probs), its full-res frame from the shm screens block, and its
+    raw genotype.  All focus work runs at emit rate (~3 Hz), never per round.
+    """
 
     def __init__(
         self,
@@ -407,6 +463,9 @@ class LiveStreamer:
         swarm_cap: int = 32,
         elite_k: int = 4,
         champ_steps: int = 2,
+        archive=None,
+        goexplore=None,
+        champ_dwell: float = 5.0,
     ) -> None:
         self.writer = LiveWriter(run_dir, hz)
         self.showcase = showcase
@@ -415,10 +474,88 @@ class LiveStreamer:
         self.elite_k = int(elite_k)
         self.champ_steps = int(champ_steps)
         self.last_size = 0
-        self._cache = None  # (screens, fitness, dead) from the most recent sample
+        # -- champion dwell: a freshly-installed champ is displayed >= champ_dwell
+        # seconds before a newer one may replace it (latest pending wins).
+        self.champ_dwell = float(champ_dwell)
+        self._champ_since: float | None = None  # unix ts of current install
+        self._champ_gen = -1
+        self._champ_fitness = 0.0
+        self._pending_champ: tuple | None = None  # (genome, id, gen, fitness)
+        # (screens, fitness, dead, obs, actions) from the most recent sample
+        self._cache = None
+        # -- side panels (loop-provided at generation boundaries) ----------
+        self.archive = archive  # NoveltyArchive (read-only)
+        self.goexplore = goexplore  # GoExplore or None (read-only)
+        self._reward_terms: dict = {}
+        self._species: list = []
+        # -- focus selection ------------------------------------------------
+        self._select_path = Path(run_dir) / "select.json"
+        self._select_sig = None  # (mtime_ns, size) of last parsed select.json
+        self._select_idx = -1  # -1 = champion (default)
+        # -- current wave context --------------------------------------------
+        self._wave_genomes: list = []
+        self._wave_gen = 0
+        self._wave_offset = 0  # index of slot 0 within the population
+        self._wave_idx = 0  # wave counter within the generation
+        self._round = 0  # round counter within the episode
+        self._focus_cache: dict[int, dict] = {}  # slot -> compiled focus entry
 
-    def set_champion(self, genome, genome_id: str) -> None:
+    def set_champion(
+        self, genome, genome_id: str, gen: int = -1, fitness: float = 0.0
+    ) -> None:
+        """Offer a new champion; installed now or after the dwell period.
+
+        The current champion keeps the showcase for at least ``champ_dwell``
+        seconds.  Offers arriving inside the dwell window are stashed (the
+        LATEST offer wins — intermediates are skipped) and promoted by the next
+        emit once the dwell has elapsed.
+        """
+        now = time.time()
+        if (
+            self._champ_since is None
+            or (now - self._champ_since) >= self.champ_dwell
+        ):
+            self._install_champion(genome, genome_id, gen, fitness, now)
+        else:
+            # copy: the loop's genome object may be recycled by reproduce()
+            self._pending_champ = (genome.copy(), str(genome_id), int(gen),
+                                   float(fitness))
+
+    def _install_champion(
+        self, genome, genome_id: str, gen: int, fitness: float, now: float
+    ) -> None:
         self.showcase.set_champion(genome, genome_id)
+        self._champ_since = now
+        self._champ_gen = int(gen)
+        self._champ_fitness = float(fitness)
+        self._pending_champ = None
+
+    def _maybe_promote_pending(self) -> None:
+        """Install the stashed (latest) champion once the dwell has elapsed."""
+        if self._pending_champ is None:
+            return
+        now = time.time()
+        if (
+            self._champ_since is None
+            or (now - self._champ_since) >= self.champ_dwell
+        ):
+            g, gid, gen, fit = self._pending_champ
+            self._install_champion(g, gid, gen, fit, now)
+
+    # -- loop-facing context hooks ------------------------------------------
+    def begin_wave(self, genomes, gen: int, offset: int, wave_idx: int) -> None:
+        """New wave: slot -> genome mapping changes, drop compiled focus state."""
+        self._wave_genomes = list(genomes)
+        self._wave_gen = int(gen)
+        self._wave_offset = int(offset)
+        self._wave_idx = int(wave_idx)
+        self._round = 0
+        self._focus_cache.clear()
+
+    def set_side_stats(self, reward_terms: dict, species: list) -> None:
+        """Generation-boundary side-panel payloads (already plain python)."""
+        self._reward_terms = dict(reward_terms)
+        self._species = list(species)
 
     def maybe_write(
         self,
@@ -426,9 +563,18 @@ class LiveStreamer:
         screens: list[np.ndarray],
         fitness: np.ndarray,
         dead: list[bool] | None = None,
+        obs: np.ndarray | None = None,
+        actions: np.ndarray | None = None,
+        round_t: int = 0,
     ) -> bool:
-        """Throttled write from inside the wave step loop."""
-        self._cache = (screens, fitness, dead)
+        """Throttled write from inside the wave step loop.
+
+        ``obs`` is the (n, obs_dim) batch the wave's actions were computed
+        from and ``actions`` the resulting per-slot action ints — both are
+        what the focus capture replays for the selected agent.
+        """
+        self._cache = (screens, fitness, dead, obs, actions)
+        self._round = int(round_t)
         if not self.writer.due():
             return False
         return self._emit(gen)
@@ -437,23 +583,207 @@ class LiveStreamer:
         """Unconditional write (e.g. at a generation boundary)."""
         return self._emit(gen)
 
+    # -- select.json polling ----------------------------------------------
+    def _poll_select(self) -> None:
+        """Cheap stat each emit; parse only when the file changed."""
+        try:
+            st = self._select_path.stat()
+        except OSError:
+            self._select_idx = -1
+            self._select_sig = None
+            return
+        sig = (st.st_mtime_ns, st.st_size)
+        if sig == self._select_sig:
+            return
+        try:
+            data = json.loads(self._select_path.read_bytes())
+            self._select_idx = int(data.get("idx", -1))
+            self._select_sig = sig
+        except Exception:
+            # mid-write/corrupt: keep the previous selection, retry next emit
+            pass
+
+    # -- focus payloads -----------------------------------------------------
+    def _focus_champion(self) -> dict:
+        sc = self.showcase
+        buttons = [0] * N_OUT
+        if 0 <= sc.last_action < N_OUT:
+            buttons[sc.last_action] = 1
+        obs_gray = (
+            np.clip(sc.obs_vis, 0.0, 1.0) * 255.0 if sc.obs_vis is not None else None
+        )
+        return {
+            "idx": -1,
+            "genome_id": sc.genome_id,
+            "frame_b64": b64_gray(sc.screen) if sc.screen is not None else "",
+            "obs_res": int(sc.encoder.res),
+            "obs_b64": b64_gray(obs_gray) if obs_gray is not None else "",
+            "action": int(sc.last_action),
+            "buttons": buttons,
+            "probs": list(sc.last_probs),
+            "net": {
+                "n_in": int(sc.encoder.dim),
+                "n_out": N_OUT,
+                "nodes": sc._net_nodes,
+                "conns": sc._net_conns,
+                "act": sc._act,
+            },
+            "genes": sc._genes,
+        }
+
+    def _focus_entry(self, idx: int) -> dict:
+        """Compiled single-genome forward state for slot ``idx`` (cached per wave)."""
+        entry = self._focus_cache.get(idx)
+        if entry is not None:
+            return entry
+        sc = self.showcase
+        g = self._wave_genomes[idx]
+        pop = Population.from_genomes(
+            [g], max_nodes=sc.max_nodes, max_conns=sc.max_conns
+        )
+        nodes, conns, id_to_slot, node_ids = build_net_view(g)
+        entry = {
+            "cp": pop.compile(sc.device),
+            "nodes": nodes,
+            "conns": conns,
+            "id_to_slot": id_to_slot,
+            "node_ids": node_ids,
+            "genes": build_genes(g),
+            "genome_id": f"gen{self._wave_gen}_g{self._wave_offset + idx}",
+        }
+        self._focus_cache[idx] = entry
+        return entry
+
+    def _focus_agent(self, idx: int, screens, obs, actions) -> dict:
+        sc = self.showcase
+        entry = self._focus_entry(idx)
+        cp = entry["cp"]
+
+        # Capture forward: THAT genome on THAT agent's current obs (~3 Hz only).
+        x = np.ascontiguousarray(obs[idx], dtype=np.float32)
+        xt = torch.from_numpy(x[None, :]).to(sc.device).unsqueeze(1)  # (1,1,dim)
+        act_state = _forward_capture(cp, xt, sc.forward_steps)  # (1,1,M)
+        out = act_state[0, 0, cp.n_in + 1 : cp.n_in + 1 + N_OUT]
+        probs = [round(float(v), 4) for v in out.tolist()]
+        vec = act_state[0, 0].detach().to("cpu").numpy()
+        node_ids = entry["node_ids"]
+        act = {
+            str(nid): round(float(vec[slot]), 4)
+            for nid, slot in entry["id_to_slot"].items()
+            if slot < vec.shape[0] and int(nid) in node_ids
+        }
+
+        action = int(actions[idx])
+        buttons = [0] * N_OUT
+        if 0 <= action < N_OUT:
+            buttons[action] = 1
+        res = sc.encoder.res
+        obs_img = np.clip(np.asarray(obs[idx][: res * res]).reshape(res, res), 0.0, 1.0) * 255.0
+        return {
+            "idx": int(idx),
+            "genome_id": entry["genome_id"],
+            "frame_b64": b64_gray(screens[idx]),
+            "obs_res": int(res),
+            "obs_b64": b64_gray(obs_img),
+            "action": action,
+            "buttons": buttons,
+            "probs": probs,
+            "net": {
+                "n_in": int(sc.encoder.dim),
+                "n_out": N_OUT,
+                "nodes": entry["nodes"],
+                "conns": entry["conns"],
+                "act": act,
+            },
+            "genes": entry["genes"],
+        }
+
+    def _build_focus(self, screens, obs, actions) -> dict:
+        idx = self._select_idx
+        if (
+            idx is None
+            or idx < 0
+            or idx >= len(self._wave_genomes)
+            or screens is None
+            or obs is None
+            or actions is None
+            or idx >= len(screens)
+            or idx >= len(obs)
+            or idx >= len(actions)
+        ):
+            return self._focus_champion()
+        try:
+            return self._focus_agent(idx, screens, obs, actions)
+        except Exception:
+            return self._focus_champion()
+
+    # -- side panels ----------------------------------------------------------
+    def _reward_terms_payload(self, fitness) -> dict:
+        terms = dict(self._reward_terms)
+        if fitness is not None and len(fitness):
+            terms["novelty"] = round(float(np.max(fitness)), 3)
+        if not terms:
+            terms = {"novelty": 0.0}
+        return terms
+
+    def _archive_payload(self) -> dict:
+        a = self.archive
+        g = self.goexplore
+        out = {
+            "cells": int(a.size) if a is not None else 0,
+            "gen_delta": int(a.generation_delta) if a is not None else 0,
+            "restores": 0,
+            "captured": 0,
+            "max_depth": 0,
+        }
+        if g is not None:
+            out["restores"] = int(g.n_restores)
+            out["captured"] = int(g.n_captured)
+            out["max_depth"] = int(max((e.depth for e in g.cells.values()), default=0))
+        return out
+
+    # -- emit -----------------------------------------------------------------
     def _emit(self, gen: int) -> bool:
+        _prof = os.environ.get("POKEIO_LIVE_PROF") == "1"
+        _t0 = time.perf_counter() if _prof else 0.0
+        self._maybe_promote_pending()
         self.showcase.step(self.champ_steps)
+        _t1 = time.perf_counter() if _prof else 0.0
+        self._poll_select()
+        screens = fitness = dead = obs = actions = None
         if self._cache is not None:
-            screens, fitness, dead = self._cache
+            screens, fitness, dead, obs, actions = self._cache
             swarm = build_swarm(
                 screens, fitness, dead, self.swarm_cap, self.elite_k
             )
         else:
             swarm = []
+        champ = self.showcase.payload()
+        champ["champ_since"] = self._champ_since  # unix ts of install (UI tenure)
+        champ["champ_gen"] = int(self._champ_gen)
+        champ["fitness"] = float(self._champ_fitness)
         payload = {
             "t": time.time(),
             "gen": int(gen),
             "run": self.run_id,
-            "champion": self.showcase.payload(),
+            "champion": champ,
             "swarm": swarm,
+            "focus": self._build_focus(screens, obs, actions),
+            "reward_terms": self._reward_terms_payload(fitness),
+            "archive": self._archive_payload(),
+            "species": self._species,
+            "wave": int(self._wave_idx),
+            "round": int(self._round),
         }
         self.last_size = self.writer.write(payload)
+        if _prof:
+            _t2 = time.perf_counter()
+            print(
+                f"[live-prof] emit={_t2 - _t0:.4f}s "
+                f"(showcase={_t1 - _t0:.4f}s focus+payload={_t2 - _t1:.4f}s) "
+                f"idx={self._select_idx}",
+                flush=True,
+            )
         return True
 
 
@@ -462,6 +792,8 @@ __all__ = [
     "ChampionShowcase",
     "LiveStreamer",
     "build_swarm",
+    "build_genes",
+    "build_net_view",
     "b64_gray",
     "downscale_swarm",
     "INTERESTING_RAM",

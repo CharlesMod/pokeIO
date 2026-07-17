@@ -12,6 +12,7 @@ Endpoints
 * ``GET /api/runs``              → {"runs": [{"id","generations","mtime"}, ...]}  newest first
 * ``GET /api/telemetry?run=ID``  → {"run", "records":[...], "host":{cpu,gpu}}  (tail of records)
 * ``GET /api/live?run=ID``       → parsed runs/<run-or-newest>/live.json (real frames + champion net) or {}
+* ``GET /api/select?run=ID&idx=N`` → writes runs/<ID>/select.json (focus agent; -1 = champion)
 * ``GET /api/host``              → {"cpu_pct","cpu_per_core":[...],"gpu":[...]}
 
 Dependency-light: stdlib + psutil (+ orjson via the telemetry reader). Never 500s
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -157,6 +159,34 @@ def _live(run: str | None) -> dict:
         return {}
 
 
+SELECT_FILENAME = "select.json"  # focus-agent selection, read by the trainer
+
+
+def _select(run: str | None, idx) -> dict:
+    """Atomically write ``runs/<run>/select.json`` = {"idx": n, "ts": now}.
+
+    ``idx`` is the player slot within the current wave (0-based) or -1 for the
+    champion (the default state).  Missing run dir / bad args -> {"ok": false}
+    (always HTTP 200; never raises).
+    """
+    try:
+        i = int(idx)
+    except (TypeError, ValueError):
+        return {"ok": False}
+    if not run:
+        return {"ok": False}
+    d = RUNS_DIR / run
+    if not d.is_dir():
+        return {"ok": False}
+    tmp = d / (SELECT_FILENAME + ".tmp")
+    try:
+        tmp.write_text(json.dumps({"idx": i, "ts": time.time()}))
+        os.replace(tmp, d / SELECT_FILENAME)
+    except Exception:
+        return {"ok": False}
+    return {"ok": True, "idx": i}
+
+
 def _telemetry(run: str | None) -> dict:
     d = _resolve_run(run)
     host = _host_stats()
@@ -205,6 +235,11 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/live":
                 run = (parse_qs(u.query).get("run") or [None])[0]
                 self._json(_live(run))
+            elif path == "/api/select":
+                q = parse_qs(u.query)
+                run = (q.get("run") or [None])[0]
+                idx = (q.get("idx") or [None])[0]
+                self._json(_select(run, idx))
             elif path == "/api/host":
                 self._json(_host_stats())
             elif path == "/healthz":

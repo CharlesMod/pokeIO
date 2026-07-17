@@ -136,6 +136,8 @@
   .cell.dead{opacity:.28; filter:grayscale(.6)}
   .cell.dead::after{content:"✕"; position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--crit); font-size:16px; opacity:.5}
   .cell .rank{position:absolute; right:3px; top:2px; font-family:var(--mono); font-size:7.5px; color:rgba(240,233,216,.4); font-variant-numeric:tabular-nums}
+  .cell.sel{border-color:var(--aqua); box-shadow:0 0 0 1px var(--aqua),0 0 12px rgba(24,162,196,.45)}
+  .cell.sel .id{color:var(--aqua)}
 
   /* ---------- right column ---------- */
   .fitness-fig{width:100%; display:block}
@@ -192,6 +194,15 @@
   .dz-head a:hover{color:var(--amber)}
   .gtwrap{position:relative; flex:1; min-height:0}
   .gtwrap canvas{position:absolute; inset:0; width:100%; height:100%; display:block}
+  .gtwrap svg{position:absolute; inset:0; width:100%; height:100%; display:block}
+  .lanebtn{font-family:var(--mono); font-size:8.5px; letter-spacing:.14em; text-transform:uppercase;
+    background:none; border:1px solid var(--line-2); color:var(--ink-mute); border-radius:20px; padding:2px 8px; cursor:pointer}
+  .lanebtn:hover{color:var(--ink-dim)}
+  .lanebtn.on{color:var(--violet); border-color:var(--violet)}
+  .term.neg .tbar i{background:linear-gradient(90deg,#7a3a28,var(--crit))}
+  .dz-head .champbtn{color:var(--amber); background:none; border:1px solid rgba(224,168,56,.4); border-radius:20px; padding:2px 9px;
+    font-family:var(--mono); font-size:8.5px; letter-spacing:.14em; text-transform:uppercase; cursor:pointer}
+  .dz-head .champbtn:hover{background:rgba(224,168,56,.1)}
 
   @media (prefers-reduced-motion:reduce){*{animation-duration:.001ms!important; transition-duration:.001ms!important}}
 </style>
@@ -268,7 +279,7 @@
       <div class="panel champion">
         <header>
           <span class="lbl">Champion Cage</span><span class="idx">// illustrative feed — live frames not streamed yet · numbers above are real</span>
-          <span class="r">reward <b style="color:var(--olive)">7,418</b> &nbsp;·&nbsp; 14,203 steps &nbsp;·&nbsp; <span style="color:var(--amber)">▲ new frontier</span></span>
+          <span class="r" id="champ-stats">reward <b style="color:var(--olive)">7,418</b> &nbsp;·&nbsp; 14,203 steps &nbsp;·&nbsp; <span style="color:var(--amber)">▲ new frontier</span></span>
         </header>
         <div class="bodyp">
           <div class="screen-wrap">
@@ -285,7 +296,7 @@
               <span class="arw">+</span>
               <div class="stage ram">RAM tap<b>8 KB WRAM</b></div>
               <span class="arw">→</span>
-              <div class="stage" style="border-color:var(--line-2)">net<b style="color:var(--amber)">6176 → 8</b></div>
+              <div class="stage" style="border-color:var(--line-2)">net<b style="color:var(--amber)" id="pipe-net">6176 → 8</b></div>
             </div>
             <div class="vision-row">
               <div class="vision">
@@ -319,18 +330,19 @@
           <div class="legend">
             <span><i style="background:var(--amber)"></i>best <b class="n" style="margin-left:2px">champion</b></span>
             <span><i style="background:var(--aqua)"></i>median</span>
-            <span><i style="background:var(--violet)"></i>novelty frontier</span>
+            <span><i style="background:var(--violet)"></i>archive cells</span>
           </div>
         </div>
       </div>
 
       <div class="panel reward">
-        <header><span class="lbl">Reward Genome</span><span class="idx">// co-evolved · unsupervised</span><span class="r">candidate <b style="color:var(--violet)">R-118</b></span></header>
+        <header><span class="lbl">Reward Genome</span><span class="idx" id="rw-idx">// co-evolved · unsupervised</span><span class="r" id="rw-cand">candidate <b style="color:var(--violet)">R-118</b></span></header>
         <div class="bodyp">
           <div class="rwhead">
-            <span class="gen">4 terms · no hand-coding</span>
-            <span class="fit">meta-fit 0.91 ↦ predicts frontier</span>
+            <span class="gen" id="rw-left">4 terms · no hand-coding</span>
+            <span class="fit" id="rw-right">meta-fit 0.91 ↦ predicts frontier</span>
           </div>
+          <div id="terms">
           <div class="term novel" id="t-novel">
             <div class="tl"><span class="tn">archive novelty <small>· screen+RAM cells</small></span><span class="tw">0.41</span></div>
             <div class="tbar"><i style="width:41%"></i></div>
@@ -347,7 +359,8 @@
             <div class="tl"><span class="tn">LLM judge <small>· episode caption rank</small></span><span class="tw">0.08</span></div>
             <div class="tbar"><i style="width:8%"></i></div>
           </div>
-          <div class="rwnote"><b>Why co-evolve reward?</b> Terms that stop predicting real exploration die off. Last mutation reweighted <b>RAM progress</b> after the population began farming battle animations.</div>
+          </div>
+          <div class="rwnote" id="rw-note"><b>Why co-evolve reward?</b> Terms that stop predicting real exploration die off. Last mutation reweighted <b>RAM progress</b> after the population began farming battle animations.</div>
         </div>
       </div>
 
@@ -356,11 +369,16 @@
         <div class="bodyp">
           <div class="expwrap">
             <div class="expgrid" id="expgrid"></div>
+            <div style="display:none;flex:none" id="expspark-wrap">
+              <canvas id="expspark" width="154" height="86" style="display:block;border-radius:3px;background:#181308;border:1px solid #100d07"></canvas>
+              <div style="font-family:var(--mono);font-size:8px;letter-spacing:.1em;color:var(--ink-mute);text-transform:uppercase;margin-top:4px;text-align:center">cells · last ~60s</div>
+            </div>
             <div class="expstat">
               <div class="row"><span class="k">Cells found</span><span class="v amber" id="cells">3,847</span></div>
               <div class="row"><span class="k">Frontier this gen</span><span class="v" id="frontier">+62</span></div>
-              <div class="row"><span class="k">Maps reached</span><span class="v" id="maps">27</span></div>
-              <div class="row"><span class="k">Deepest badge</span><span class="v" style="color:var(--olive)">03 · Vermilion</span></div>
+              <div class="row"><span class="k">Restores</span><span class="v" id="exp-restores">—</span></div>
+              <div class="row"><span class="k">Captured</span><span class="v" id="exp-captured">—</span></div>
+              <div class="row"><span class="k">Max depth</span><span class="v" style="color:var(--olive)" id="exp-depth">—</span></div>
             </div>
           </div>
         </div>
@@ -378,8 +396,9 @@
 <section class="dz" id="detail">
   <div class="dz-head">
     <span class="chip">detail</span>
-    <span class="t">BRAIN VIEW — agent <b id="det-agent">#4471</b></span>
-    <span class="dim">// HyperNEAT lane preview (Lane B) — the active runner is direct-NEAT; these CPPN panels become real when Lane B lands</span>
+    <span class="t">BRAIN VIEW — <b id="det-agent">CHAMPION</b></span>
+    <span class="dim" id="det-mode">// demo — no live focus yet · click a swarm cell above to inspect an agent</span>
+    <button class="champbtn" id="det-champ" title="focus the champion (idx −1)">◆ champion</button>
     <a href="#top">▲ back to the wall</a>
   </div>
 
@@ -387,22 +406,22 @@
   <div style="display:grid;grid-template-columns:0.95fr 1.35fr;gap:10px">
   <div class="panel" style="height:clamp(260px,34vh,380px)">
     <header>
-      <span class="lbl">The Genotype</span><span class="idx">// CPPN · the DNA · answers "what weight goes here?"</span>
-      <span class="r"><span>gen <b id="gt-gen" style="color:var(--amber)">413</b></span><span><b id="gt-nodes">7</b> nodes</span><span><b id="gt-conns">14</b> conn</span><span id="gt-lastmut" style="color:var(--violet)">+node sin()</span></span>
+      <span class="lbl">The Genotype</span><span class="idx" id="gt-idx">// Lane A · NEAT connection genome · innovation-ordered</span>
+      <span class="r"><button class="lanebtn" id="laneb-btn">lane b preview · off</button><span>gen <b id="gt-gen" style="color:var(--amber)">—</b></span><span><b id="gt-nodes">—</b> nodes</span><span><b id="gt-conns">—</b> conn</span><span id="gt-lastmut" style="color:var(--violet)"></span></span>
     </header>
-    <div class="bodyp" style="padding:0;flex:1"><div class="gtwrap"><canvas id="gt-graph"></canvas></div></div>
-    <div class="foot" style="padding:7px 12px;border-top:1px solid var(--line);letter-spacing:.04em">
-      watch it build: <b style="color:var(--amber)">weight out</b>, asked at every pixel, paints one <b>receptive field</b> — the phenotype at right is full of them
+    <div class="bodyp" style="padding:0;flex:1"><div class="gtwrap"><canvas id="gt-graph" style="display:none"></canvas><canvas id="gt-real"></canvas></div></div>
+    <div class="foot" id="gt-foot" style="padding:7px 12px;border-top:1px solid var(--line);letter-spacing:.04em">
+      each bar = one connection gene of the focused agent, innovation-ordered · <b style="color:var(--amber)">height = |weight|</b> · green = excitatory · rust = inhibitory · struck = disabled
     </div>
   </div>
   <div class="panel" style="height:clamp(260px,34vh,380px)">
     <header>
-      <span class="lbl">The Phenotype</span><span class="idx">// the live network the genotype paints</span>
-      <span class="r"><span><b id="pn-n">10</b> neurons</span><span><b id="pn-w">1,760</b> painted weights</span><span style="color:var(--violet)">⟳ rewires on every mutation</span></span>
+      <span class="lbl">The Phenotype</span><span class="idx" id="pn-idx">// the wired network · glow = live activation</span>
+      <span class="r"><span><b id="pn-n">—</b> nodes</span><span><b id="pn-w">—</b> live conn</span><span id="pn-note" style="color:var(--violet)"></span></span>
     </header>
-    <div class="bodyp" style="padding:0;flex:1"><div class="gtwrap"><canvas id="pn-net"></canvas></div></div>
-    <div class="foot" style="padding:7px 12px;border-top:1px solid var(--line);letter-spacing:.04em">
-      real forward pass · input nodes = the champion's live pixels above · each neuron is its receptive field (the weights the CPPN painted) · neurons exist only where the field has structure (ES-HyperNEAT) · ghost boxes = unexpressed · wires sampled across each field
+    <div class="bodyp" style="padding:0;flex:1"><div class="gtwrap"><canvas id="pn-net" style="display:none"></canvas><svg id="pn-real" viewBox="0 0 640 300" preserveAspectRatio="xMidYMid meet"></svg></div></div>
+    <div class="foot" id="pn-foot" style="padding:7px 12px;border-top:1px solid var(--line);letter-spacing:.04em">
+      the focused agent's real net — inputs pre-sampled by the backend · node glow = activation from the live forward pass · edge green + / rust − · width = |weight|
     </div>
   </div>
   </div>
@@ -453,12 +472,12 @@
     <header>
       <span class="chip">detail</span>
       <span class="lbl">Forward Pass · Step by Step</span>
-      <span class="idx">// agent <span id="fp-agent">#4471</span> · one brain · pixels → action</span>
+      <span class="idx">// <span id="fp-agent">demo brain</span> · pixels → action</span>
       <span class="r">
-        <span>retina <b>16×14 · 224 in</b></span>
-        <span>weights <b>1,889 · 1 recurrent</b></span>
+        <span>obs <b id="fp-retina">16×14 · 224 in</b></span>
+        <span>weights <b id="fp-weights">1,889 · 1 recurrent</b></span>
         <span>outputs <b>8 buttons</b></span>
-        <span>gate <b class="am">1 action / frame</b> <i>· slowed ~10× for viewing</i></span>
+        <span>gate <b class="am" id="fp-gate">1 action / frame</b> <i id="fp-gatenote">· slowed ~10× for viewing</i></span>
       </span>
     </header>
     <div class="fpcvwrap"><div class="fpcv"><canvas id="fp"></canvas></div></div>
@@ -1031,6 +1050,7 @@ function draw(time,dt){
 /* ======================= LOOP ======================= */
 let last=0, time=0;
 function frameLoop(ts){
+  if(window.POKE_FOCUS){ last=ts; requestAnimationFrame(frameLoop); return; } // live focus owns #fp
   const dt=Math.min(0.05,(ts-last)/1000||0); last=ts; time+=dt;
   updateWorld(dt); drawGB(time); forward();
   histAcc+=dt;
@@ -1062,13 +1082,22 @@ else requestAnimationFrame(frameLoop);
 </section>
 
 <script>
-/* bridge: wall → detail */
-window.pokeSelectAgent=function(id){
-  var t='#'+id;
-  var a=document.getElementById('det-agent'); if(a)a.textContent=t;
-  var b=document.getElementById('fp-agent'); if(b)b.textContent=t;
-  var d=document.getElementById('detail'); if(d)d.scrollIntoView({behavior:'smooth'});
+/* bridge: wall → detail. pokeSelect(idx) focuses swarm slot idx (0-based) for the
+   backend via GET /api/select; idx=-1 focuses the champion (the default). */
+window.POKE_SEL=-1;
+window.pokeSelect=function(idx,noScroll){
+  if(idx===window.POKE_SEL&&idx>=0)idx=-1;               // re-click the selected cell → champion
+  window.POKE_SEL=idx;
+  if(window.pokeNoteClick)window.pokeNoteClick();
+  if(window.pokeMarkSel)window.pokeMarkSel(idx);
+  if(window.__detail)window.__detail.selected(idx);
+  var run=window.POKE_RUN;
+  if(run){
+    try{fetch('/api/select?run='+encodeURIComponent(run)+'&idx='+idx,{cache:'no-store'}).catch(function(){});}catch(e){}
+  }
+  if(!noScroll){var d=document.getElementById('detail'); if(d&&d.scrollIntoView)d.scrollIntoView({behavior:'smooth'});}
 };
+window.pokeSelectAgent=function(){window.pokeSelect(-1);}; // legacy alias
 </script>
 
 <script>
@@ -1163,7 +1192,7 @@ window.pokeSelectAgent=function(id){
     const id=document.createElement('span'); id.className='id'; id.textContent='#'+(4400+i);
     const rk=document.createElement('span'); rk.className='rank';
     d.appendChild(cv);d.appendChild(id);d.appendChild(rk);swarm.appendChild(d);
-    (function(nid){d.addEventListener('click',function(){window.pokeSelectAgent&&window.pokeSelectAgent(nid);});})(4400+i);
+    (function(slot){d.addEventListener('click',function(){window.pokeSelect&&window.pokeSelect(slot);});})(i);
     const seed=Math.random()*1000;
     cells.push({el:d,cx:cv.getContext('2d'),seed,phase:rand(0,6),spd:rand(.4,1.6),
       elite:i<4, dead:false, rk});
@@ -1172,7 +1201,7 @@ window.pokeSelectAgent=function(id){
   [11,27,38,52,59].forEach(k=>{cells[k].dead=true;cells[k].el.classList.add('dead');});
   cells.forEach((c,i)=>{ if(c.elite)c.rk.textContent='#'+(i+1); });
   const badge=document.getElementById('champ-badge');
-  if(badge)badge.addEventListener('click',function(){window.pokeSelectAgent&&window.pokeSelectAgent(4471);});
+  if(badge)badge.addEventListener('click',function(){window.pokeSelect&&window.pokeSelect(-1);});
   function drawCell(c,t){
     if(window.POKE_FRAMES)return;   // real swarm frames are driving the cells
     const x=c.cx, pal=c.dead?PD:P;
@@ -1314,6 +1343,7 @@ window.pokeSelectAgent=function(id){
 
   const terms=[['t-novel',41],['t-ram',33],['t-screen',18],['t-judge',8]];
   setInterval(()=>{
+    if(window.POKE_LIVE||window.POKE_FRAMES)return;   // real reward_terms drive the panel
     terms.forEach(([id,base])=>{const el=document.getElementById(id);if(!el)return;
       const v=Math.max(2,base+rand(-2,2)); el.querySelector('i').style.width=v.toFixed(0)+'%';
       el.querySelector('.tw').textContent=(v/100).toFixed(2);});
@@ -1630,16 +1660,33 @@ function renderPheno(dt,time){
     px2.font='9px ui-monospace,monospace';px2.textAlign='left';px2.fillText(lastChangeTxt,16,14);}
 }
 
-/* ---- shared loop ---- */
+/* ---- controllable loop: Lane B is a labeled PREVIEW, off by default ----
+   Nothing here runs until window.__laneB.start() (the "lane b preview" toggle).
+   The real Lane-A genotype/phenotype renderers own the panes otherwise. */
 function fitAll(){fitG();fitP();}
-window.addEventListener('resize',fitAll);
-initGenome(); fitAll();
-let last=0,time=0;
-function loop(ts){const dt=Math.min(0.05,(ts-last)/1000||0);last=ts;time+=dt;
+let last=0,time=0,running=false,raf=0,mutAcc=0;
+window.addEventListener('resize',function(){if(running)fitAll();});
+function loop(ts){
+  if(!running)return;
+  const dt=Math.min(0.05,(ts-last)/1000||0);last=ts;time+=dt;
+  mutAcc+=dt; if(mutAcc>=2.6){mutAcc=0;mutate();}
   samplePlusFire(); renderGraph(dt,time); renderPheno(dt,time);
-  if(!RM)requestAnimationFrame(loop);}
-if(RM){samplePlusFire();renderGraph(0,0);renderPheno(0,0);} else requestAnimationFrame(loop);
-if(!RM)setInterval(mutate,2600);
+  raf=requestAnimationFrame(loop);
+}
+window.__laneB={
+  start:function(){
+    if(running)return; running=true;
+    if(!genome)initGenome();
+    fitAll(); last=0; mutAcc=0;
+    if(RM){samplePlusFire();renderGraph(0,0);renderPheno(0,0);}
+    else raf=requestAnimationFrame(loop);
+  },
+  stop:function(){
+    if(!running)return; running=false;
+    if(raf)cancelAnimationFrame(raf);
+    try{gx.clearRect(0,0,GW,GH);px2.clearRect(0,0,PW,PH);}catch(e){}
+  }
+};
 })();
 </script>
 
@@ -1649,6 +1696,9 @@ if(!RM)setInterval(mutate,2600);
 "use strict";
 const $=id=>document.getElementById(id);
 const fmt=n=>Math.round(n).toLocaleString();
+/* optional ?run=<id> pin, forwarded to the API (also used by /api/live below) */
+window.POKE_RUNQ=(function(){try{const r=new URLSearchParams(location.search).get('run');
+  return r?('?run='+encodeURIComponent(r)):'';}catch(e){return '';}})();
 let lastGen=-1; const badge=$('live-badge');
 function setBadge(live,run){
   if(!badge)return;
@@ -1680,16 +1730,34 @@ function paintCoresLive(perCore){
     kids[i].style.background = load>4 ? (i%5===0?'#18a2c4':'#e0a838') : '#1d1810';
     kids[i].style.opacity = load>4 ? (0.4+Math.min(1,load/100)*0.6) : 1;}
 }
-function pushMilestone(r){
+/* ---- real milestone feed --------------------------------------------------
+   Events are derived ONLY from observed data deltas (telemetry records +
+   live.json polls). The demo's invented flavor text is cleared the first time
+   a real event lands. */
+let evtN=0, feedCleared=false;
+window.pokePushEvent=function(gen,cls,tag,html){
   const sc=$('scroller'); if(!sc)return;
-  const d=document.createElement('div'); d.className='evt'+(r.archive_delta>0?' disc':'');
-  d.innerHTML='<span class="gen">G'+r.gen+'</span><div><div class="txt">gen <b>'+r.gen+'</b> · best <b>'+fmt(r.fitness_best)+'</b> · <b>+'+(r.archive_delta||0)+'</b> new cells</div><div class="tag">frontier</div></div>';
+  if(!feedCleared){sc.innerHTML=''; feedCleared=true;}
+  const d=document.createElement('div'); d.className='evt '+(cls||'');
+  d.innerHTML='<span class="gen">G'+(gen!=null?gen:'·')+'</span><div><div class="txt">'+html+'</div><div class="tag">'+tag+'</div></div>';
   sc.insertBefore(d, sc.firstChild);
   while(sc.children.length>16) sc.removeChild(sc.lastChild);
+  evtN++; if($('evt-count'))$('evt-count').textContent=evtN.toLocaleString()+' live events';
+};
+function pushMilestone(r,prev){
+  const pe=window.pokePushEvent;
+  pe(r.gen, (r.archive_delta>0?'disc':''), 'gen done',
+     'gen <b>'+r.gen+'</b> complete · best <b>'+fmt(r.fitness_best)+'</b> · median '+fmt(r.fitness_median)+' · <b>+'+(r.archive_delta||0)+'</b> cells');
+  if(prev&&r.fitness_best>prev.fitness_best)
+    pe(r.gen,'hot','new best','new best fitness <b>'+fmt(r.fitness_best)+'</b> (was '+fmt(prev.fitness_best)+')');
+  if(prev&&r.n_species!==prev.n_species)
+    pe(r.gen,'evo','speciate','species <b>'+prev.n_species+' → '+r.n_species+'</b>');
+  if(prev&&r.champion_id&&r.champion_id!==prev.champion_id)
+    pe(r.gen,'disc','champion','new champion <b>'+r.champion_id+'</b>');
 }
 async function poll(){
   try{
-    const res=await fetch('/api/telemetry',{cache:'no-store'});
+    const res=await fetch('/api/telemetry'+(window.POKE_RUNQ||''),{cache:'no-store'});
     const j=await res.json();
     const recs=j.records||[]; const host=j.host||{};
     if(recs.length){
@@ -1702,14 +1770,26 @@ async function poll(){
       if($('cells'))$('cells').textContent=fmt(last.archive_cells);
       if($('frontier'))$('frontier').textContent='+'+(last.archive_delta||0);
       if($('fit-r'))$('fit-r').textContent='best '+fmt(last.fitness_best)+' ▲';
-      if($('evt-count'))$('evt-count').textContent=recs.length.toLocaleString()+' generations';
+      if(last.wall_time!=null&&$('s-clock')){
+        const s=Math.max(0,Math.round(last.wall_time)),hh=(s/3600|0),mm=(s%3600/60|0),ss=s%60;
+        $('s-clock').textContent=hh+':'+String(mm).padStart(2,'0')+':'+String(ss).padStart(2,'0');
+      }
+      if($('champ-stats'))$('champ-stats').innerHTML=
+        'reward <b style="color:var(--olive)">'+fmt(last.fitness_best)+'</b> &nbsp;·&nbsp; gen '+last.gen+
+        ((last.archive_delta||0)>0?' &nbsp;·&nbsp; <span style="color:var(--amber)">▲ +'+last.archive_delta+' cells</span>':'');
       if(host.cpu_pct!=null){const c=Math.round(host.cpu_pct);if($('cpu-pct'))$('cpu-pct').textContent=c;if($('cpu-bar'))$('cpu-bar').style.width=c+'%';}
       paintCoresLive(host.cpu_per_core);
       const g=host.gpu||[];
       if(g[0]){if($('g0-bar'))$('g0-bar').style.width=g[0].util+'%';if($('g0v'))$('g0v').innerHTML='<b>'+Math.round(g[0].util)+'</b>% · '+(g[0].mem_used_mb/1024).toFixed(1)+'G';}
       if(g[1]){if($('g1-bar'))$('g1-bar').style.width=g[1].util+'%';if($('g1v'))$('g1v').innerHTML='<b>'+Math.round(g[1].util)+'</b>% · '+(g[1].mem_used_mb/1024).toFixed(1)+'G';}
       drawFitLive(recs);
-      if(last.gen!==lastGen){ if(lastGen>=0) pushMilestone(last); lastGen=last.gen; }
+      if(last.gen!==lastGen){
+        if(lastGen<0)  /* first live poll: retire the demo feed, mark attachment */
+          window.pokePushEvent(last.gen,'','live','telemetry attached · <b>'+recs.length+'</b> generations recorded · best <b>'+fmt(last.fitness_best)+'</b>');
+        else
+          pushMilestone(last, recs.length>1?recs[recs.length-2]:null);
+        lastGen=last.gen;
+      }
     } else { window.POKE_LIVE=false; setBadge(false); }
   }catch(e){ window.POKE_LIVE=false; setBadge(false); }
 }
@@ -1727,6 +1807,7 @@ poll(); setInterval(poll,1500);
 "use strict";
 const $=id=>document.getElementById(id);
 const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const fmt=n=>Math.round(n).toLocaleString();
 
 /* base64 → Uint8Array of raw grayscale bytes */
 function b64bytes(b64){
@@ -1790,6 +1871,8 @@ function drawRamTap(ram){
 function drawSwarm(swarm){
   if(!swarm||!swarm.length) return;
   const cells=document.querySelectorAll('#swarm .cell');
+  /* hide demo cells beyond the real swarm; restore if the swarm grows */
+  for(let i=0;i<cells.length;i++)cells[i].style.display=(i<swarm.length)?'':'none';
   for(let i=0;i<swarm.length && i<cells.length;i++){
     const sw=swarm[i], el=cells[i], cv=el.querySelector('canvas');
     if(cv){
@@ -1814,19 +1897,24 @@ const COL={in:'#18a2c4', hidden:'#9d78dd', out:'#e0a838'};
 function idRng(id){ let a=((id|0)*2654435761)>>>0;
   return function(){a=(a+0x6D2B79F5)>>>0; let t=Math.imul(a^a>>>15,1|a);
     t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296;}; }
-function renderNet(net, buttons){
-  if(!netSvg||!net||!net.nodes) return;
-  const W=348, H=150, pad=13;
+/* Shared renderer: real NEAT graph → any target SVG (champion pane + phenotype
+   pane both use it — factored, not forked). Returns the enabled-conn count. */
+window.pokeRenderNet=function(svgEl, net, buttons, W, H, opts){
+  if(!svgEl||!net||!net.nodes) return 0;
+  opts=opts||{};
+  const pad=Math.max(13,H*0.087), fs=opts.fs||8, lfs=opts.lfs||7.5;
+  const rHid=opts.rHid||3.2, rIO=opts.rIO||4.0;
+  const inX=W*0.075, outX=W*0.925;
   const ins=[], hids=[], outs=[];
   net.nodes.forEach(n=>{ (n.kind==='in'?ins:n.kind==='out'?outs:hids).push(n); });
   outs.sort((a,b)=>a.id-b.id);
   const pos={}, act=net.act||{};
   const spread=(arr,x)=>{ const n=arr.length; arr.forEach((nd,i)=>{
     pos[nd.id]={x:x, y:n<=1?H/2:pad+(H-2*pad)*i/(n-1), kind:nd.kind}; }); };
-  spread(ins, 26);
-  spread(outs, 322);
+  spread(ins, inX);
+  spread(outs, outX);
   hids.forEach(nd=>{ const r=idRng(nd.id);
-    pos[nd.id]={x:96+r()*156, y:14+r()*(H-28), kind:'hidden'}; });
+    pos[nd.id]={x:W*0.276+r()*W*0.448, y:H*0.093+r()*(H-H*0.187), kind:'hidden'}; });
   let s='', enCount=0;
   (net.conns||[]).forEach(e=>{
     if(e.en===false) return;
@@ -1843,7 +1931,7 @@ function renderNet(net, buttons){
     const p=pos[n.id]; if(!p) return;
     const col=COL[n.kind]||'#a89d88';
     const a=Math.abs(+act[n.id]||0), glow=clamp(a,0,1);
-    const r=n.kind==='hidden'?3.2:4.0;
+    const r=n.kind==='hidden'?rHid:rIO;
     if(glow>0.02)
       s+='<circle cx="'+p.x.toFixed(1)+'" cy="'+p.y.toFixed(1)+'" r="'+(r+glow*3.5).toFixed(1)+
          '" fill="'+col+'" opacity="'+(0.30+glow*0.45).toFixed(2)+'"/>';
@@ -1852,15 +1940,142 @@ function renderNet(net, buttons){
   outs.forEach((n,i)=>{
     const p=pos[n.id]; if(!p) return;
     if(buttons && buttons[i])
-      s+='<circle cx="'+p.x.toFixed(1)+'" cy="'+p.y.toFixed(1)+'" r="6.5" fill="none" stroke="#e0a838" stroke-width="1.4"/>';
-    s+='<text x="'+(p.x+7)+'" y="'+(p.y+3)+'" fill="#a89d88" font-size="8" font-family="ui-monospace,monospace">'+(OUT_SYM[i]||'')+'</text>';
+      s+='<circle cx="'+p.x.toFixed(1)+'" cy="'+p.y.toFixed(1)+'" r="'+(rIO+2.5)+'" fill="none" stroke="#e0a838" stroke-width="1.4"/>';
+    s+='<text x="'+(p.x+rIO+3)+'" y="'+(p.y+3)+'" fill="#a89d88" font-size="'+fs+'" font-family="ui-monospace,monospace">'+(OUT_SYM[i]||'')+'</text>';
   });
-  s+='<text x="26" y="147" fill="#6f6656" font-size="7.5" font-family="ui-monospace,monospace" text-anchor="middle" letter-spacing="1">INPUTS</text>';
-  s+='<text x="174" y="147" fill="#6f6656" font-size="7.5" font-family="ui-monospace,monospace" text-anchor="middle" letter-spacing="1">HIDDEN</text>';
-  s+='<text x="322" y="147" fill="#6f6656" font-size="7.5" font-family="ui-monospace,monospace" text-anchor="middle" letter-spacing="1">BUTTONS</text>';
-  netSvg.innerHTML=s;
-  if(nodesEl)nodesEl.textContent=net.nodes.length;
-  if(connsEl)connsEl.textContent=enCount;
+  s+='<text x="'+inX+'" y="'+(H-3)+'" fill="#6f6656" font-size="'+lfs+'" font-family="ui-monospace,monospace" text-anchor="middle" letter-spacing="1">INPUTS</text>';
+  s+='<text x="'+(W/2)+'" y="'+(H-3)+'" fill="#6f6656" font-size="'+lfs+'" font-family="ui-monospace,monospace" text-anchor="middle" letter-spacing="1">HIDDEN</text>';
+  s+='<text x="'+outX+'" y="'+(H-3)+'" fill="#6f6656" font-size="'+lfs+'" font-family="ui-monospace,monospace" text-anchor="middle" letter-spacing="1">BUTTONS</text>';
+  svgEl.innerHTML=s;
+  return enCount;
+};
+function renderNet(net, buttons){
+  const enCount=window.pokeRenderNet(netSvg, net, buttons, 348, 150);
+  if(net&&net.nodes){
+    if(nodesEl)nodesEl.textContent=net.nodes.length;
+    if(connsEl)connsEl.textContent=enCount;
+  }
+}
+
+/* --- reward genome (real reward_terms) ------------------------------------- */
+const TERM_CLS=['novel','ram','screen','judge'];
+let termSig='';
+function renderRewardTerms(rt,gen){
+  const box=$('terms'); if(!box||!rt)return;
+  const keys=Object.keys(rt); if(!keys.length)return;
+  const sig=keys.join('|');
+  if(sig!==termSig){
+    termSig=sig;
+    box.innerHTML=keys.map((k,i)=>
+      '<div class="term '+TERM_CLS[i%TERM_CLS.length]+'">'+
+      '<div class="tl"><span class="tn">'+k+'</span><span class="tw">·</span></div>'+
+      '<div class="tbar"><i style="width:0%"></i></div></div>').join('');
+  }
+  const mx=Math.max(1e-9,...keys.map(k=>Math.abs(+rt[k]||0)));
+  let sum=0;
+  keys.forEach((k,i)=>{
+    const el=box.children[i]; if(!el)return;
+    const v=+rt[k]||0; sum+=v;
+    el.classList.toggle('neg',v<0);
+    el.querySelector('.tw').textContent=(v<0?'−':'')+Math.abs(v).toFixed(3);
+    el.querySelector('i').style.width=(Math.abs(v)/mx*100).toFixed(1)+'%';
+  });
+  if($('rw-left'))$('rw-left').textContent=keys.length+' terms · live from run';
+  if($('rw-right'))$('rw-right').textContent='Σ '+sum.toFixed(3);
+  if($('rw-idx'))$('rw-idx').textContent='// live reward_terms · '+keys.length+' terms';
+  if($('rw-cand'))$('rw-cand').innerHTML='gen <b style="color:var(--violet)">'+(gen!=null?gen:'—')+'</b>';
+  if($('rw-note'))$('rw-note').innerHTML='<b>Live values</b> from the run’s reward stack. Bar = |value| relative to the largest term this poll; signed values shown as reported.';
+}
+
+/* --- exploration archive (real stats + cells-over-time sparkline) ----------- */
+const cellsHist=[]; let expLive=false;
+function drawSpark(){
+  const cv=$('expspark'); if(!cv)return;
+  const c=cv.getContext('2d'), W=cv.width, H=cv.height;
+  c.clearRect(0,0,W,H);
+  if(cellsHist.length<2)return;
+  let mn=Infinity,mxv=-Infinity;
+  for(const v of cellsHist){if(v<mn)mn=v;if(v>mxv)mxv=v;}
+  if(mxv-mn<1)mn=mxv-1;
+  c.beginPath();
+  for(let i=0;i<cellsHist.length;i++){
+    const x=i/(cellsHist.length-1)*(W-8)+4;
+    const y=H-6-(cellsHist[i]-mn)/(mxv-mn)*(H-14);
+    i?c.lineTo(x,y):c.moveTo(x,y);
+  }
+  c.strokeStyle='#e0a838'; c.lineWidth=1.6; c.stroke();
+  c.lineTo(W-4,H-2); c.lineTo(4,H-2); c.closePath();
+  c.fillStyle='rgba(224,168,56,0.12)'; c.fill();
+  c.font='8px ui-monospace,monospace'; c.fillStyle='rgba(168,157,136,0.9)'; c.textAlign='left';
+  c.fillText(String(mxv),5,10);
+}
+function renderArchive(a){
+  if(!a)return;
+  if(!expLive){expLive=true;
+    const g=$('expgrid'); if(g)g.style.display='none';
+    const s=$('expspark-wrap'); if(s)s.style.display='block';}
+  if(a.cells!=null){
+    if($('cells'))$('cells').textContent=fmt(a.cells);
+    cellsHist.push(a.cells); if(cellsHist.length>180)cellsHist.shift();
+    drawSpark();
+  }
+  if($('frontier'))$('frontier').textContent='+'+(a.gen_delta||0);
+  if($('exp-restores'))$('exp-restores').textContent=a.restores!=null?fmt(a.restores):'—';
+  if($('exp-captured'))$('exp-captured').textContent=a.captured!=null?fmt(a.captured):'—';
+  if($('exp-depth'))$('exp-depth').textContent=a.max_depth!=null?a.max_depth:'—';
+}
+
+/* --- live milestones from live.json deltas (archive / depth) ---------------- */
+const MS={cells:-1,restores:-1,captured:-1,depth:-1}, msLastT={};
+function msPush(tag,minGapMs,gen,cls,html){
+  const now=Date.now();
+  if(msLastT[tag]&&now-msLastT[tag]<minGapMs)return;
+  msLastT[tag]=now;
+  if(window.pokePushEvent)window.pokePushEvent(gen,cls,tag,html);
+}
+function liveMilestones(j){
+  const a=j.archive; if(!a)return;
+  const g=j.gen;
+  if(MS.cells>=0&&a.cells!=null&&Math.floor(a.cells/250)>Math.floor(MS.cells/250))
+    msPush('archive',0,g,'hot','archive crossed <b>'+fmt(Math.floor(a.cells/250)*250)+'</b> cells');
+  if(MS.restores>=0&&a.restores>MS.restores)
+    msPush('restore',8000,g,'','go-explore restored from archive · total <b>'+fmt(a.restores)+'</b>');
+  if(MS.captured>=0&&a.captured>MS.captured)
+    msPush('capture',8000,g,'disc','<b>+'+(a.captured-MS.captured)+'</b> cell'+((a.captured-MS.captured)>1?'s':'')+' captured · total '+fmt(a.captured));
+  if(MS.depth>=0&&a.max_depth>MS.depth)
+    msPush('depth',0,g,'evo','new max archive depth <b>'+a.max_depth+'</b>');
+  if(a.cells!=null)MS.cells=a.cells;
+  if(a.restores!=null)MS.restores=a.restores;
+  if(a.captured!=null)MS.captured=a.captured;
+  if(a.max_depth!=null)MS.depth=a.max_depth;
+}
+
+/* --- focus (selected agent) -------------------------------------------------
+   Contract: live.json carries j.focus for the slot selected via /api/select.
+   Older payloads have no focus → fall back to champion fields so the detail
+   zone never breaks. */
+function focusOf(j){
+  const f=j&&j.focus;
+  if(f&&(f.net||f.genes||f.frame_b64))return f;
+  const ch=j&&j.champion; if(!ch)return null;
+  return {idx:-1, genome_id:ch.genome_id, frame_b64:ch.frame_b64,
+          obs_b64:ch.obs_b64, obs_res:ch.obs_res, action:ch.action,
+          buttons:ch.buttons, probs:null, net:ch.net, genes:null, _synth:true};
+}
+
+/* --- selection ring sync ----------------------------------------------------- */
+let lastClickT=0;
+window.pokeNoteClick=function(){lastClickT=Date.now();};
+window.pokeMarkSel=function(idx){
+  const cells=document.querySelectorAll('#swarm .cell');
+  for(let i=0;i<cells.length;i++)cells[i].classList.toggle('sel',i===idx);
+};
+function syncSel(f){
+  if(f&&!f._synth&&typeof f.idx==='number'&&Date.now()-lastClickT>1500&&f.idx!==window.POKE_SEL){
+    window.POKE_SEL=f.idx;               // adopt server truth once clicks settle
+    if(window.__detail)window.__detail.selected(f.idx);
+  }
+  window.pokeMarkSel(window.POKE_SEL);
 }
 
 /* --- poll ------------------------------------------------------------------ */
@@ -1868,35 +2083,573 @@ const swarmIdx=document.querySelector('.swarm header .idx');
 const swarmIdx0=swarmIdx?swarmIdx.textContent:'';
 function setLiveLabels(on){
   if(champIdx)champIdx.innerHTML= on
-    ? '<span style="color:var(--good)">● live champion</span> — real optical feed'
+    ? '<span style="color:var(--good)">● live champion</span> — replays from newgame (no restores)'
     : champIdx0;
   if(swarmIdx)swarmIdx.innerHTML= on
-    ? '<span style="color:var(--good)">● live swarm</span> · click to inspect ▾'
+    ? '<span style="color:var(--good)">● live swarm</span> · half restore from the Go-Explore frontier · click to inspect ▾'
     : swarmIdx0;
 }
 async function pollLive(){
   try{
-    const res=await fetch('/api/live',{cache:'no-store'});
+    const res=await fetch('/api/live'+(window.POKE_RUNQ||''),{cache:'no-store'});
     const j=await res.json();
     const ch=j&&j.champion;
     if(ch&&ch.frame_b64){
       window.POKE_FRAMES=true;
+      if(j.run)window.POKE_RUN=j.run;
       drawChampionFrame(ch);
       drawChampionObs(ch);
       drawRamTap(ch.ram);
       if(champBadge&&ch.genome_id)champBadge.textContent='#'+ch.genome_id+' ▾';
       if(ch.net)renderNet(ch.net, ch.buttons);
+      if(ch.net&&$('pipe-net'))$('pipe-net').textContent=(ch.net.n_in||'?')+' → '+(ch.net.n_out||8);
       drawSwarm(j.swarm);
+      /* real top-strip numbers only live.json knows */
+      if(j.swarm&&$('s-players'))$('s-players').textContent=j.swarm.length;
+      const pop=(j.pop!=null)?j.pop:j.population;
+      if($('s-pop'))$('s-pop').textContent=pop!=null?(+pop).toLocaleString():'—';
+      if(j.species&&j.species.length&&$('s-spec'))$('s-spec').textContent=j.species.length;
+      /* contract panes */
+      renderRewardTerms(j.reward_terms, j.gen);
+      if(j.archive)renderArchive(j.archive);
+      liveMilestones(j);
+      /* detail zone focus */
+      const f=focusOf(j);
+      window.POKE_FOCUS=!!(f&&(f.net||f.frame_b64));
+      if(window.__detail)window.__detail.setFocus(f,j);
+      syncSel(f);
       setLiveLabels(true);
     } else {
       if(window.POKE_FRAMES){ setLiveLabels(false); }
       window.POKE_FRAMES=false;
+      window.POKE_FOCUS=false;
+      if(window.__detail)window.__detail.setFocus(null,null);
     }
   }catch(e){
     if(window.POKE_FRAMES){ setLiveLabels(false); }
     window.POKE_FRAMES=false;
+    window.POKE_FOCUS=false;
+    if(window.__detail)window.__detail.setFocus(null,null);
   }
 }
 pollLive(); setInterval(pollLive,330);
+})();
+</script>
+
+<script>
+/* ===== LIVE DETAIL ZONE — the focused agent's REAL genotype, phenotype and
+   forward pass, driven by /api/live `focus` (fed by /api/select). Every mark
+   drawn here comes from the payload; when no live feed exists the panes show
+   an explicit placeholder and the old demos stay behind guards/toggles. ===== */
+(function(){
+"use strict";
+const $=id=>document.getElementById(id);
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const MONO='ui-monospace,Menlo,monospace';
+const EXC='139,171,62', INH='198,90,62', AMB='224,168,56', AQA='63,181,207', VIO='169,139,224';
+const SYM=['↑','↓','←','→','A','B','ST','SE'];
+const NAME=['UP','DOWN','LEFT','RIGHT','A','B','START','SELECT'];
+const DPR=Math.min(2,window.devicePixelRatio||1);
+
+/* ---------- state ---------- */
+let F=null, J=null, payloadN=0, lastT=null, oneHot=false;
+const hist=[];                      // last 20 real actions, newest first
+const probS=new Float32Array(8);    // displayed (smoothed) probabilities
+const probT=new Float32Array(8);    // target = payload probs
+let flash=0;                        // chosen-action flash
+let obsOff=null, obsRes=0, frameOff=null;
+let G=null;                         // normalized genes {src,nodes,conns,sum:{nIn,nHid,nOut,dis,en,iMin,iMax,acts}}
+let NP=null;                        // prepped net view {inBins,hid,wIH,wHO,wIO,wMax,nIn}
+
+function b64bytes(b64){const bin=atob(b64),n=bin.length,u=new Uint8Array(n);for(let i=0;i<n;i++)u[i]=bin.charCodeAt(i);return u;}
+function grayCanvas(b64,w,h){
+  try{
+    const bytes=b64bytes(b64);
+    if(bytes.length!==w*h)return null;
+    const cv=document.createElement('canvas');cv.width=w;cv.height=h;
+    const c=cv.getContext('2d'),img=c.createImageData(w,h),d=img.data;
+    for(let i=0;i<bytes.length;i++){const v=bytes[i],o=i*4;d[o]=v;d[o+1]=v;d[o+2]=v;d[o+3]=255;}
+    c.putImageData(img,0,0);return cv;
+  }catch(e){return null;}
+}
+
+/* ---------- genes: contract focus.genes, fallback focus.net.conns ---------- */
+function kindStr(k){
+  if(typeof k==='string')return (k==='in'||k==='input')?'in':(k==='out'||k==='output')?'out':'hid';
+  return k===0?'in':k===2?'out':'hid';
+}
+function normGenes(f){
+  let nodes=[],conns=[],src;
+  if(f&&f.genes&&f.genes.conns&&f.genes.conns.length){
+    src='genes';
+    nodes=f.genes.nodes||[];
+    conns=f.genes.conns.slice().sort((a,b)=>a[0]-b[0]);      // innovation order
+  }else if(f&&f.net&&f.net.conns&&f.net.conns.length){
+    src='net';
+    nodes=(f.net.nodes||[]).map(n=>[n.id, n.kind, -1]);
+    conns=f.net.conns.map((c,i)=>[i, c.from, c.to, c.w, c.en!==false]);
+  }else return null;
+  let nIn=0,nHid=0,nOut=0; const acts={};
+  nodes.forEach(n=>{
+    const k=kindStr(n[1]);
+    if(k==='in')nIn++; else if(k==='out')nOut++; else nHid++;
+    if(n[2]!=null&&n[2]>=0)acts[n[2]]=(acts[n[2]]||0)+1;
+  });
+  let dis=0,en=0,iMin=Infinity,iMax=-Infinity;
+  conns.forEach(c=>{
+    const on=(c[4]!==false&&c[4]!==0); on?en++:dis++;
+    if(c[0]<iMin)iMin=c[0]; if(c[0]>iMax)iMax=c[0];
+  });
+  return {src,nodes,conns,sum:{nIn,nHid,nOut,dis,en,iMin,iMax,acts,nNodes:nodes.length}};
+}
+
+/* ---------- net prep for the forward-pass stage ---------- */
+const NBINS=16;
+function prepNet(f){
+  if(!f||!f.net||!f.net.nodes)return null;
+  const net=f.net, act=net.act||{};
+  const ins=net.nodes.filter(n=>n.kind==='in');
+  const hids=net.nodes.filter(n=>n.kind!=='in'&&n.kind!=='out');
+  const outs=net.nodes.filter(n=>n.kind==='out').sort((a,b)=>a.id-b.id);
+  const binOf={}; ins.forEach((n,i)=>binOf[n.id]=Math.min(NBINS-1,Math.floor(i/Math.max(1,ins.length)*NBINS)));
+  const inBins=new Array(NBINS).fill(0), cnt=new Array(NBINS).fill(0);
+  ins.forEach(n=>{const b=binOf[n.id]; inBins[b]+=Math.abs(+act[n.id]||0); cnt[b]++;});
+  for(let b=0;b<NBINS;b++)inBins[b]=cnt[b]?inBins[b]/cnt[b]:0;
+  const hid=hids.map(n=>({id:n.id, a:+act[n.id]||0}));
+  const hidIdx={}; hid.forEach((h,i)=>hidIdx[h.id]=i);
+  const outIdx={}; outs.forEach((n,i)=>outIdx[n.id]=i);
+  const wIH=[],wHO=[],wIO=[]; let wMax=1e-6;
+  const perHid={},perOut={};
+  (net.conns||[]).forEach(c=>{
+    if(c.en===false)return;
+    if(Math.abs(c.w)>wMax)wMax=Math.abs(c.w);
+    if(hidIdx[c.to]!=null)(perHid[hidIdx[c.to]]=perHid[hidIdx[c.to]]||[]).push(c);
+    else if(outIdx[c.to]!=null)(perOut[outIdx[c.to]]=perOut[outIdx[c.to]]||[]).push(c);
+  });
+  const strongest=(arr,n)=>arr.sort((a,b)=>Math.abs(b.w)-Math.abs(a.w)).slice(0,n);
+  Object.keys(perHid).forEach(hi=>{
+    strongest(perHid[hi],8).forEach(c=>{
+      if(binOf[c.from]!=null)wIH.push({b:binOf[c.from],h:+hi,w:c.w,sa:Math.abs(+act[c.from]||0)});
+    });
+  });
+  Object.keys(perOut).forEach(k=>{
+    strongest(perOut[k],8).forEach(c=>{
+      if(hidIdx[c.from]!=null)wHO.push({h:hidIdx[c.from],k:+k,w:c.w,sa:Math.abs(+act[c.from]||0)});
+      else if(binOf[c.from]!=null)wIO.push({b:binOf[c.from],k:+k,w:c.w,sa:Math.abs(+act[c.from]||0)});
+    });
+  });
+  return {inBins,hid,wIH,wHO,wIO,wMax,nIn:ins.length};
+}
+
+/* ---------- payload intake ---------- */
+function setFocus(f,j){
+  F=f; J=j;
+  if(!f){G=null;NP=null;renderPheno();return;}
+  const t=j&&j.t;
+  if(t===lastT)return;               // same payload — nothing new
+  lastT=t; payloadN++;
+  obsOff=null; obsRes=0;
+  if(f.obs_b64){
+    const bytes=(function(){try{return b64bytes(f.obs_b64);}catch(e){return null;}})();
+    if(bytes){
+      const res=f.obs_res||Math.round(Math.sqrt(bytes.length));
+      if(res*res===bytes.length){obsOff=grayCanvas(f.obs_b64,res,res);obsRes=res;}
+    }
+  }
+  frameOff=f.frame_b64?grayCanvas(f.frame_b64,f.frame_w||160,f.frame_h||144):null;
+  G=normGenes(f);
+  NP=prepNet(f);
+  /* probabilities: real probs preferred; buttons one-hot as honest fallback */
+  oneHot=false;
+  let p=(f.probs&&f.probs.length===8)?f.probs:null;
+  if(!p&&f.buttons&&f.buttons.length===8){p=f.buttons;oneHot=true;}
+  if(p)for(let k=0;k<8;k++)probT[k]=clamp(+p[k]||0,0,1);
+  const act=(typeof f.action==='number'&&f.action>=0&&f.action<8)?f.action
+            :(f.buttons?f.buttons.indexOf(1):-1);
+  if(hist.length===0||hist[0].n!==payloadN)
+    hist.unshift({n:payloadN,a:act,sym:(act>=0&&act<8)?SYM[act]:'·'});
+  if(hist.length>20)hist.pop();
+  flash=1;
+  const fr=$('fr'); if(fr)fr.textContent=String(payloadN%1000000).padStart(6,'0');
+  const beat=$('beat'); if(beat){beat.classList.remove('on'); void beat.offsetWidth; beat.classList.add('on');}
+  updateHeaders();
+  renderPheno();
+}
+
+function pad2(n){return String(n).padStart(2,'0');}
+function focusLabel(){
+  if(!F)return 'demo brain';
+  const gid=F.genome_id||'?';
+  return (F.idx!=null&&F.idx>=0)?('AGENT slot '+pad2(F.idx)+' · '+gid):('CHAMPION · '+gid);
+}
+function updateHeaders(){
+  const lbl=focusLabel();
+  if($('det-agent'))$('det-agent').textContent=lbl;
+  if($('fp-agent'))$('fp-agent').textContent=lbl;
+  if($('det-mode')){
+    let m='// live focus · gen '+(J&&J.gen!=null?J.gen:'—');
+    if(J&&J.wave!=null)m+=' · wave '+J.wave;
+    if(J&&J.round!=null)m+=' · round '+J.round;
+    if(F&&F._synth)m+=' · payload has no focus field — showing champion';
+    $('det-mode').textContent=m;
+  }
+  if($('fp-retina'))$('fp-retina').textContent=obsRes?(obsRes+'×'+obsRes+' · '+(obsRes*obsRes)+' in'):'—';
+  if(G){
+    if($('fp-weights'))$('fp-weights').textContent=G.sum.en.toLocaleString()+' conn';
+    if($('gt-nodes'))$('gt-nodes').textContent=G.sum.nNodes;
+    if($('gt-conns'))$('gt-conns').textContent=G.sum.en;
+    if($('gt-lastmut'))$('gt-lastmut').textContent=(G.sum.dis?G.sum.dis+' disabled · ':'')+'innov '+G.sum.iMin+'–'+G.sum.iMax;
+  }
+  if($('fp-gatenote'))$('fp-gatenote').textContent='· sampled live at ~3 Hz';
+  if($('fp-gate'))$('fp-gate').textContent='1 action / step';
+  if($('gt-gen'))$('gt-gen').textContent=J&&J.gen!=null?J.gen:'—';
+  if($('pn-note'))$('pn-note').textContent=oneHot?'probs not in payload':'';
+}
+
+/* ---------- pane 1: THE GENOTYPE (gene strip on canvas) ---------- */
+const gtCv=$('gt-real'), gtx=gtCv&&gtCv.getContext('2d');
+let GW=0,GH=0;
+function fitGt(){
+  if(!gtCv)return;
+  const r=gtCv.parentElement.getBoundingClientRect();
+  GW=Math.max(2,r.width);GH=Math.max(2,r.height);
+  gtCv.width=GW*DPR;gtCv.height=GH*DPR;
+}
+function placeholder(ctx,w,h,t1,t2,t3){
+  ctx.fillStyle='rgba(111,102,86,0.75)';ctx.font='700 10px '+MONO;ctx.textAlign='center';
+  ctx.fillText(t1,w/2,h/2-16);
+  ctx.font='9px '+MONO;ctx.fillStyle='rgba(111,102,86,0.95)';
+  ctx.fillText(t2,w/2,h/2+2);
+  if(t3){ctx.fillStyle='rgba(157,120,221,0.75)';ctx.fillText(t3,w/2,h/2+18);}
+}
+let sweep=0;
+function drawGenotype(dt,time){
+  if(!gtx)return;
+  gtx.setTransform(DPR,0,0,DPR,0,0);
+  gtx.clearRect(0,0,GW,GH);
+  if(!G){
+    placeholder(gtx,GW,GH,'THE GENOTYPE — LANE A','awaiting live feed · no focus payload on /api/live','(toggle LANE B PREVIEW above for the CPPN demo)');
+    return;
+  }
+  const conns=G.conns, n=conns.length, s=G.sum;
+  const padL=14,padR=14,topY=48,botY=GH-26;
+  const stripH=botY-topY, mid=topY+stripH/2, W=GW-padL-padR;
+  const step=W/n, bw=Math.max(1,Math.min(6,step-0.4));
+  let wmax=1e-6; for(let i=0;i<n;i++){const a=Math.abs(conns[i][3]); if(a>wmax)wmax=a;}
+  /* header row (all real) */
+  gtx.font='700 9px '+MONO; gtx.textAlign='left';
+  gtx.fillStyle='rgba(224,168,56,0.9)';
+  gtx.fillText('IN '+s.nIn+' · HIDDEN '+s.nHid+' · OUT '+s.nOut,padL,16);
+  gtx.font='8px '+MONO; gtx.fillStyle='rgba(168,157,136,0.9)'; gtx.textAlign='right';
+  gtx.fillText(n+' genes · '+s.en+' enabled · '+s.dis+' disabled'+(G.src==='net'?' · derived from net (genes not in payload)':''),GW-padR,16);
+  const actKeys=Object.keys(s.acts);
+  if(actKeys.length){
+    gtx.textAlign='left'; gtx.fillStyle='rgba(157,120,221,0.85)';
+    gtx.fillText('acts: '+actKeys.map(k=>'#'+k+'×'+s.acts[k]).join(' '),padL,27);
+  }
+  /* center axis */
+  gtx.strokeStyle='rgba(74,65,50,1)'; gtx.lineWidth=1;
+  gtx.beginPath();gtx.moveTo(padL,mid);gtx.lineTo(GW-padR,mid);gtx.stroke();
+  /* sweep cursor */
+  sweep=(sweep+dt*0.10)%1;
+  const sx=padL+sweep*W, si=clamp(Math.floor(sweep*n),0,n-1);
+  /* gene bars */
+  for(let i=0;i<n;i++){
+    const c=conns[i], x=padL+i*step, w=c[3], en=(c[4]!==false&&c[4]!==0);
+    const h=Math.max(1.5,Math.abs(w)/wmax*(stripH/2-4));
+    if(!en){
+      gtx.fillStyle='rgba(120,110,90,0.20)';
+      gtx.fillRect(x,mid-h*0.5,bw,h);
+      gtx.strokeStyle='rgba(198,90,62,0.55)';gtx.lineWidth=1;
+      gtx.beginPath();gtx.moveTo(x-1,mid+3);gtx.lineTo(x+bw+1,mid-3);gtx.stroke();
+      continue;
+    }
+    const near=Math.max(0,1-Math.abs(x-sx)/26);
+    gtx.fillStyle='rgba('+(w>=0?EXC:INH)+','+(0.42+near*0.58).toFixed(2)+')';
+    if(w>=0)gtx.fillRect(x,mid-h,bw,h);
+    else gtx.fillRect(x,mid,bw,h);
+  }
+  /* sweep line + live gene readout */
+  gtx.strokeStyle='rgba('+AMB+',0.55)'; gtx.lineWidth=1;
+  gtx.beginPath();gtx.moveTo(sx,topY-4);gtx.lineTo(sx,botY+4);gtx.stroke();
+  const c=conns[si], en=(c[4]!==false&&c[4]!==0);
+  gtx.font='700 8.5px '+MONO; gtx.textAlign=sx>GW*0.6?'right':'left';
+  gtx.fillStyle='rgba('+AMB+',0.95)';
+  gtx.fillText('innov '+c[0]+' · '+c[1]+' → '+c[2]+' · w '+(c[3]>=0?'+':'')+(+c[3]).toFixed(3)+(en?'':' · DISABLED'),
+               sx+(sx>GW*0.6?-6:6),topY-8);
+  /* axis captions */
+  gtx.font='8px '+MONO; gtx.fillStyle='rgba(111,102,86,0.95)';
+  gtx.textAlign='left';  gtx.fillText('innov '+s.iMin,padL,GH-8);
+  gtx.textAlign='center';gtx.fillText('INNOVATION →',GW/2,GH-8);
+  gtx.textAlign='right'; gtx.fillText('innov '+s.iMax,GW-padR,GH-8);
+}
+
+/* ---------- pane 2: THE PHENOTYPE (shared real-net renderer) ---------- */
+function renderPheno(){
+  const svg=$('pn-real'); if(!svg||window.POKE_LANEB_ON)return;
+  if(!F||!F.net||!F.net.nodes){
+    svg.innerHTML='<text x="320" y="146" fill="#6f6656" font-size="12" font-family="ui-monospace,monospace" text-anchor="middle">awaiting live feed — no focus.net on /api/live</text>'+
+      '<text x="320" y="164" fill="#57503f" font-size="10" font-family="ui-monospace,monospace" text-anchor="middle">the wall above falls back to demo · this pane only draws real networks</text>';
+    if($('pn-n'))$('pn-n').textContent='—';
+    if($('pn-w'))$('pn-w').textContent='—';
+    return;
+  }
+  const en=window.pokeRenderNet(svg,F.net,F.buttons,640,300,{fs:9.5,lfs:8.5,rHid:4.4,rIO:5.2});
+  if($('pn-n'))$('pn-n').textContent=F.net.nodes.length;
+  if($('pn-w'))$('pn-w').textContent=en.toLocaleString();
+}
+
+/* ---------- pane 3: FORWARD PASS (real inference, step by step) ---------- */
+const fpCv=$('fp'), fpx=fpCv&&fpCv.getContext('2d');
+let FW=0,FH=0;
+function fitFp(){
+  if(!fpCv)return;
+  const r=fpCv.parentElement.getBoundingClientRect();
+  FW=Math.max(900,r.width);FH=r.height;
+  fpCv.width=FW*DPR;fpCv.height=FH*DPR;
+}
+function wire(ctx,ax,ay,bx,by,col,alpha,lw){
+  const cx=(ax+bx)/2;
+  ctx.beginPath();ctx.moveTo(ax,ay);ctx.bezierCurveTo(cx,ay,cx,by,bx,by);
+  ctx.strokeStyle='rgba('+col+','+alpha.toFixed(2)+')';ctx.lineWidth=lw;ctx.stroke();
+}
+function particles(ctx,ax,ay,bx,by,col,np,time,seed){
+  const cx=(ax+bx)/2;
+  for(let i=0;i<np;i++){
+    const t=((time*0.55)+i/np+seed*0.37)%1,u=1-t;
+    const X=u*u*u*ax+3*u*u*t*cx+3*u*t*t*cx+t*t*t*bx;
+    const Y=u*u*u*ay+3*u*u*t*ay+3*u*t*t*by+t*t*t*by;
+    const gl=0.4+0.6*Math.sin(t*Math.PI);
+    ctx.beginPath();ctx.arc(X,Y,1.3,0,7);
+    ctx.fillStyle='rgba('+col+','+(0.55*gl).toFixed(2)+')';ctx.fill();
+  }
+}
+function fcap(ctx,txt,x,y,align,col){
+  ctx.fillStyle=col||'rgba(111,102,86,0.95)';ctx.font='8px '+MONO;
+  ctx.textAlign=align||'center';ctx.fillText(txt,x,y);
+}
+function drawFp(dt,time){
+  if(!fpx)return;
+  fpx.setTransform(DPR,0,0,DPR,0,0);
+  fpx.clearRect(0,0,FW,FH);
+  if(!F){return;}
+  const top=46, bot=FH-46, ah=bot-top;
+  /* ---- stage labels ---- */
+  const L={
+    sX:18, sH:Math.min(ah*0.82,236),
+    obsGap:56, binGap:64
+  };
+  L.sW=L.sH*160/144; L.sY=top+(ah-L.sH)/2;
+  const obsS=Math.min(ah*0.60,168);
+  L.oX=L.sX+L.sW+L.obsGap; L.oY=top+(ah-obsS)/2; L.oS=obsS;
+  L.bX=L.oX+obsS+L.binGap;
+  const rem=FW-18-L.bX;
+  L.hX=L.bX+rem*0.20;
+  L.barLX=L.bX+rem*0.40; L.barW=Math.max(60,rem*0.16);
+  L.actX=L.bX+rem*0.80; L.actW=FW-18-L.actX;
+  const binY=b=>top+(b+0.5)*ah/NBINS;
+  const hidY=i=>{const nh=NP&&NP.hid.length||1;return top+(i+0.5)*ah/nh;};
+  const barY=k=>top+(k+0.5)*ah/8;
+  /* stage captions */
+  const stops=[['01','SCREEN',L.sX+L.sW/2],['02','OBS',L.oX+obsS/2],['03','NET',(L.bX+L.barLX)/2],
+               ['04','P(BUTTON)',L.barLX+L.barW/2+14],['05','ACTION',L.actX+L.actW/2]];
+  fpx.font='700 9px '+MONO;fpx.textAlign='center';
+  stops.forEach((st,i)=>{
+    fpx.fillStyle='rgba(224,168,56,0.9)';fpx.fillText(st[0],st[2]-((st[1].length*5.6)/2)-8,18);
+    fpx.fillStyle='rgba(168,157,136,0.9)';fpx.fillText(st[1],st[2]+6,18);
+    if(i<stops.length-1){fpx.fillStyle='rgba(111,102,86,0.7)';fpx.fillText('▸',(st[2]+stops[i+1][2])/2,18);}
+  });
+  /* ---- 01 screen (the focused agent's real frame) ---- */
+  fpx.imageSmoothingEnabled=false;
+  if(frameOff)fpx.drawImage(frameOff,L.sX,L.sY,L.sW,L.sH);
+  else{fpx.fillStyle='#151109';fpx.fillRect(L.sX,L.sY,L.sW,L.sH);
+    fcap(fpx,'no frame in payload',L.sX+L.sW/2,L.sY+L.sH/2);}
+  fpx.strokeStyle=flash>0?'rgba('+AMB+','+(0.35+flash*0.6)+')':'rgba(74,65,50,1)';
+  fpx.lineWidth=flash>0?2:1.5;
+  fpx.strokeRect(L.sX-1,L.sY-1,L.sW+2,L.sH+2);
+  fcap(fpx,'LIVE FRAME · 160×144',L.sX+L.sW/2,L.sY+L.sH+14);
+  /* screen → obs connectors */
+  fpx.strokeStyle='rgba('+AQA+',0.22)';fpx.lineWidth=1;
+  fpx.beginPath();
+  fpx.moveTo(L.sX+L.sW,L.sY);fpx.lineTo(L.oX,L.oY);
+  fpx.moveTo(L.sX+L.sW,L.sY+L.sH);fpx.lineTo(L.oX,L.oY+L.oS);
+  fpx.stroke();
+  fcap(fpx,'normalize ▸',(L.sX+L.sW+L.oX)/2,L.oY-6,'center','rgba('+AQA+',0.75)');
+  /* ---- 02 obs (what the net actually eats) ---- */
+  fpx.fillStyle='#151109';fpx.fillRect(L.oX-2,L.oY-2,L.oS+4,L.oS+4);
+  if(obsOff)fpx.drawImage(obsOff,L.oX,L.oY,L.oS,L.oS);
+  else fcap(fpx,'no obs',L.oX+L.oS/2,L.oY+L.oS/2);
+  fpx.strokeStyle='rgba(74,65,50,1)';fpx.lineWidth=1;
+  fpx.strokeRect(L.oX-2,L.oY-2,L.oS+4,L.oS+4);
+  fcap(fpx,'OBS · '+(obsRes?obsRes+'×'+obsRes:'?')+' · what the net sees',L.oX+L.oS/2,L.oY+L.oS+14);
+  if(!NP){
+    fcap(fpx,'no focus.net in payload — cannot draw inference',(L.bX+L.actX)/2,top+ah/2,'center','rgba(198,90,62,0.8)');
+  }else{
+    /* ---- input bins (real mean |activation| of the sampled input nodes) ---- */
+    for(let b=0;b<NBINS;b++){
+      const y=binY(b), a=clamp(NP.inBins[b],0,1);
+      /* obs → bin wire */
+      wire(fpx,L.oX+L.oS+2,L.oY+(b+0.5)*L.oS/NBINS,L.bX-6,y,AQA,0.08+a*0.2,0.6);
+      fpx.beginPath();fpx.arc(L.bX,y,3.2+a*2.2,0,7);
+      fpx.fillStyle='rgba('+AMB+','+(0.15+a*0.75).toFixed(2)+')';fpx.fill();
+      fpx.lineWidth=1;fpx.strokeStyle='rgba('+AMB+','+(0.3+a*0.6).toFixed(2)+')';fpx.stroke();
+    }
+    fcap(fpx,NP.nIn+' inputs · binned ×'+NBINS,L.bX,bot+14);
+    fcap(fpx,'glow = mean |act|',L.bX,bot+24,'center','rgba(111,102,86,0.6)');
+    const wm=NP.wMax;
+    /* ---- hidden units (real ids + activations) ---- */
+    if(NP.hid.length){
+      NP.wIH.forEach((e,i)=>{
+        const col=e.w>=0?EXC:INH, mg=Math.abs(e.w)/wm, live=clamp(mg*e.sa*1.6,0,1);
+        wire(fpx,L.bX+5,binY(e.b),L.hX-14,hidY(e.h),col,0.07+mg*0.12+live*0.25,0.5+mg*1.8);
+        if(live>0.25)particles(fpx,L.bX+5,binY(e.b),L.hX-14,hidY(e.h),col,Math.round(live*3),time,i*7);
+      });
+      NP.hid.forEach((h,i)=>{
+        const y=hidY(i), mg=clamp(Math.abs(h.a),0,1), col=h.a>=0?AMB:AQA;
+        fpx.beginPath();fpx.arc(L.hX,y,9+mg*5,0,7);
+        fpx.fillStyle='rgba('+col+','+(0.05+mg*0.22).toFixed(2)+')';fpx.fill();
+        fpx.beginPath();fpx.arc(L.hX,y,8,0,7);
+        fpx.fillStyle='rgba('+col+','+(0.16+mg*0.6).toFixed(2)+')';fpx.fill();
+        fpx.lineWidth=1.3;fpx.strokeStyle='rgba('+col+','+(0.5+mg*0.5).toFixed(2)+')';fpx.stroke();
+        fpx.font='700 8px '+MONO;fpx.textAlign='center';fpx.fillStyle='rgba(240,233,216,0.9)';
+        fpx.fillText('h'+h.id,L.hX,y-13);
+        fpx.font='8px '+MONO;fpx.fillStyle='rgba('+col+',0.9)';
+        fpx.fillText((h.a>=0?'+':'')+h.a.toFixed(2),L.hX,y+20);
+      });
+      NP.wHO.forEach((e,i)=>{
+        const col=e.w>=0?EXC:INH, mg=Math.abs(e.w)/wm, live=clamp(mg*e.sa*1.6,0,1);
+        wire(fpx,L.hX+11,hidY(e.h),L.barLX-8,barY(e.k),col,0.07+mg*0.12+live*0.25,0.5+mg*1.8);
+        if(live>0.25)particles(fpx,L.hX+11,hidY(e.h),L.barLX-8,barY(e.k),col,Math.round(live*3),time,i*13);
+      });
+      fcap(fpx,NP.hid.length+' hidden unit'+(NP.hid.length>1?'s':''),L.hX,bot+14);
+    }else{
+      fcap(fpx,'no hidden units',L.hX,top+ah/2-6,'center','rgba(111,102,86,0.8)');
+      fcap(fpx,'inputs wire straight to buttons',L.hX,top+ah/2+6,'center','rgba(111,102,86,0.6)');
+    }
+    /* ---- direct in→out genes (always real; the whole net when 0 hidden) ---- */
+    NP.wIO.forEach((e,i)=>{
+      const col=e.w>=0?EXC:INH, mg=Math.abs(e.w)/wm, live=clamp(mg*e.sa*1.6,0,1);
+      wire(fpx,L.bX+5,binY(e.b),L.barLX-8,barY(e.k),col,0.05+mg*0.10+live*0.22,0.4+mg*1.6);
+      if(live>0.3)particles(fpx,L.bX+5,binY(e.b),L.barLX-8,barY(e.k),col,Math.round(live*2),time,i*11);
+    });
+  }
+  /* ---- 04 probability bars (real focus.probs, or one-hot buttons) ---- */
+  const chosen=hist.length?hist[0].a:-1;
+  fpx.textBaseline='middle';
+  for(let k=0;k<8;k++){
+    const y=barY(k), p=clamp(probS[k],0,1), on=(k===chosen);
+    fpx.font='700 11px '+MONO;fpx.textAlign='left';
+    fpx.fillStyle=on?'rgba('+AMB+',1)':'rgba(168,157,136,0.9)';
+    fpx.fillText(SYM[k],L.barLX,y);
+    fpx.font='7px '+MONO;fpx.fillStyle='rgba(111,102,86,0.9)';
+    fpx.fillText(NAME[k],L.barLX,y+11);
+    const bx=L.barLX+26,bh=9;
+    fpx.fillStyle='#151109';fpx.fillRect(bx,y-bh/2,L.barW,bh);
+    fpx.strokeStyle='rgba(16,13,7,1)';fpx.lineWidth=1;fpx.strokeRect(bx,y-bh/2,L.barW,bh);
+    const fw=L.barW*p;
+    const grd=fpx.createLinearGradient(bx,0,bx+L.barW,0);
+    grd.addColorStop(0,'#bd8122');grd.addColorStop(1,'#e0a838');
+    fpx.fillStyle=grd;fpx.fillRect(bx,y-bh/2,fw,bh);
+    if(on&&flash>0){fpx.fillStyle='rgba(240,233,216,'+(flash*0.5).toFixed(2)+')';fpx.fillRect(bx,y-bh/2,fw,bh);}
+    fpx.font='8.5px '+MONO;fpx.textAlign='left';
+    fpx.fillStyle=on?'rgba('+AMB+',1)':'rgba(168,157,136,0.85)';
+    fpx.fillText((p*100).toFixed(0).padStart(2,' ')+'%',bx+L.barW+5,y);
+    if(on&&flash>0){
+      fpx.beginPath();fpx.arc(bx+fw,y,4+(1-flash)*16,0,7);
+      fpx.strokeStyle='rgba('+AMB+','+(flash*0.8).toFixed(2)+')';fpx.lineWidth=2;fpx.stroke();
+    }
+  }
+  fpx.textBaseline='alphabetic';
+  fcap(fpx,oneHot?'buttons (one-hot) · probs not in payload':'P(button) · live',L.barLX+L.barW/2+16,bot+14);
+  fcap(fpx,'UP DOWN LEFT RIGHT A B START SELECT',L.barLX+L.barW/2+16,bot+24,'center','rgba(111,102,86,0.6)');
+  /* ---- 05 chosen action ---- */
+  const cxp=L.actX+L.actW/2, cy=top+ah*0.32, size=34;
+  if(chosen>=0){
+    if(flash>0){fpx.beginPath();fpx.arc(cxp,cy,size*0.75+flash*14,0,7);
+      fpx.strokeStyle='rgba('+AMB+','+(flash*0.5).toFixed(2)+')';fpx.lineWidth=2;fpx.stroke();}
+    const g=fpx.createLinearGradient(0,cy-size/2,0,cy+size/2);
+    g.addColorStop(0,'#e0a838');g.addColorStop(1,'#bd8122');
+    fpx.fillStyle=g;fpx.beginPath();
+    if(fpx.roundRect)fpx.roundRect(cxp-size/2,cy-size/2,size,size,6);else fpx.rect(cxp-size/2,cy-size/2,size,size);
+    fpx.fill();
+    fpx.font='700 14px '+MONO;fpx.textAlign='center';fpx.fillStyle='#1a1712';
+    fpx.fillText(SYM[chosen],cxp,cy+5);
+  }else{
+    fpx.font='10px '+MONO;fpx.textAlign='center';fpx.fillStyle='rgba(111,102,86,0.8)';
+    fpx.fillText('· idle ·',cxp,cy+4);
+  }
+  fcap(fpx,'PRESSED',cxp,cy-size/2-12,'center','rgba('+AMB+',0.85)');
+  fcap(fpx,'focus.action · held until next step',cxp,cy+size/2+16,'center','rgba(111,102,86,0.8)');
+  /* ---- keypress history strip (last 20 real actions) ---- */
+  const hy=cy+size/2+52, cell=Math.min(26,(L.actW-8)/7);
+  fcap(fpx,'LAST '+hist.length+' ACTIONS · newest first',cxp,hy-12,'center','rgba(168,157,136,0.8)');
+  hist.forEach((hh,i)=>{
+    const col=i%7, row=(i/7)|0;
+    const x=cxp-(3.5*cell)+col*cell+cell/2, y=hy+row*cell+cell/2;
+    if(y>FH-16)return;
+    const al=Math.max(0.12,1-i*0.045);
+    fpx.beginPath();
+    if(fpx.roundRect)fpx.roundRect(x-cell/2+2,y-cell/2+2,cell-4,cell-4,4);else fpx.rect(x-cell/2+2,y-cell/2+2,cell-4,cell-4);
+    fpx.fillStyle=i===0?'rgba('+AMB+','+(0.85*al).toFixed(2)+')':'rgba(43,38,30,'+(al*0.9).toFixed(2)+')';
+    fpx.fill();
+    fpx.lineWidth=1;fpx.strokeStyle='rgba(74,65,50,'+al.toFixed(2)+')';fpx.stroke();
+    fpx.font='700 9px '+MONO;fpx.textAlign='center';
+    fpx.fillStyle=i===0?'#1a1712':'rgba(240,233,216,'+(al*0.85).toFixed(2)+')';
+    fpx.fillText(hh.sym,x,y+3);
+  });
+}
+
+/* ---------- lane B toggle (explicit demo preview, default OFF) ---------- */
+function setLaneB(on){
+  window.POKE_LANEB_ON=!!on;
+  const lb=$('laneb-btn');
+  if(lb){lb.textContent='lane b preview · '+(on?'on':'off');lb.classList.toggle('on',!!on);}
+  const show=(id,v)=>{const e=$(id);if(e)e.style.display=v?'block':'none';};
+  show('gt-graph',on);show('pn-net',on);show('gt-real',!on);show('pn-real',!on);
+  if($('gt-idx'))$('gt-idx').textContent=on
+    ?'// LANE B PREVIEW — CPPN demo, NOT the live runner'
+    :'// Lane A · NEAT connection genome · innovation-ordered';
+  if($('pn-idx'))$('pn-idx').textContent=on
+    ?'// LANE B PREVIEW — painted-phenotype demo'
+    :'// the wired network · glow = live activation';
+  if($('gt-foot'))$('gt-foot').innerHTML=on
+    ?'demo: a CPPN paints receptive fields — becomes real when Lane B (HyperNEAT) lands · toggle off for the live Lane-A genome'
+    :'each bar = one connection gene of the focused agent, innovation-ordered · <b style="color:var(--amber)">height = |weight|</b> · green = excitatory · rust = inhibitory · struck = disabled';
+  if($('pn-foot'))$('pn-foot').innerHTML=on
+    ?'demo phenotype painted by the CPPN at left — not the live network'
+    :'the focused agent\'s real net — inputs pre-sampled by the backend · node glow = activation from the live forward pass · edge green + / rust − · width = |weight|';
+  if(window.__laneB){on?window.__laneB.start():window.__laneB.stop();}
+  if(!on)renderPheno();
+}
+const lbBtn=$('laneb-btn');
+if(lbBtn)lbBtn.addEventListener('click',function(){setLaneB(!window.POKE_LANEB_ON);});
+const dcBtn=$('det-champ');
+if(dcBtn)dcBtn.addEventListener('click',function(){if(window.pokeSelect)window.pokeSelect(-1,true);});
+
+/* ---------- selection echo (instant, before the next payload lands) ---------- */
+function selected(idx){
+  const lbl=idx>=0?('AGENT slot '+pad2(idx)+' · …'):'CHAMPION · …';
+  if($('det-agent'))$('det-agent').textContent=lbl;
+  if($('fp-agent'))$('fp-agent').textContent=lbl;
+}
+
+/* ---------- loop ---------- */
+let lastTs=0;
+function loop(ts){
+  const dt=Math.min(0.1,(ts-lastTs)/1000||0); lastTs=ts;
+  const t=ts/1000;
+  for(let k=0;k<8;k++)probS[k]+=(probT[k]-probS[k])*Math.min(1,dt*7);
+  flash=Math.max(0,flash-dt*1.6);
+  if(!window.POKE_LANEB_ON)drawGenotype(dt,t);
+  if(window.POKE_FOCUS)drawFp(dt,t);
+  requestAnimationFrame(loop);
+}
+window.addEventListener('resize',function(){fitGt();fitFp();});
+fitGt();fitFp();
+setLaneB(false);
+renderPheno();
+requestAnimationFrame(loop);
+
+window.__detail={setFocus:setFocus, selected:selected};
 })();
 </script>

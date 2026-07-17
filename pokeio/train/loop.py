@@ -192,7 +192,10 @@ def evaluate_wave(
 
         # Stream a live sample ~3 Hz (throttled internally; cheap when not due).
         if streamer is not None:
-            streamer.maybe_write(gen, screens, wave.fitness, dead)
+            streamer.maybe_write(
+                gen, screens, wave.fitness, dead,
+                obs=X, actions=actions, round_t=t,
+            )
 
     for i, g in enumerate(genomes):
         g.fitness = float(wave.fitness[i])
@@ -292,7 +295,12 @@ def evaluate_wave_parallel(
                     pending[i] = (key, t)
 
         if streamer is not None:
-            streamer.maybe_write(gen, fleet.screens[:n], wave.fitness, dead)
+            # X is the obs batch this round's actions came from (a stable copy),
+            # so the focus capture-forward reproduces the acted-on decision.
+            streamer.maybe_write(
+                gen, fleet.screens[:n], wave.fitness, dead,
+                obs=X, actions=actions, round_t=t,
+            )
         if _prof:
             _t_book += time.perf_counter() - _c2
 
@@ -557,10 +565,12 @@ def train(
             max_nodes=max_nodes,
             max_conns=max_conns,
         )
-        streamer = LiveStreamer(run_dir, showcase, run_id, hz=3.0)
+        streamer = LiveStreamer(
+            run_dir, showcase, run_id, hz=3.0, archive=archive, goexplore=go
+        )
         # Seed the showcase with an initial champion so the very first wave has a
         # live network to stream (replaced by the real champion each generation).
-        streamer.set_champion(genomes[0], "init")
+        streamer.set_champion(genomes[0], "init", gen=0, fitness=0.0)
         print(f"[train] live streaming ON -> {run_dir / 'live.json'} (~3 Hz)")
 
     proc = psutil.Process()
@@ -576,8 +586,12 @@ def train(
             psutil.cpu_percent(None)
 
             steps_done = 0
-            for a in range(0, pop_size, players):
+            for wi, a in enumerate(range(0, pop_size, players)):
                 wave = genomes[a : a + players]
+                # Give the streamer this wave's slot -> genome mapping so the
+                # focus protocol can capture-forward any selected player slot.
+                if streamer is not None:
+                    streamer.begin_wave(wave, gen, a, wi)
                 if parallel:
                     steps_done += evaluate_wave_parallel(
                         wave,
@@ -620,7 +634,10 @@ def train(
             # Update the showcase to this generation's real champion and push a
             # fresh live frame at the generation boundary.
             if streamer is not None:
-                streamer.set_champion(champion, f"gen{gen}_g{champ_idx}")
+                streamer.set_champion(
+                    champion, f"gen{gen}_g{champ_idx}",
+                    gen=gen, fitness=float(fits.max()),
+                )
                 streamer.force_write(gen)
 
             gen_dt = time.perf_counter() - gen_t0
@@ -650,6 +667,23 @@ def train(
                 reward_terms["species_threshold"] = float(spec.threshold)
             if go is not None:
                 reward_terms.update(go.stats())
+
+            # Push the real side-panel payloads to the live stream (species +
+            # per-term reward breakdown; archive stats are read live).
+            if streamer is not None:
+                species_list = sorted(
+                    (
+                        [int(sid), len(members),
+                         float(max(m.fitness for m in members))]
+                        for sid, members in species.items()
+                    ),
+                    key=lambda s: -s[1],
+                )
+                streamer.set_side_stats(reward_terms, species_list)
+                # Refresh the stream mid-boundary (replay + speciation +
+                # reproduce can take many seconds with no wave emits) so the
+                # dashboard's side panels and champion don't look frozen.
+                streamer.force_write(gen)
             rec = GenerationRecord(
                 gen=gen,
                 wall_time=time.perf_counter() - run_start,
