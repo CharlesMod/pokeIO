@@ -182,7 +182,9 @@ def propagate_sparse(
     M: int,
     X: Tensor,
     steps: int,
-) -> Tensor:
+    state: Tensor | None = None,
+    return_state: bool = False,
+) -> Tensor | tuple[Tensor, Tensor]:
     """Edge-list propagation that never materialises the dense ``(M, M)`` matrix.
 
     Cost is ``O(N·B·E)`` in the number of *edges* ``E`` rather than ``O(N·M²)``,
@@ -192,6 +194,14 @@ def propagate_sparse(
 
     Shapes: ``conn_*`` are ``(N, E)``; ``X`` is ``(N, B, n_in)``; returns
     ``(N, B, n_out)``.
+
+    ``state`` (optional, ``(N, B, M)``): the node activations to SEED this
+    inference with — the previous agent-step's final ``x`` for hidden/output
+    nodes, so recurrent edges carry memory ACROSS agent-steps (input + bias
+    slots are always overwritten with the current observation, so only the
+    evolved hidden/output state persists).  ``None`` seeds zeros (the classic
+    memoryless behaviour).  With ``return_state=True`` the final ``x`` is
+    returned alongside the output so the caller can feed it back next step.
     """
     N, E = conn_in_slot.shape
     B = X.shape[1]
@@ -202,7 +212,10 @@ def propagate_sparse(
     in_idx = conn_in_slot.unsqueeze(1).expand(N, B, E)  # (N, B, E)
     out_idx = conn_out_slot.unsqueeze(1).expand(N, B, E)
 
-    x = torch.zeros(N, B, M, device=dev, dtype=dtype)
+    if state is None:
+        x = torch.zeros(N, B, M, device=dev, dtype=dtype)
+    else:
+        x = state.to(dev, dtype).clone()
     Xc = X.to(dev, dtype)
     x[:, :, 0:n_in] = Xc
     x[:, :, n_in] = 1.0
@@ -219,13 +232,21 @@ def propagate_sparse(
         x[:, :, n_in] = 1.0
 
     out_start = n_in + 1
-    return x[:, :, out_start : out_start + n_out]
+    out = x[:, :, out_start : out_start + n_out]
+    if return_state:
+        return out, x
+    return out
 
 
 def population_forward_sparse(
-    cp: "CompiledPopulation", X: Tensor, steps: int = 8
-) -> Tensor:
-    """Sparse-edge forward over a whole population (no dense adjacency)."""
+    cp: "CompiledPopulation", X: Tensor, steps: int = 8,
+    state: Tensor | None = None, return_state: bool = False,
+) -> Tensor | tuple[Tensor, Tensor]:
+    """Sparse-edge forward over a whole population (no dense adjacency).
+
+    ``state`` / ``return_state`` thread cross-agent-step recurrent memory (see
+    :func:`propagate_sparse`); the full node-state tensor is ``(N, B, cp.M)``.
+    """
     N = cp.n
     if X.dim() == 2:
         X = X.unsqueeze(0).expand(N, -1, -1)
@@ -241,6 +262,8 @@ def population_forward_sparse(
         cp.M,
         X,
         steps,
+        state=state,
+        return_state=return_state,
     )
 
 

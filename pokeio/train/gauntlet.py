@@ -72,6 +72,7 @@ def run_boot_gauntlet(
     max_conns: int,
     reset_state: str,
     forward_steps: int = 4,
+    recurrent_memory: bool = True,
 ) -> dict[str, float]:
     """Run the champion solo from ``reset_state``; return the metric dict.
 
@@ -89,11 +90,17 @@ def run_boot_gauntlet(
     screen = env.reset(reset_state)
     wram = env.raw_wram()
     seen_keys: set[bytes] = set()
+    state = None  # recurrent node-state carried across the gauntlet episode
     n = 0
     for _t in range(int(steps)):
         x = encoder.encode(screen, wram)
         xt = torch.from_numpy(x[None, :]).to(device).unsqueeze(1)
-        out = population_forward_sparse(cp, xt, steps=forward_steps)
+        if recurrent_memory:
+            out, state = population_forward_sparse(
+                cp, xt, steps=forward_steps, state=state, return_state=True
+            )
+        else:
+            out = population_forward_sparse(cp, xt, steps=forward_steps)
         action = int(out[0, 0, :].argmax().item())
         screen, wram, _done, _info = env.step(action)
         seen_keys.add(archive.cell_key(screen, wram))

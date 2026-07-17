@@ -187,12 +187,16 @@ class LiveWriter:
 # --------------------------------------------------------------------------
 # single-genome forward with full activation capture
 # --------------------------------------------------------------------------
-def _forward_capture(cp, X: torch.Tensor, steps: int) -> torch.Tensor:
+def _forward_capture(
+    cp, X: torch.Tensor, steps: int, state: torch.Tensor | None = None
+) -> torch.Tensor:
     """Sparse-edge propagation that returns the FULL (N,B,M) activation state.
 
     Semantics are identical to :func:`pokeio.evo.forward.propagate_sparse`; we
     just keep the whole node vector so we can read hidden/out activations for the
-    live net view instead of only the output slice.
+    live net view instead of only the output slice.  ``state`` seeds the node
+    activations (previous step's returned x) so the cage reflects the same
+    cross-step recurrent memory the champion had in training; ``None`` = zeros.
     """
     conn_in_slot = cp.conn_in_slot
     conn_out_slot = cp.conn_out_slot
@@ -206,7 +210,10 @@ def _forward_capture(cp, X: torch.Tensor, steps: int) -> torch.Tensor:
     in_idx = conn_in_slot.unsqueeze(1).expand(N, B, E)
     out_idx = conn_out_slot.unsqueeze(1).expand(N, B, E)
 
-    x = torch.zeros(N, B, M, device=dev, dtype=dtype)
+    if state is None:
+        x = torch.zeros(N, B, M, device=dev, dtype=dtype)
+    else:
+        x = state.to(dev, dtype).clone()
     Xc = X.to(dev, dtype)
     x[:, :, 0 : cp.n_in] = Xc
     x[:, :, cp.n_in] = 1.0
@@ -359,6 +366,7 @@ class ChampionShowcase:
         self._still_ring: deque = deque(maxlen=4)
         self._still_n = 0
         self._fis = 0  # frames into the current agent-step (advance() path)
+        self._state = None  # recurrent node-state carried across cage steps
         self.spawn_state: bytes | None = None
         self._act: dict[str, float] = {}
         self._genes: dict = {"nodes": [], "conns": []}
@@ -398,6 +406,7 @@ class ChampionShowcase:
         self._still_ring.clear()
         self._still_n = 0
         self._fis = 0  # frames into the current agent-step (advance() path)
+        self._state = None  # new episode → clear recurrent memory
 
     def _encode_vis(self, screen, wram) -> np.ndarray:
         res = self.encoder.res
@@ -421,7 +430,12 @@ class ChampionShowcase:
         """
         x = self.encoder.encode(self.screen, self.wram)
         xt = torch.from_numpy(x[None, :]).to(self.device).unsqueeze(1)  # (1,1,dim)
-        act_state = _forward_capture(self.cp, xt, self.forward_steps)  # (1,1,M)
+        # seed with the previous step's node state so the cage carries the same
+        # cross-step recurrent memory the champion had in training
+        act_state = _forward_capture(
+            self.cp, xt, self.forward_steps, state=self._state
+        )  # (1,1,M)
+        self._state = act_state
         out = act_state[0, 0, self.cp.n_in + 1 : self.cp.n_in + 1 + N_OUT]
         self.last_action = int(out.argmax().item())
         return act_state, out

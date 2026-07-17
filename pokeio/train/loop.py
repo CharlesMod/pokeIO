@@ -275,6 +275,7 @@ def evaluate_wave(
     restore_prob: float = 0.5,
     spawn_out: dict[int, bytes] | None = None,
     wave_offset: int = 0,
+    recurrent_memory: bool = True,
 ) -> int:
     """Evaluate one wave of genomes in lockstep; sets genome.fitness in place.
 
@@ -314,6 +315,12 @@ def evaluate_wave(
 
     pop = Population.from_genomes(genomes, max_nodes=max_nodes, max_conns=max_conns)
     cp = pop.compile(device)
+    # lockstep: every env steps every round, so recurrent state advances for
+    # all rows each round (no selective write-back like the async engine).
+    state_t = (
+        torch.zeros((n, 1, cp.M), dtype=torch.float32, device=device)
+        if recurrent_memory else None
+    )
 
     for t in range(episode_steps):
         if goexplore is not None:
@@ -322,7 +329,12 @@ def evaluate_wave(
         for i in range(n):
             X[i] = encoder.encode(screens[i], wrams[i])
         xt = torch.from_numpy(X).to(device).unsqueeze(1)  # (n, 1, dim)
-        out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)  # (n,1,N_OUT)
+        if recurrent_memory:
+            out, state_t = population_forward_sparse(
+                cp, xt, steps=FORWARD_STEPS, state=state_t, return_state=True
+            )
+        else:
+            out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
         actions = out[:, 0, :].argmax(dim=1).cpu().numpy()
 
         for i in range(n):
@@ -371,6 +383,7 @@ def evaluate_wave_parallel(
     waves_left: int = 0,
     spawn_out: dict[int, bytes] | None = None,
     taps: list[dict] | None = None,  # accepted for API parity; furnace-only v1
+    recurrent_memory: bool = True,
 ) -> int:
     """Parallel-barrier equivalent of :func:`evaluate_wave`.
 
@@ -433,11 +446,22 @@ def evaluate_wave_parallel(
     if pace is not None:
         pace.begin_wave()
 
+    # lockstep barrier: all envs step every round → state advances for all.
+    state_t = (
+        torch.zeros((n, 1, cp.M), dtype=torch.float32, device=device)
+        if recurrent_memory else None
+    )
+
     for t in range(episode_steps):
         _c0 = time.perf_counter() if _prof else 0.0
         X = np.ascontiguousarray(obs[:n], dtype=np.float32)
         xt = torch.from_numpy(X).to(device).unsqueeze(1)  # (n,1,dim)
-        out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
+        if recurrent_memory:
+            out, state_t = population_forward_sparse(
+                cp, xt, steps=FORWARD_STEPS, state=state_t, return_state=True
+            )
+        else:
+            out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
         actions = out[:, 0, :].argmax(dim=1).cpu().numpy()
         actions_full[:] = 0
         actions_full[:n] = actions
@@ -569,6 +593,7 @@ def evaluate_wave_async(
     waves_left: int = 0,
     spawn_out: dict[int, bytes] | None = None,
     taps: list[dict] | None = None,
+    recurrent_memory: bool = True,
 ) -> int:
     """Free-running ("furnace") equivalent of :func:`evaluate_wave_parallel`.
 
@@ -652,16 +677,45 @@ def evaluate_wave_async(
                     _ = _o[:, 0, :].argmax(dim=1)
             torch.cuda.current_stream(device).wait_stream(warm)
             torch.cuda.synchronize(device)
+            # recurrent memory needs the node-state tensor as a static graph
+            # in/out so it can be fed back each replay (see the loop below).
+            st_static = (
+                torch.zeros((n, 1, cp.M), dtype=torch.float32, device=device)
+                if recurrent_memory else None
+            )
+            if recurrent_memory:
+                with torch.cuda.stream(warm):
+                    for _ in range(3):
+                        _o, _s = population_forward_sparse(
+                            cp, x_static, steps=FORWARD_STEPS,
+                            state=st_static, return_state=True,
+                        )
+                        _ = _o[:, 0, :].argmax(dim=1)
+                torch.cuda.current_stream(device).wait_stream(warm)
+                torch.cuda.synchronize(device)
             _graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(_graph):
-                _o = population_forward_sparse(cp, x_static, steps=FORWARD_STEPS)
+                if recurrent_memory:
+                    _o, _st_out = population_forward_sparse(
+                        cp, x_static, steps=FORWARD_STEPS,
+                        state=st_static, return_state=True,
+                    )
+                else:
+                    _o = population_forward_sparse(cp, x_static, steps=FORWARD_STEPS)
                 _acts_static = _o[:, 0, :].argmax(dim=1).to(torch.int32)
             torch.cuda.synchronize(device)
 
-            def graph_fwd(X_np):
+            def graph_fwd(X_np, cur_state):
                 x_static.copy_(torch.from_numpy(X_np).unsqueeze(1))
+                if recurrent_memory:
+                    st_static.copy_(cur_state)  # feed last step's state back in
                 _graph.replay()
-                return _acts_static.cpu().numpy()
+                # _st_out lives in the graph pool; the caller copies the fresh
+                # rows it needs out (state_t[idx]=) before the next replay.
+                return (
+                    _acts_static.cpu().numpy(),
+                    _st_out if recurrent_memory else None,
+                )
         except RuntimeError as e:
             print(f"[train] CUDA-graph capture failed ({e}); eager fallback",
                   flush=True)
@@ -688,6 +742,14 @@ def evaluate_wave_async(
     pending: dict[int, tuple[bytes, int]] = {}
     last_X = None
     last_actions = np.zeros(n, dtype=np.int32)
+    # Per-env recurrent node-state (N,1,M), zeroed at wave start (= episode
+    # start). Advances ONLY for envs that actually consume an action this
+    # cycle — the batched forward computes new state for all n envs, but a
+    # non-ready env didn't step, so its memory must not tick (audit EVO#4).
+    state_t = (
+        torch.zeros((n, 1, cp.M), dtype=torch.float32, device=device)
+        if recurrent_memory else None
+    )
 
     # realtime pacing state (absolute per-wave schedule, per-env re-anchor)
     if pace is not None:
@@ -802,15 +864,27 @@ def evaluate_wave_async(
         if ready.any():
             X = np.ascontiguousarray(obs_shm[:n], dtype=np.float32)
             if graph_fwd is not None:
-                acts = graph_fwd(X)
+                acts, new_state = graph_fwd(X, state_t)
+            elif recurrent_memory:
+                xt = torch.from_numpy(X).to(device).unsqueeze(1)
+                out, new_state = population_forward_sparse(
+                    cp, xt, steps=FORWARD_STEPS, state=state_t, return_state=True
+                )
+                acts = out[:, 0, :].argmax(dim=1).cpu().numpy().astype(np.int32)
             else:
                 xt = torch.from_numpy(X).to(device).unsqueeze(1)
                 out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
                 acts = out[:, 0, :].argmax(dim=1).cpu().numpy().astype(np.int32)
+                new_state = None
             idx = np.nonzero(ready)[0]
             actions_shm[idx] = acts[idx]
             act_seq[idx] = snap[idx]  # publish AFTER the action rows (x86 TSO)
             acted[idx] = snap[idx]
+            # advance memory ONLY for envs that stepped (ready rows)
+            if new_state is not None:
+                state_t[torch.from_numpy(idx).to(device)] = new_state[
+                    torch.from_numpy(idx).to(device)
+                ]
             last_X, last_actions = X, acts
             if realtime:
                 nd = next_due[idx] + period
@@ -1007,6 +1081,7 @@ def replay_champion(
     reset_state: str,
     spawn_state: bytes | None = None,
     record_wram: bool = False,
+    recurrent_memory: bool = True,
 ) -> np.ndarray | None:
     """Replay the generation champion solo and log a few ChampionSteps.
 
@@ -1025,10 +1100,16 @@ def replay_champion(
         screen = env.reset(reset_state)
     wram = env.raw_wram()
     trace = np.empty((steps, wram.size), dtype=np.uint8) if record_wram else None
+    state = None  # recurrent node-state carried across the replay episode
     for t in range(steps):
         x = encoder.encode(screen, wram)
         xt = torch.from_numpy(x[None, :]).to(device).unsqueeze(1)  # (1,1,dim)
-        out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
+        if recurrent_memory:
+            out, state = population_forward_sparse(
+                cp, xt, steps=FORWARD_STEPS, state=state, return_state=True
+            )
+        else:
+            out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
         action = int(out[0, 0, :].argmax().item())
         screen, wram, _done, info = env.step(action)
         time.sleep(0)  # cooperative GIL handoff for the live pump thread
@@ -1594,6 +1675,7 @@ def train(
     boot_gauntlet_every: int = 10,
     boot_gauntlet_steps: int = 0,  # 0 = auto (4 * episode_steps)
     resume: bool = False,  # append to existing telemetry (checkpoint-resume)
+    recurrent_memory: bool = True,  # persist node state across agent-steps
 ) -> Path:
     device = pick_device(device_str)
     rng = np.random.default_rng(config.run.seed)
@@ -1868,6 +1950,7 @@ def train(
                         waves_left=n_waves - 1 - wi,
                         spawn_out=spawn_states,
                         taps=taps if (taps and engine == "furnace") else None,
+                        recurrent_memory=recurrent_memory,
                     )
                 else:
                     steps_done += evaluate_wave(
@@ -1888,6 +1971,7 @@ def train(
                         restore_prob=restore_prob,
                         spawn_out=spawn_states,
                         wave_offset=a,
+                        recurrent_memory=recurrent_memory,
                     )
 
             _bt = time.perf_counter()
@@ -1922,6 +2006,7 @@ def train(
                 max_nodes, max_conns, reset_state,
                 spawn_state=spawn_states.get(champ_idx),
                 record_wram=True,
+                recurrent_memory=recurrent_memory,
             )
             if trace is not None and trace.shape[0] >= 2:
                 miner_rollouts.append(trace)
@@ -1995,6 +2080,7 @@ def train(
                     champion, replay_env, encoder, archive, go, device,
                     _bsteps, max_nodes, max_conns, reset_state,
                     forward_steps=FORWARD_STEPS,
+                    recurrent_memory=recurrent_memory,
                 )
                 _fr = int(max((e.depth for e in go.cells.values()), default=0))
                 print(
@@ -2243,6 +2329,10 @@ def main() -> None:
     ap.add_argument("--resume", action="store_true", default=False,
                     help="append to existing telemetry instead of rotating it "
                          "aside (for checkpoint-resume; default starts fresh)")
+    ap.add_argument("--no-recurrent-memory", dest="recurrent_memory",
+                    action="store_false", default=True,
+                    help="disable cross-agent-step recurrent state (memoryless "
+                         "policies; default persists node state within an episode)")
     ap.add_argument("--goexplore-capacity", type=int, default=16384,
                     help="max stored emulator states (memory bound)")
     ap.add_argument("--goexplore-caps-per-round", type=float, default=4.0,
@@ -2310,6 +2400,7 @@ def main() -> None:
         boot_gauntlet_every=args.boot_gauntlet_every,
         boot_gauntlet_steps=args.boot_gauntlet_steps,
         resume=args.resume,
+        recurrent_memory=args.recurrent_memory,
     )
 
 
