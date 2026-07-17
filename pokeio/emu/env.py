@@ -130,6 +130,29 @@ class PokeEnv:
             self._advance_pulsed(name)
         return self._obs(), self.wram_strided(wram_stride), False
 
+    def hold(self, action_idx: int) -> None:
+        """Sticky-press an action's button without advancing a frame."""
+        name = ACTIONS[action_idx]
+        if name != self._held:
+            if self._held is not None:
+                self.pyboy.button_release(self._held)
+            self.pyboy.button_press(name)
+            self._held = name
+
+    def tick_frames(self, n: int) -> np.ndarray:
+        """Advance ``n`` game frames with the held input; render only the last.
+
+        Sub-agent-step ticking for smooth spectator playback: ``hold()`` +
+        ``frame_skip`` total ``tick_frames`` == one sticky :meth:`step`'s
+        dynamics (rendering intermediate frames does not perturb emulation).
+        Returns the observation after the last frame.
+        """
+        if n > 1:
+            self.pyboy.tick(n - 1, False)
+        if n >= 1:
+            self.pyboy.tick(1, True)
+        return self._obs()
+
     def _advance_sticky(self, name: str) -> None:
         """Hold `name` down across frame_skip ticks; only re-press on a change.
 

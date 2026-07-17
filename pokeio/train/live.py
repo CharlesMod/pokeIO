@@ -25,6 +25,7 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -309,9 +310,16 @@ def build_net_view(genome) -> tuple[list[dict], list[dict], dict[int, int], set[
 # champion showcase env
 # --------------------------------------------------------------------------
 class ChampionShowcase:
-    """A dedicated env replaying the best-genome-so-far from newgame."""
+    """A dedicated env replaying the current champion from its eval spawn.
 
-    STUCK_STEPS = 40  # identical frames before the run restarts (fixed point)
+    Champions that earned their fitness from a Go-Explore frontier restore are
+    replayed from that same restored state; a deterministic policy diverges
+    wildly from a different start (a dialogue-masher restored mid-text looks
+    like a couch potato from the silent newgame bedroom), so replaying from
+    newgame would misrepresent almost every restored champion.
+    """
+
+    STUCK_STEPS = 40  # looping frames before the run restarts (fixed point)
 
     def __init__(
         self,
@@ -346,34 +354,50 @@ class ChampionShowcase:
         self.obs_vis: np.ndarray | None = None
         self.last_action = 0
         self.last_probs: list[float] = [0.0] * N_OUT
-        self._still_sig: bytes | None = None
+        # recent frame signatures: catches both dead-still fixed points and
+        # short pixel loops (wall-bump animation is a 2-frame cycle).
+        self._still_ring: deque = deque(maxlen=4)
         self._still_n = 0
+        self._fis = 0  # frames into the current agent-step (advance() path)
+        self.spawn_state: bytes | None = None
         self._act: dict[str, float] = {}
         self._genes: dict = {"nodes": [], "conns": []}
 
     # -- champion swap -----------------------------------------------------
-    def set_champion(self, genome, genome_id: str) -> None:
-        """Install a new champion genome (keeps env state for continuity)."""
+    def set_champion(
+        self, genome, genome_id: str, spawn_state: bytes | None = None
+    ) -> None:
+        """Install a new champion genome and replay it from its eval spawn.
+
+        ``spawn_state`` is the serialized emulator state the champion actually
+        started its winning episode from (a Go-Explore frontier restore), or
+        None for the canonical newgame state.
+        """
         self.genome = genome.copy()
         self.genome_id = str(genome_id)
+        self.spawn_state = spawn_state
         pop = Population.from_genomes(
             [self.genome], max_nodes=self.max_nodes, max_conns=self.max_conns
         )
         self.cp = pop.compile(self.device)
         self._prepare_net()
-        # Every new champion replays from the newgame state (matches the cage
-        # label "replays from newgame"). A deterministic argmax policy in a
-        # deterministic env converges to a fixed point (walking into furniture)
-        # within seconds, so "continuous play" just freezes the cage — each
-        # install is a fresh honest attempt instead.
+        # Every install replays from the champion's own spawn. A deterministic
+        # argmax policy in a deterministic env converges to a fixed point
+        # within seconds of "continuous play", which just freezes the cage —
+        # each install is a fresh honest attempt instead.
         self._reset_run()
 
     def _reset_run(self) -> None:
-        self.screen = self.env.reset(self.reset_state)
+        if self.spawn_state is not None:
+            self.env.load_state(self.spawn_state)
+            self.screen = self.env.reset(None)  # clear held input + settle a frame
+        else:
+            self.screen = self.env.reset(self.reset_state)
         self.wram = self.env.raw_wram()
         self.obs_vis = self._encode_vis(self.screen, self.wram)
-        self._still_sig = None
+        self._still_ring.clear()
         self._still_n = 0
+        self._fis = 0  # frames into the current agent-step (advance() path)
 
     def _encode_vis(self, screen, wram) -> np.ndarray:
         res = self.encoder.res
@@ -390,41 +414,89 @@ class ChampionShowcase:
         self._genes = build_genes(self.genome)
 
     # -- stepping ----------------------------------------------------------
-    def step(self, n_steps: int = 2) -> None:
-        """Advance the showcase env ``n_steps`` and capture the live activations."""
-        if self.cp is None or self.screen is None:
-            return
-        res = self.encoder.res
-        for _ in range(max(1, n_steps)):
-            x = self.encoder.encode(self.screen, self.wram)
-            xt = torch.from_numpy(x[None, :]).to(self.device).unsqueeze(1)  # (1,1,dim)
-            act_state = _forward_capture(self.cp, xt, self.forward_steps)  # (1,1,M)
-            out = act_state[0, 0, self.cp.n_in + 1 : self.cp.n_in + 1 + N_OUT]
-            self.last_action = int(out.argmax().item())
-            self.screen, self.wram, _done, _info = self.env.step(self.last_action)
+    def _forward_choose(self):
+        """One captured forward pass on the current obs; sets last_action.
+
+        Returns ``(act_state, out)`` for the caller to publish probs/acts.
+        """
+        x = self.encoder.encode(self.screen, self.wram)
+        xt = torch.from_numpy(x[None, :]).to(self.device).unsqueeze(1)  # (1,1,dim)
+        act_state = _forward_capture(self.cp, xt, self.forward_steps)  # (1,1,M)
+        out = act_state[0, 0, self.cp.n_in + 1 : self.cp.n_in + 1 + N_OUT]
+        self.last_action = int(out.argmax().item())
+        return act_state, out
+
+    def _publish_forward(self, act_state, out) -> None:
+        """Expose the last forward's probs + per-node activations (slot space)."""
         self.last_probs = [round(float(v), 4) for v in out.tolist()]
-
-        # Fixed-point detector: a deterministic policy that wedges itself into
-        # a wall produces pixel-identical frames forever. After STUCK_STEPS
-        # unchanged frames, restart the run from newgame so the cage stays
-        # alive (~16 s at realtime pace, ~7 s at max).
-        sig = self.screen[::8, ::8].tobytes() if self.screen is not None else None
-        if sig is not None and sig == self._still_sig:
-            self._still_n += 1
-            if self._still_n >= self.STUCK_STEPS:
-                self._reset_run()
-                return
-        else:
-            self._still_sig = sig
-            self._still_n = 0
-
-        # capture per-node activations from the LAST forward (in slot space)
         vec = act_state[0, 0].detach().to("cpu").numpy()
         self._act = {
             str(nid): round(float(vec[slot]), 4)
             for nid, slot in self._id_to_slot.items()
             if slot < vec.shape[0] and int(nid) in self._net_node_ids
         }
+
+    def _stuck_check(self) -> bool:
+        """Fixed-point detector, run once per completed agent-step.
+
+        A deterministic policy that wedges itself into a wall produces
+        pixel-identical frames — or a tight 2-frame bump loop — forever.
+        After STUCK_STEPS agent-steps whose frames all recur within the last
+        few signatures, restart the run so the cage stays alive (~16 s at
+        realtime pace, ~7 s at max). Genuine play (walking, text advancing)
+        mints fresh signatures and keeps resetting the counter.
+        Returns True iff the run was restarted.
+        """
+        sig = self.screen[::8, ::8].tobytes() if self.screen is not None else None
+        if sig is not None and sig in self._still_ring:
+            self._still_n += 1
+            if self._still_n >= self.STUCK_STEPS:
+                self._reset_run()
+                return True
+        else:
+            self._still_n = 0
+        if sig is not None:
+            self._still_ring.append(sig)
+        return False
+
+    def step(self, n_steps: int = 2) -> None:
+        """Advance the showcase env ``n_steps`` full agent-steps (max pace)."""
+        if self.cp is None or self.screen is None:
+            return
+        for _ in range(max(1, n_steps)):
+            act_state, out = self._forward_choose()
+            self.screen, self.wram, _done, _info = self.env.step(self.last_action)
+        self._fis = 0  # step() always ends on an agent-step boundary
+        if self._stuck_check():
+            return
+        self._publish_forward(act_state, out)
+        self.obs_vis = self._encode_vis(self.screen, self.wram)
+
+    def advance(self, n_frames: int) -> None:
+        """Advance ``n_frames`` game frames (realtime pace: 60/s of wall clock).
+
+        The net still decides once per ``env.frame_skip`` frames — identical
+        dynamics to :meth:`step` — but the screen is rendered at every call,
+        so a 10 Hz emit cadence shows 10 fresh frames/s instead of one
+        24-frame gulp every 400 ms (the cage played at 2.5 fps before this).
+        """
+        if self.cp is None or self.screen is None or n_frames <= 0:
+            return
+        fs = max(1, int(getattr(self.env, "frame_skip", 24)))
+        act_state = out = None
+        while n_frames > 0:
+            if self._fis == 0:
+                act_state, out = self._forward_choose()
+                self.env.hold(self.last_action)
+            run = min(n_frames, fs - self._fis)
+            self.screen = self.env.tick_frames(run)
+            self.wram = self.env.raw_wram()
+            self._fis = (self._fis + run) % fs
+            n_frames -= run
+            if self._fis == 0 and self._stuck_check():
+                return
+        if out is not None:
+            self._publish_forward(act_state, out)
         self.obs_vis = self._encode_vis(self.screen, self.wram)
 
     # -- payload -----------------------------------------------------------
@@ -447,6 +519,7 @@ class ChampionShowcase:
         )
         return {
             "genome_id": self.genome_id,
+            "spawn": "frontier" if self.spawn_state is not None else "newgame",
             "frame_w": _SCREEN_W,
             "frame_h": _SCREEN_H,
             "frame_b64": b64_gray(self.screen) if self.screen is not None else "",
@@ -525,10 +598,10 @@ class LiveStreamer:
         self._focus_min_dt = 1.0 / 3.0
         self._focus_last = 0.0
         self._focus_payload: dict | None = None
-        # Realtime: the champion showcase env is paced to authentic GB speed
-        # (one agent-step per frame_skip/60 s) instead of champ_steps/emit.
-        fs = getattr(getattr(showcase, "env", None), "frame_skip", 24)
-        self._champ_period = float(fs) / 60.0
+        # Realtime: the champion showcase env is paced to authentic GB speed —
+        # frame-accurate (60 game frames per wall second, rendered per emit)
+        # instead of one 24-frame agent-step gulp every 400 ms.
+        self._champ_fs = int(getattr(getattr(showcase, "env", None), "frame_skip", 24))
         self._champ_step_ts = 0.0
         # -- champion dwell: a freshly-installed champ is displayed >= champ_dwell
         # seconds before a newer one may replace it (latest pending wins).
@@ -567,31 +640,35 @@ class LiveStreamer:
         self._pump.start()
 
     def set_champion(
-        self, genome, genome_id: str, gen: int = -1, fitness: float = 0.0
+        self, genome, genome_id: str, gen: int = -1, fitness: float = 0.0,
+        spawn_state: bytes | None = None,
     ) -> None:
         """Offer a new champion; installed now or after the dwell period.
 
         The current champion keeps the showcase for at least ``champ_dwell``
         seconds.  Offers arriving inside the dwell window are stashed (the
         LATEST offer wins — intermediates are skipped) and promoted by the next
-        emit once the dwell has elapsed.
+        emit once the dwell has elapsed.  ``spawn_state`` is the emulator state
+        the champion's winning episode actually started from (a Go-Explore
+        frontier restore), or None for newgame.
         """
         now = time.time()
         if (
             self._champ_since is None
             or (now - self._champ_since) >= self.champ_dwell
         ):
-            self._install_champion(genome, genome_id, gen, fitness, now)
+            self._install_champion(genome, genome_id, gen, fitness, now, spawn_state)
         else:
             # copy: the loop's genome object may be recycled by reproduce()
             self._pending_champ = (genome.copy(), str(genome_id), int(gen),
-                                   float(fitness))
+                                   float(fitness), spawn_state)
 
     def _install_champion(
-        self, genome, genome_id: str, gen: int, fitness: float, now: float
+        self, genome, genome_id: str, gen: int, fitness: float, now: float,
+        spawn_state: bytes | None = None,
     ) -> None:
         with self._lock:  # never swap the showcase net mid-emit
-            self.showcase.set_champion(genome, genome_id)
+            self.showcase.set_champion(genome, genome_id, spawn_state)
             self._champ_since = now
             self._champ_gen = int(gen)
             self._champ_fitness = float(fitness)
@@ -606,8 +683,8 @@ class LiveStreamer:
             self._champ_since is None
             or (now - self._champ_since) >= self.champ_dwell
         ):
-            g, gid, gen, fit = self._pending_champ
-            self._install_champion(g, gid, gen, fit, now)
+            g, gid, gen, fit, spawn = self._pending_champ
+            self._install_champion(g, gid, gen, fit, now, spawn)
 
     # -- loop-facing context hooks ------------------------------------------
     def begin_wave(
@@ -885,12 +962,20 @@ class LiveStreamer:
                 return False
             self._maybe_promote_pending()
             if self._pace == "realtime":
-                # Spectate mode: the champion cage plays at authentic GB speed
-                # too — one agent-step per frame_skip/60 s of wall clock.
+                # Spectate mode: the champion cage plays at authentic GB speed,
+                # frame-accurately — advance however many 60 Hz game frames of
+                # wall clock have elapsed and render, so every emit carries
+                # fresh pixels (smooth ~10 fps) instead of one 24-frame gulp
+                # every 400 ms (2.5 fps).
                 _now = time.monotonic()
-                if _now - self._champ_step_ts >= self._champ_period:
-                    self.showcase.step(1)
-                    self._champ_step_ts = _now
+                frames = int((_now - self._champ_step_ts) * 60.0)
+                cap = 2 * self._champ_fs  # bound catch-up after a stall/boundary
+                if frames > cap:
+                    frames = cap
+                    self._champ_step_ts = _now - frames / 60.0
+                if frames > 0:
+                    self.showcase.advance(frames)
+                    self._champ_step_ts += frames / 60.0
             else:
                 self.showcase.step(self.champ_steps)
             _t1 = time.perf_counter() if _prof else 0.0

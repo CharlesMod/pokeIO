@@ -270,6 +270,8 @@ def evaluate_wave(
     novelty_floor: float = 0.1,
     goexplore: GoExplore | None = None,
     restore_prob: float = 0.5,
+    spawn_out: dict[int, bytes] | None = None,
+    wave_offset: int = 0,
 ) -> int:
     """Evaluate one wave of genomes in lockstep; sets genome.fitness in place.
 
@@ -296,6 +298,9 @@ def evaluate_wave(
             entry = goexplore.sample()
         if entry is not None:
             obs = goexplore.restore(envs[i], entry)
+            if spawn_out is not None:
+                # record the champion-candidate's true spawn for the showcase
+                spawn_out[wave_offset + i] = entry.state
         else:
             obs = envs[i].reset(reset_state)
         screens.append(obs)
@@ -357,6 +362,7 @@ def evaluate_wave_parallel(
     wave_offset: int = 0,
     pace: PaceController | None = None,
     waves_left: int = 0,
+    spawn_out: dict[int, bytes] | None = None,
 ) -> int:
     """Parallel-barrier equivalent of :func:`evaluate_wave`.
 
@@ -390,6 +396,10 @@ def evaluate_wave_parallel(
                 if entry is not None:
                     restore[i] = entry.state
         goexplore.n_restores += len(restore)
+        if spawn_out is not None:
+            # record each candidate's true spawn for the champion showcase
+            for i, blob in restore.items():
+                spawn_out[wave_offset + i] = blob
     _t = _mark("go_sample", _t)
     # Release the reset round, then pack/compile WHILE the workers reset.
     fleet.reset_all_begin(restore if restore else None)
@@ -1176,6 +1186,10 @@ def train(
                 return _cache[0]
 
             n_waves = (pop_size + players - 1) // players
+            # genome idx -> the emulator state its episode spawned from (only
+            # restored players appear; the rest spawned from newgame). Blobs
+            # are refs into the Go-Explore archive, not copies.
+            spawn_states: dict[int, bytes] = {}
             for wi, a in enumerate(range(0, pop_size, players)):
                 wave = genomes[a : a + players]
                 # Give the streamer this wave's slot -> genome mapping so the
@@ -1202,6 +1216,7 @@ def train(
                         wave_offset=a,
                         pace=pace,
                         waves_left=n_waves - 1 - wi,
+                        spawn_out=spawn_states,
                     )
                 else:
                     steps_done += evaluate_wave(
@@ -1220,6 +1235,8 @@ def train(
                         novelty_floor=config.reward.novelty_floor,
                         goexplore=go,
                         restore_prob=restore_prob,
+                        spawn_out=spawn_states,
+                        wave_offset=a,
                     )
 
             _bt = time.perf_counter()
@@ -1234,6 +1251,7 @@ def train(
                 streamer.set_champion(
                     champion, f"gen{gen}_g{champ_idx}",
                     gen=gen, fitness=float(fits.max()),
+                    spawn_state=spawn_states.get(champ_idx),
                 )
                 streamer.force_write(gen)
             _bt = _phase("live_champ", _bt)

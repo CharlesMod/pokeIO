@@ -2179,9 +2179,10 @@ function syncSel(f){
 /* --- poll ------------------------------------------------------------------ */
 const swarmIdx=document.querySelector('.swarm header .idx');
 const swarmIdx0=swarmIdx?swarmIdx.textContent:'';
-function setLiveLabels(on){
+function setLiveLabels(on,spawn){
   if(champIdx)champIdx.innerHTML= on
-    ? '<span style="color:var(--good)">● live champion</span> — replays from newgame (no restores)'
+    ? '<span style="color:var(--good)">● live champion</span> — replays from '
+      +(spawn==='frontier'?'its Go-Explore spawn cell':'newgame')
     : champIdx0;
   if(swarmIdx)swarmIdx.innerHTML= on
     ? '<span style="color:var(--good)">● live swarm</span> · half restore from the Go-Explore frontier · click to inspect ▾'
@@ -2226,7 +2227,7 @@ async function pollLive(){
       window.POKE_FOCUS=!!(f&&(f.net||f.frame_b64));
       if(window.__detail)window.__detail.setFocus(f,j);
       syncSel(f);
-      setLiveLabels(true);
+      setLiveLabels(true, ch&&ch.spawn);
     } else {
       if(window.POKE_FRAMES){ setLiveLabels(false); }
       window.POKE_FRAMES=false;
