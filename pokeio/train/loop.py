@@ -46,6 +46,7 @@ from pokeio.evo.ops import MutationRates, Speciation, compatibility_distance
 from pokeio.reward.archive import NoveltyArchive
 from pokeio.reward.goexplore import GoExplore
 from pokeio.reward.novelty import WaveNovelty
+from pokeio.train.gauntlet import run_boot_gauntlet
 from pokeio.train.live import ChampionShowcase, LiveStreamer
 from pokeio.telemetry.schema import (
     ChampionStep,
@@ -1590,6 +1591,8 @@ def train(
     init_connect: str = "sparse",
     init_k: int = 12,
     engine: str = "furnace",
+    boot_gauntlet_every: int = 10,
+    boot_gauntlet_steps: int = 0,  # 0 = auto (4 * episode_steps)
 ) -> Path:
     device = pick_device(device_str)
     rng = np.random.default_rng(config.run.seed)
@@ -1972,6 +1975,36 @@ def train(
                             for tp in taps
                         )
                     )
+
+            # Boot gauntlet (docs/specs/boot-gauntlet.md): every N gens,
+            # measure how deep into the archived frontier the champion
+            # re-reaches from power-on, solo, STRICTLY read-only. gen 0 is
+            # skipped (archive still seeding; the -1 sentinel marks no-run).
+            boot_metrics: dict[str, float] | None = None
+            if (
+                go is not None
+                and boot_gauntlet_every > 0
+                and gen > 0
+                and gen % boot_gauntlet_every == 0
+            ):
+                if streamer is not None:
+                    streamer.set_phase("evolving", "boot gauntlet")
+                _bsteps = boot_gauntlet_steps or 4 * episode_steps
+                boot_metrics = run_boot_gauntlet(
+                    champion, replay_env, encoder, archive, go, device,
+                    _bsteps, max_nodes, max_conns, reset_state,
+                    forward_steps=FORWARD_STEPS,
+                )
+                _fr = int(max((e.depth for e in go.cells.values()), default=0))
+                print(
+                    f"[gen {gen}] boot-gauntlet: depth "
+                    f"{boot_metrics['boot_depth']:.0f}/{_fr} "
+                    f"({100 * boot_metrics['boot_depth_frac']:.1f}%) cells "
+                    f"{boot_metrics['boot_cells']:.0f} (known "
+                    f"{boot_metrics['boot_cells_known']:.0f}) in "
+                    f"{boot_metrics['boot_steps']:.0f} steps"
+                )
+            _bt = _phase("gauntlet", _bt)
             if pace is not None:
                 pace.poll()  # pick up mid-boundary flips before the next wave
 
@@ -2046,6 +2079,9 @@ def train(
                     max(getattr(g, "progress", 0.0) for g in genomes)
                 )
                 reward_terms["progress_taps"] = float(len(taps))
+            if boot_metrics is not None:
+                # mirrored so the wall side panel shows it with zero UI work
+                reward_terms.update(boot_metrics)
             if go is not None:
                 reward_terms.update(go.stats())
 
@@ -2081,6 +2117,7 @@ def train(
                 throughput_sps=sps,
                 cpu_pct=cpu_pct,
                 gpu=query_gpu(),
+                **(boot_metrics or {}),
             )
             writer.write_generation(rec)
             _bt = _phase("telemetry", _bt)
@@ -2197,6 +2234,11 @@ def main() -> None:
                     help="restart episodes from sampled frontier cells (Go-Explore)")
     ap.add_argument("--restore-prob", type=float, default=0.5,
                     help="per-player prob of restoring from a frontier cell")
+    ap.add_argument("--boot-gauntlet-every", type=int, default=10,
+                    help="run the from-boot champion gauntlet every N gens "
+                         "(0 = off; see docs/specs/boot-gauntlet.md)")
+    ap.add_argument("--boot-gauntlet-steps", type=int, default=0,
+                    help="gauntlet episode length (0 = auto: 4*episode-steps)")
     ap.add_argument("--goexplore-capacity", type=int, default=16384,
                     help="max stored emulator states (memory bound)")
     ap.add_argument("--goexplore-caps-per-round", type=float, default=4.0,
@@ -2261,6 +2303,8 @@ def main() -> None:
         init_connect=args.init_connect,
         init_k=args.init_k,
         engine=args.engine,
+        boot_gauntlet_every=args.boot_gauntlet_every,
+        boot_gauntlet_steps=args.boot_gauntlet_steps,
     )
 
 

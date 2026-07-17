@@ -57,6 +57,12 @@ class GenerationRecord:
     throughput_sps: float = 0.0  # aggregate agent-steps/second
     cpu_pct: float = 0.0
     gpu: list[dict[str, Any]] = field(default_factory=list)  # per-card util/mem
+    # -- boot gauntlet (docs/specs/boot-gauntlet.md); -1.0 = didn't run this gen
+    boot_depth: float = -1.0
+    boot_depth_frac: float = -1.0
+    boot_cells: float = -1.0
+    boot_cells_known: float = -1.0
+    boot_steps: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
