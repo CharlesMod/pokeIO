@@ -730,7 +730,11 @@ def evaluate_wave_async(
                     pending[ii] = (key, int(base_depth[ii]) + k)
             booked[ii] = snap[ii]
         if goexplore is not None and pending:
-            for i in np.nonzero(cap_done[:n])[0]:
+            # snapshot: workers flip cap_done concurrently, and np.nonzero on
+            # a mutating shm array raises "number of non-zero array elements
+            # changed during function execution" (took down a live run).
+            done_snap = cap_done[:n].copy()
+            for i in np.nonzero(done_snap)[0]:
                 ii = int(i)
                 got = pending.pop(ii, None)
                 if got is not None:
