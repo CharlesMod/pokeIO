@@ -1893,6 +1893,7 @@ def train(
     if checkpoint_every < 0:  # -1 sentinel → config default
         checkpoint_every = int(getattr(config.run, "checkpoint_every_gens", 25))
     start_gen = 0
+    total_agent_steps = 0  # cumulative across all agents (drives Play Years)
     if resume:
         ckpt = load_checkpoint(run_dir)
         if ckpt is not None:
@@ -1907,6 +1908,7 @@ def train(
             taps = ckpt["taps"] or []
             miner_rollouts = _deque(ckpt["miner_rollouts"], maxlen=8)
             miner_exclude = ckpt["miner_exclude"]
+            total_agent_steps = int(ckpt.get("total_agent_steps", 0))
             start_gen = int(ckpt["gen"])
             # re-arm the obs taps the checkpoint was training with
             if taps:
@@ -2038,6 +2040,13 @@ def train(
             gen_dt = time.perf_counter() - gen_t0
             cpu_pct = psutil.cpu_percent(None)
             sps = steps_done / gen_dt if gen_dt > 0 else 0.0
+            # Cumulative game-time played across ALL agents: one agent-step is
+            # frame_skip/60 game-seconds. This is the wall's "Play Years" tile.
+            total_agent_steps += steps_done
+            if streamer is not None:
+                streamer.set_play_seconds(
+                    total_agent_steps * config.emu.frame_skip / 60.0
+                )
 
             # Champion replay: live-feed telemetry AND the miner's data source.
             # Replaying from the champion's true eval spawn (not newgame)
@@ -2304,6 +2313,7 @@ def train(
                         prev_reps=prev_reps, species_best=species_best,
                         rng=rng, taps=taps, miner_rollouts=miner_rollouts,
                         miner_exclude=miner_exclude,
+                        total_agent_steps=total_agent_steps,
                     ),
                 )
                 print(f"[checkpoint] gen {gen + 1} saved in {_ck_dt:.1f}s",

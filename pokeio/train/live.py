@@ -651,6 +651,7 @@ class LiveStreamer:
         self._focus_cache: dict[int, dict] = {}  # slot -> compiled focus entry
         # -- pump thread: emits at ~hz THROUGH generation boundaries ----------
         self._gen = 0
+        self._play_seconds = 0.0  # cumulative game-time played across all agents
         self._phase = "wave"
         self._phase_detail = ""
         self._lock = threading.RLock()  # serializes _emit / champion swaps
@@ -729,6 +730,12 @@ class LiveStreamer:
         self._pace = "realtime" if mode == "realtime" else "max"
         hz = self._hz_realtime if self._pace == "realtime" else self._hz_max
         self.writer.interval = 1.0 / max(0.1, hz)
+
+    def set_play_seconds(self, secs: float) -> None:
+        """Cumulative game-time played across ALL agents (for the wall's
+        'Play Years' tile). One agent-step = frame_skip/60 game-seconds;
+        summed over every parallel agent and every generation."""
+        self._play_seconds = float(secs)
 
     def set_eta(self, eta_s: float, round_hz: float) -> None:
         """Per-round countdown feed from the loop (cheap attribute writes):
@@ -1046,6 +1053,7 @@ class LiveStreamer:
                 "eta_s": round(eta_s, 2),
                 "round_hz": round(float(self._round_hz), 3),
                 "waves": int(self._n_waves),
+                "play_seconds": round(float(self._play_seconds), 1),
                 "champion": champ,
                 "swarm": swarm,
                 "focus": focus,

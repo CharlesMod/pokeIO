@@ -229,7 +229,7 @@
       </div>
     </div>
     <div class="stat"><span class="k">Generation</span><span class="v amber" id="s-gen">412</span></div>
-    <div class="stat"><span class="k">Population</span><span class="v" id="s-pop">1,024</span></div>
+    <div class="stat" title="cumulative game-time played across every parallel agent"><span class="k">Play Years</span><span class="v" id="s-playyears">0.00</span></div>
     <div class="stat"><span class="k">Players</span><span class="v" id="s-players">128</span></div>
     <div class="stat"><span class="k">Elapsed</span><span class="v" id="s-clock">38:14:07</span></div>
     <div class="stat"><span class="k">Throughput</span><span class="v" id="s-fps">23.2<small> k steps/s</small></span></div>
@@ -2220,8 +2220,13 @@ async function pollLive(){
       drawSwarm(j.swarm);
       /* real top-strip numbers only live.json knows */
       if(j.swarm&&$('s-players'))$('s-players').textContent=j.swarm.length;
-      const pop=(j.pop!=null)?j.pop:j.population;
-      if($('s-pop'))$('s-pop').textContent=pop!=null?(+pop).toLocaleString():'—';
+      // Play Years: cumulative game-time across ALL agents (play_seconds from
+      // the trainer). Show more precision while small, fewer digits once large.
+      if($('s-playyears')&&j.play_seconds!=null){
+        const yrs=j.play_seconds/(365.25*86400);
+        $('s-playyears').textContent = yrs>=100 ? Math.round(yrs).toLocaleString()
+          : yrs>=1 ? yrs.toFixed(1) : yrs.toFixed(3);
+      }
       if(j.species&&j.species.length&&$('s-spec'))$('s-spec').textContent=j.species.length;
       /* contract panes */
       renderRewardTerms(j.reward_terms, j.gen);

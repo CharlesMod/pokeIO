@@ -90,6 +90,7 @@ def build_state(
     taps,
     miner_rollouts,
     miner_exclude,
+    total_agent_steps=0,
 ) -> dict:
     """Assemble the checkpoint dict from the loop's live objects.
 
@@ -109,6 +110,7 @@ def build_state(
         "taps": taps,
         "miner_rollouts": list(miner_rollouts),
         "miner_exclude": miner_exclude,
+        "total_agent_steps": int(total_agent_steps),
     }
 
 
