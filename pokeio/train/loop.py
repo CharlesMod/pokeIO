@@ -1908,8 +1908,13 @@ def train(
             taps = ckpt["taps"] or []
             miner_rollouts = _deque(ckpt["miner_rollouts"], maxlen=8)
             miner_exclude = ckpt["miner_exclude"]
-            total_agent_steps = int(ckpt.get("total_agent_steps", 0))
             start_gen = int(ckpt["gen"])
+            # pre-feature checkpoints lack the cumulative step count: estimate
+            # it from the resume gen (each gen ran pop_size*episode_steps steps)
+            # so Play Years stays roughly continuous across the upgrade.
+            total_agent_steps = int(
+                ckpt.get("total_agent_steps", start_gen * pop_size * episode_steps)
+            )
             # re-arm the obs taps the checkpoint was training with
             if taps:
                 addrs = [0] * int(config.vision.obs_ram_bytes)
