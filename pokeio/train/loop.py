@@ -1181,6 +1181,41 @@ def assign_species_mat(spec, genomes, D: np.ndarray, rng: np.random.Generator):
     return species
 
 
+def _relabel_species(species, prev_reps, spec):
+    """Give this generation's fresh clusters STABLE cross-generation ids.
+
+    ``assign_species_mat`` re-clusters from scratch every generation and mints
+    fresh sids, so species had no identity over time — which made stagnation
+    tracking structurally impossible (audit EVO#2). Match each new cluster to
+    the closest previous representative within the compat threshold (greedy,
+    biggest clusters claim first) and reuse that sid; unmatched clusters keep
+    their fresh sid (a genuinely new species). ~n_species^2 scalar distance
+    calls per generation — trivial next to the vectorized NxN matrix.
+    """
+    if not prev_reps:
+        return species
+    out: dict[int, list] = {}
+    used: set[int] = set()
+    for sid, members in sorted(species.items(), key=lambda kv: -len(kv[1])):
+        rep = members[0]
+        best_sid, best_d = None, None
+        for psid, prep in prev_reps.items():
+            if psid in used:
+                continue
+            d = compatibility_distance(rep, prep, spec.c1, spec.c2, spec.c3)
+            if best_d is None or d < best_d:
+                best_sid, best_d = psid, d
+        if best_sid is not None and best_d < spec.threshold:
+            used.add(best_sid)
+            nsid = best_sid
+        else:
+            nsid = sid
+        out[nsid] = members
+        for g in members:
+            g.species_id = nsid
+    return out
+
+
 # --------------------------------------------------------------------------
 # fast reproduction (rng-stream-identical to pokeio.evo.ops.reproduce)
 # --------------------------------------------------------------------------
@@ -1341,6 +1376,34 @@ def fast_reproduce(
     frac_order = sorted(species, key=lambda s: raw_alloc[s] - alloc[s], reverse=True)
     for i in range(remainder):
         alloc[frac_order[i % len(frac_order)]] += 1
+
+    # Diversity guards (audit EVO#2/#6): cap any one species at ~40% of the
+    # population (a lucky champion's species could otherwise take ~90% in one
+    # step and the adaptive threshold would cosmetically re-split its clones),
+    # and guarantee every surviving species >= 1 slot so its elite is never
+    # extinguished by allocation rounding alone.
+    if len(alloc) > 1:
+        cap = max(1, int(np.ceil(0.4 * pop_size)))
+        over = [sid for sid in alloc if alloc[sid] > cap]
+        if over:
+            excess = sum(alloc[sid] - cap for sid in over)
+            for sid in over:
+                alloc[sid] = cap
+            order = sorted(
+                (s for s in alloc if s not in set(over)),
+                key=lambda s: species_adj.get(s, 0.0), reverse=True,
+            )
+            i = 0
+            while excess > 0 and order:
+                alloc[order[i % len(order)]] += 1
+                excess -= 1
+                i += 1
+        for sid in alloc:
+            if alloc[sid] <= 0:
+                donor = max(alloc, key=lambda s: alloc[s])
+                if alloc[donor] > 1:
+                    alloc[donor] -= 1
+                    alloc[sid] = 1
 
     new: list = []
     for sid, members in species.items():
@@ -1590,6 +1653,13 @@ def train(
     proc.cpu_percent(None)  # prime the psutil counter
     run_start = time.perf_counter()
 
+    # Cross-generation species lineage state (see _relabel_species): last
+    # generation's best-member representative per stable sid, and each
+    # lineage's (best raw fitness, gen it was set) for stagnation kills.
+    prev_reps: dict[int, object] = {}
+    species_best: dict[int, tuple[float, int]] = {}
+    species_stagnation = int(getattr(config.evo, "species_stagnation", 15))
+
     with TelemetryWriter(run_dir) as writer:
         gen_wall_prev = time.perf_counter()
         for gen in range(gens):
@@ -1738,11 +1808,43 @@ def train(
             else:
                 species = spec.assign(genomes, rng)
             del D
+            # Stable species identity + stagnation (audit EVO#2): relabel this
+            # generation's clusters to last generation's ids by rep distance,
+            # track each lineage's best RAW fitness, and remove species that
+            # haven't improved in `species_stagnation` gens (the champion's
+            # species and a 2-species floor are protected).
+            if auto_species:
+                # (spec.assign keeps stable ids natively; only the from-scratch
+                # matrix clustering needs relabeling)
+                species = _relabel_species(species, prev_reps, spec)
+            champ_sid = genomes[champ_idx].species_id
+            for sid, members in species.items():
+                b = max(g.fitness for g in members)
+                rec = species_best.get(sid)
+                if rec is None or b > rec[0] + 1e-9:
+                    species_best[sid] = (b, gen)
+            stagnant = {
+                sid for sid in species
+                if sid != champ_sid
+                and gen - species_best[sid][1] >= species_stagnation
+            }
+            while stagnant and len(species) - len(stagnant) < 2:
+                stagnant.pop()  # keep at least 2 species alive
+            n_stagnant_killed = len(stagnant)
+            for sid in stagnant:
+                del species[sid]
+            # bounded bookkeeping: forget lineages that went extinct
+            species_best = {s: v for s, v in species_best.items() if s in species}
+            prev_reps = {
+                sid: max(members, key=lambda g: g.fitness).copy()
+                for sid, members in species.items()
+            }
             _bt = _phase("spec_assign", _bt)
 
             reward_terms = {"novelty": float(fits.max())}
             if auto_species:
                 reward_terms["species_threshold"] = float(spec.threshold)
+                reward_terms["species_stagnant_killed"] = float(n_stagnant_killed)
             if go is not None:
                 reward_terms.update(go.stats())
 

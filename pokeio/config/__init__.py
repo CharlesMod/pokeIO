@@ -97,6 +97,9 @@ class EvoConfig:
     mutate_toggle: float = 0.01
     crossover_rate: float = 0.75
     fitness_sharing: bool = True
+    # kill species whose best raw fitness hasn't improved in this many gens
+    # (champion's species + a 2-species floor are always protected)
+    species_stagnation: int = 15
     recurrent: bool = True  # allow evolved recurrent connections
     max_nodes: int = 512  # padding bound for tensorized genome
     max_conns: int = 4096
