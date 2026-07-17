@@ -46,6 +46,11 @@ from pokeio.evo.ops import MutationRates, Speciation, compatibility_distance
 from pokeio.reward.archive import NoveltyArchive
 from pokeio.reward.goexplore import GoExplore
 from pokeio.reward.novelty import WaveNovelty
+from pokeio.train.checkpoint import (
+    build_state as build_checkpoint_state,
+    load_checkpoint,
+    save_checkpoint,
+)
 from pokeio.train.gauntlet import run_boot_gauntlet
 from pokeio.train.live import ChampionShowcase, LiveStreamer
 from pokeio.telemetry.schema import (
@@ -1676,6 +1681,7 @@ def train(
     boot_gauntlet_steps: int = 0,  # 0 = auto (4 * episode_steps)
     resume: bool = False,  # append to existing telemetry (checkpoint-resume)
     recurrent_memory: bool = True,  # persist node state across agent-steps
+    checkpoint_every: int = -1,  # -1 = config default; 0 = off
 ) -> Path:
     device = pick_device(device_str)
     rng = np.random.default_rng(config.run.seed)
@@ -1883,9 +1889,47 @@ def train(
         frame_skip=config.emu.frame_skip,
     )
 
+    # -- resume from a checkpoint (survive power loss) ----------------------
+    if checkpoint_every < 0:  # -1 sentinel → config default
+        checkpoint_every = int(getattr(config.run, "checkpoint_every_gens", 25))
+    start_gen = 0
+    if resume:
+        ckpt = load_checkpoint(run_dir)
+        if ckpt is not None:
+            genomes = ckpt["genomes"]
+            archive = ckpt["archive"]
+            go = ckpt["goexplore"]
+            tracker = ckpt["tracker"]
+            spec = ckpt["spec"]
+            prev_reps = ckpt["prev_reps"]
+            species_best = ckpt["species_best"]
+            rng.bit_generator.state = ckpt["rng_state"]
+            taps = ckpt["taps"] or []
+            miner_rollouts = _deque(ckpt["miner_rollouts"], maxlen=8)
+            miner_exclude = ckpt["miner_exclude"]
+            start_gen = int(ckpt["gen"])
+            # re-arm the obs taps the checkpoint was training with
+            if taps:
+                addrs = [0] * int(config.vision.obs_ram_bytes)
+                for tp in taps:
+                    for b, j in enumerate(tp["slots"]):
+                        addrs[j] = tp["addr"] + b
+                encoder.set_taps(addrs)
+                if fleet is not None and hasattr(fleet, "set_tap_addrs"):
+                    fleet.set_tap_addrs(addrs)
+            print(
+                f"[checkpoint] resumed at gen {start_gen}: "
+                f"{len(genomes)} genomes, {archive.size} cells, "
+                f"{go.size if go else 0} go-states, {len(taps)} taps",
+                flush=True,
+            )
+        else:
+            print("[checkpoint] --resume set but no usable checkpoint; fresh start",
+                  flush=True)
+
     with TelemetryWriter(run_dir, resume=resume) as writer:
         gen_wall_prev = time.perf_counter()
-        for gen in range(gens):
+        for gen in range(start_gen, gens):
             gen_t0 = time.perf_counter()
             prof: dict = {}
 
@@ -2243,6 +2287,29 @@ def train(
                 )
             _bt = _phase("reproduce", _bt)
 
+            # ---- checkpoint (survive power loss) --------------------------
+            # After reproduction: `genomes` is the NEXT population and the
+            # archives are quiescent (no wave mutating them), so a synchronous
+            # snapshot here is race-free. gen+1 = the generation to resume at.
+            if (
+                checkpoint_every > 0
+                and gen < gens - 1
+                and (gen + 1) % checkpoint_every == 0
+            ):
+                _ck_dt = save_checkpoint(
+                    run_dir,
+                    build_checkpoint_state(
+                        gen=gen + 1, genomes=genomes, archive=archive,
+                        goexplore=go, tracker=tracker, spec=spec,
+                        prev_reps=prev_reps, species_best=species_best,
+                        rng=rng, taps=taps, miner_rollouts=miner_rollouts,
+                        miner_exclude=miner_exclude,
+                    ),
+                )
+                print(f"[checkpoint] gen {gen + 1} saved in {_ck_dt:.1f}s",
+                      flush=True)
+            _bt = _phase("checkpoint", _bt)
+
             # ---- per-generation boundary profile -------------------------
             gen_wall = time.perf_counter()
             wall_dt = gen_wall - gen_wall_prev
@@ -2333,6 +2400,9 @@ def main() -> None:
                     action="store_false", default=True,
                     help="disable cross-agent-step recurrent state (memoryless "
                          "policies; default persists node state within an episode)")
+    ap.add_argument("--checkpoint-every", type=int, default=-1,
+                    help="save a resumable checkpoint every N gens (0=off; "
+                         "-1=use config.run.checkpoint_every_gens, default 25)")
     ap.add_argument("--goexplore-capacity", type=int, default=16384,
                     help="max stored emulator states (memory bound)")
     ap.add_argument("--goexplore-caps-per-round", type=float, default=4.0,
@@ -2401,6 +2471,7 @@ def main() -> None:
         boot_gauntlet_steps=args.boot_gauntlet_steps,
         resume=args.resume,
         recurrent_memory=args.recurrent_memory,
+        checkpoint_every=args.checkpoint_every,
     )
 
 
