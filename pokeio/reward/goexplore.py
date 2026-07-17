@@ -96,6 +96,15 @@ class GoExplore:
     recency_halflife: float = 4.0
     depth_weight: float = 0.25
     caps_per_round: float = 0.0  # max captures per swarm round (0 = unlimited)
+    # --- eviction / detachment guard (A6) ------------------------------------
+    # The eviction keep-score used to be recency * visits * depth, so the fast
+    # 0.5^(age/halflife) recency term crushed a proven deep hub to ~0 after a
+    # dozen idle gens and batch-evicted it; because the novelty ``seen`` set is
+    # append-only, an evicted hub can NEVER be re-captured and exploration depth
+    # silently regresses on plateaus.  Two bounded guards below keep proven deep
+    # frontier hubs while never letting them crowd out eviction capacity:
+    evict_depth_floor: float = 1.0  # weight of an UNDECAYED proven-hub keep floor
+    deep_exempt_frac: float = 0.125  # fraction of capacity exempt from eviction
     rng: np.random.Generator = field(default_factory=lambda: np.random.default_rng(0))
 
     cells: dict[bytes, CellEntry] = field(default_factory=dict)
@@ -249,22 +258,50 @@ class GoExplore:
         recent, and deep cells; EVICT stale one-offs first. Batched because
         the old per-eviction O(n) min-scan ran thousands of times per
         generation once cell discovery outpaced capacity.
+
+        Detachment guard (A6). The keep-score is no longer a bare
+        ``recency * visits * depth`` product — that let the fast recency decay
+        (0.5^(age/halflife)) out-rank a proven deep hub against a recent shallow
+        one-off after ~a dozen idle gens, batch-evicting the hub for good. Two
+        bounded guards restore stability:
+
+        * an **additive, undecayed floor** ``evict_depth_floor * log1p(visits) *
+          depth_term`` added to the recency-weighted component, so a proven
+          (multi-visit AND deep) hub keeps a positive keep-score no matter how
+          stale. The floor scales with ``log1p(visits)``, so a shallow one-off
+          (visits=1, depth=0) contributes ~0 and is never protected by it;
+        * a **bounded hard exemption**: the top-N deepest *proven* (visits>1)
+          cells are never evicted. N is capped at ``deep_exempt_frac * capacity``
+          AND at ``m - k`` so there are always >= k evictable cells — stale-but-
+          deep cells therefore can never crowd out eviction capacity.
         """
         if not self.cells:
             return
-        k = max(1, self.capacity // 64)
         entries = list(self.cells.values())
+        m = len(entries)
+        k = max(1, self.capacity // 64)
         v, _sel, seen, dep = self._fields(entries)
         age = np.maximum(0.0, self.cur_gen - seen)
         recency = 0.5 ** (age / max(1e-6, self.recency_halflife))
-        keep_score = (
-            recency
-            * (0.5 + np.log1p(v))
-            * (1.0 + self.depth_weight * np.log1p(np.maximum(0.0, dep)))
+        depth_term = 1.0 + self.depth_weight * np.log1p(np.maximum(0.0, dep))
+        visits_log = np.log1p(v)
+        # Recency-weighted component (differentiates cells while fresh) PLUS an
+        # undecayed proven-hub floor so a stale deep hub is not crushed to ~0.
+        keep_score = recency * (0.5 + visits_log) * depth_term + (
+            max(0.0, self.evict_depth_floor) * visits_log * depth_term
         )
-        for i in np.argsort(keep_score)[:k]:
+        # Bounded exemption: never evict the top-N deepest PROVEN cells.
+        exempt_cap = min(int(self.capacity * self.deep_exempt_frac), m - k)
+        if exempt_cap > 0:
+            proven = np.nonzero(v > 1)[0]
+            if proven.size:
+                deepest = proven[np.argsort(-dep[proven])][:exempt_cap]
+                keep_score = keep_score.copy()
+                keep_score[deepest] = np.inf  # sort last -> never in bottom-k
+        n_evict = min(k, m)
+        for i in np.argsort(keep_score)[:n_evict]:
             del self.cells[entries[int(i)].key]
-        self.n_evicted += min(k, len(entries))
+        self.n_evicted += n_evict
 
     # ---------------------------------------------------------------- sample
     def sample_many(self, k: int) -> list[CellEntry]:

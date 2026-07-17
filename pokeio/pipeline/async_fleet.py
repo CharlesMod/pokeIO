@@ -1,15 +1,23 @@
-"""AsyncFleet — decoupled, shared-memory, barrier-synchronized render-on fleet.
+"""PipelineFleet — decoupled, shared-memory, barrier-synchronized render-on fleet.
 
-The Phase-1.5 transport. N worker processes each drive a bare PyBoy at
-``frame_skip=1`` (reflex control): apply the action published for the previous
-frame, ``tick(1, render=True)``, grab a compact 144x160 grayscale framebuffer,
-and write it straight into a shared-memory ring. Synchronization is a
-**sense-reversing barrier in shared memory** (monotone generation counters, no
-locks, no pipes) between the N workers and a single controller — NOT the 2N
-blocking pipe round-trips of ``emu.fleet.VecFleet`` (which caps ~2.9k steps/s).
+EXPERIMENTAL / benchmark-only, NOT wired into training. This is the Phase-1.5
+``fs=1`` reflex transport and it exists to drive the GPU-vision throughput
+benchmarks (``scripts/bench_40k.py``); the production training loop
+(``pokeio.train.loop``) runs on ``emu.fleet.AsyncFleet`` / ``BarrierFleet``, not
+this module. The class was renamed from ``AsyncFleet`` to ``PipelineFleet`` to
+stop it colliding with the unrelated production ``emu.fleet.AsyncFleet``; a
+deprecated ``AsyncFleet`` alias is kept at the bottom for back-compat.
 
-The controller (driven in the parent by :meth:`AsyncFleet.run_frames`) waits for
-all N framebuffers of a generation, hands the batch to an ``infer`` callable
+N worker processes each drive a bare PyBoy at ``frame_skip=1`` (reflex control):
+apply the action published for the previous frame, ``tick(1, render=True)``,
+grab a compact 144x160 grayscale framebuffer, and write it straight into a
+shared-memory ring. Synchronization is a **sense-reversing barrier in shared
+memory** (monotone generation counters, no locks, no pipes) between the N
+workers and a single controller — NOT the 2N blocking pipe round-trips of
+``emu.fleet.VecFleet`` (which caps ~2.9k steps/s).
+
+The controller (driven in the parent by :meth:`PipelineFleet.run_frames`) waits
+for all N framebuffers of a generation, hands the batch to an ``infer`` callable
 (the GPU vision+inference path by default), and publishes one action per worker.
 
 Pipeline latency
@@ -212,8 +220,14 @@ class StubPolicy:
 
 
 # --------------------------------------------------------------------- fleet
-class AsyncFleet:
-    """N NUMA-pinned render-on workers + a shared-memory barrier controller."""
+class PipelineFleet:
+    """N NUMA-pinned render-on workers + a shared-memory barrier controller.
+
+    EXPERIMENTAL / benchmark-only (see module docstring). Renamed from
+    ``AsyncFleet`` to avoid colliding with the production
+    ``pokeio.emu.fleet.AsyncFleet``; ``AsyncFleet`` remains a deprecated alias
+    of this class.
+    """
 
     def __init__(
         self,
@@ -518,4 +532,10 @@ class AsyncFleet:
             pass
 
 
-__all__ = ["AsyncFleet", "StubPolicy", "NUMA_NODES", "ACTIONS"]
+# Deprecated back-compat alias: the class was renamed PipelineFleet to stop it
+# colliding with the production emu.fleet.AsyncFleet. Kept so existing importers
+# (pokeio.pipeline.__init__, scripts/bench_40k.py) keep working; prefer
+# PipelineFleet in new code.
+AsyncFleet = PipelineFleet
+
+__all__ = ["PipelineFleet", "AsyncFleet", "StubPolicy", "NUMA_NODES", "ACTIONS"]

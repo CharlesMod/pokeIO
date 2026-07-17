@@ -30,6 +30,7 @@ import json
 import math
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -47,13 +48,19 @@ from pokeio.reward.archive import NoveltyArchive
 from pokeio.reward.goexplore import GoExplore
 from pokeio.reward.novelty import WaveNovelty
 from pokeio.train.checkpoint import (
+    LOAD_ABSENT,
     build_state as build_checkpoint_state,
-    load_checkpoint,
+    checkpoint_path,
+    load_checkpoint_status,
     save_checkpoint,
 )
 from pokeio.train.gauntlet import run_boot_gauntlet
 from pokeio.train.live import ChampionShowcase, LiveStreamer
 from pokeio.telemetry.schema import (
+    CHAMPION_FILENAME,
+    TELEMETRY_FILENAME,
+    TYPE_CHAMPION_STEP,
+    TYPE_GENERATION,
     ChampionStep,
     GenerationRecord,
     TelemetryWriter,
@@ -63,6 +70,179 @@ _SCREEN_H = 144
 _SCREEN_W = 160
 N_OUT = 9  # Discrete(9): up down left right A B START SELECT NOOP
 FORWARD_STEPS = 4  # propagation hops per inference (covers evolved depth)
+
+
+# --------------------------------------------------------------------------
+# reproducibility (A4) + topology-budget growth (A2) + resume hygiene (A3)
+# --------------------------------------------------------------------------
+def _git_sha(repo_dir: str | Path | None = None) -> str:
+    """Best-effort ``<sha>[-dirty]``; empty string outside a git checkout.
+
+    Records the exact code a run used. Guarded for non-git checkouts (tarball
+    deploys) — a missing ``git`` or a non-repo cwd yields ``""`` rather than
+    raising.
+    """
+    repo = Path(repo_dir) if repo_dir else Path(__file__).resolve().parents[2]
+
+    def _git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args], cwd=str(repo),
+            capture_output=True, text=True, timeout=5,
+        )
+
+    try:
+        head = _git("rev-parse", "HEAD")
+        if head.returncode != 0:
+            return ""
+        sha = head.stdout.strip()
+        status = _git("status", "--porcelain")
+        if status.returncode == 0 and status.stdout.strip():
+            sha += "-dirty"
+        return sha
+    except Exception:
+        return ""
+
+
+def _write_resolved_run(
+    run_dir: str | Path, argv, train_kwargs: dict, config
+) -> Path:
+    """Write ``<run_dir>/resolved-run.json`` (argv + all train() kwargs + config).
+
+    ``config.yaml`` snapshots only the ``Config`` dataclass and omits the
+    decisive CLI-only knobs (gens, episode_steps, novelty_mode, goexplore*,
+    init_connect/init_k, engine, boot_gauntlet_*, recurrent_memory,
+    checkpoint_every); this captures the FULL call so a run is reproducible from
+    one file. Written atomically (temp + os.replace). (audit A4)
+    """
+    payload = {
+        "argv": list(argv),
+        "git_sha": config.run.git_sha,
+        "seed": config.run.seed,
+        "train_kwargs": train_kwargs,
+        "config": config.to_dict(),
+    }
+    path = Path(run_dir) / "resolved-run.json"
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True, default=str)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    return path
+
+
+def _grow_topology_budget(
+    max_nodes: int, max_conns: int,
+    need_nodes: int, need_conns: int,
+    headroom: float = 0.25,
+) -> tuple[int, int]:
+    """Grow padding budgets so the biggest genome fits with headroom (A2).
+
+    NEAT's add_node/add_conn grow genomes monotonically, so a gen-0 budget is
+    eventually exceeded and ``Population.from_genomes`` raises ``ValueError``,
+    killing a long run with no in-flight checkpoint. When a genome comes within
+    ``headroom`` of a cap, grow that cap to the next power of two above
+    ``need*(1+headroom)`` (rounding up keeps regrows rare and tensors
+    realloc-friendly). Never shrinks.
+    """
+    def _grow(cap: int, need: int) -> int:
+        need = max(int(need), 1)
+        if need <= int(cap * (1.0 - headroom)):
+            return cap
+        target = int(math.ceil(need * (1.0 + headroom)))
+        grown = 1 << max(0, (target - 1)).bit_length()
+        return max(cap, grown)
+
+    return _grow(max_nodes, need_nodes), _grow(max_conns, need_conns)
+
+
+def _atomic_write_lines(path: Path, lines) -> None:
+    """Rewrite ``path`` with ``lines`` (bytes, newline-free) atomically."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "wb") as fh:
+        for s in lines:
+            fh.write(s)
+            fh.write(b"\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _truncate_streams_on_resume(run_dir: str | Path, start_gen: int) -> None:
+    """Drop telemetry/champion records for ``gen >= start_gen`` before appending.
+
+    ``write_generation`` fires every gen but checkpoints are periodic, so gens
+    between the last checkpoint and a crash were already written. On ``--resume``
+    the loop re-runs them; without this they'd be appended a SECOND time
+    (``read_generations`` does no dedup -> the dashboard sees duplicate / rewound
+    generations). Both streams are rewritten atomically (temp + os.replace) so a
+    crash mid-truncate can't corrupt them. (audit A3a)
+    """
+    import orjson  # the same serializer the telemetry writer uses
+
+    run_dir = Path(run_dir)
+
+    # -- telemetry.jsonl: keyed directly on each record's `gen` field ---------
+    tpath = run_dir / TELEMETRY_FILENAME
+    if tpath.exists():
+        kept: list[bytes] = []
+        dropped = 0
+        with open(tpath, "rb") as fh:
+            for line in fh:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    env = orjson.loads(s)
+                except Exception:
+                    continue  # torn trailing line from a crash mid-write
+                if (
+                    env.get("type") == TYPE_GENERATION
+                    and int(env.get("data", {}).get("gen", -1)) >= start_gen
+                ):
+                    dropped += 1
+                    continue
+                kept.append(s)
+        _atomic_write_lines(tpath, kept)
+        if dropped:
+            print(
+                f"[resume] telemetry: dropped {dropped} record(s) for "
+                f"gen>={start_gen}", flush=True,
+            )
+
+    # -- champion.jsonl: no gen field; one replay block per gen, each block
+    #    begins with a step==0 record. Keep the first `start_gen` blocks. ------
+    cpath = run_dir / CHAMPION_FILENAME
+    if cpath.exists():
+        kept = []
+        blocks = 0
+        dropped = 0
+        dropping = False
+        with open(cpath, "rb") as fh:
+            for line in fh:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    env = orjson.loads(s)
+                except Exception:
+                    continue
+                if (
+                    env.get("type") == TYPE_CHAMPION_STEP
+                    and int(env.get("data", {}).get("step", -1)) == 0
+                ):
+                    dropping = blocks >= start_gen  # block index == gen
+                    blocks += 1
+                if dropping:
+                    dropped += 1
+                    continue
+                kept.append(s)
+        _atomic_write_lines(cpath, kept)
+        if dropped:
+            print(
+                f"[resume] champion: dropped {dropped} step(s) past "
+                f"gen {start_gen - 1}", flush=True,
+            )
 
 
 # --------------------------------------------------------------------------
@@ -1685,6 +1865,11 @@ def train(
 ) -> Path:
     device = pick_device(device_str)
     rng = np.random.default_rng(config.run.seed)
+    # Seed torch's global RNG too (A4): weight-init / any torch sampling was
+    # previously unseeded, so nominally "seed=0" runs weren't reproducible.
+    torch.manual_seed(int(config.run.seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(config.run.seed))
 
     encoder = ObsEncoder(obs_res, config.vision.obs_ram_bytes)
     n_in = encoder.dim
@@ -1699,7 +1884,29 @@ def train(
 
     run_dir = Path(config.run.runs_dir) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    # Reproducibility (A4): stamp the exact code + the FULL resolved call.
+    if not config.run.git_sha:
+        config.run.git_sha = _git_sha()
     config.snapshot(run_dir)
+    _write_resolved_run(
+        run_dir,
+        argv=list(sys.argv),
+        train_kwargs=dict(
+            gens=gens, pop_size=pop_size, players=players,
+            episode_steps=episode_steps, obs_res=obs_res, run_id=run_id,
+            device_str=device_str, champion_steps=champion_steps, live=live,
+            novelty_mode=novelty_mode, goexplore=goexplore,
+            restore_prob=restore_prob, goexplore_capacity=goexplore_capacity,
+            goexplore_caps_per_round=goexplore_caps_per_round,
+            auto_species=auto_species, species_target=species_target,
+            parallel=parallel, envs_per_worker=envs_per_worker,
+            init_connect=init_connect, init_k=init_k, engine=engine,
+            boot_gauntlet_every=boot_gauntlet_every,
+            boot_gauntlet_steps=boot_gauntlet_steps, resume=resume,
+            recurrent_memory=recurrent_memory, checkpoint_every=checkpoint_every,
+        ),
+        config=config,
+    )
 
     print(
         f"[train] device={device} n_in={n_in} (res={obs_res}^2+{config.vision.obs_ram_bytes} ram) "
@@ -1895,7 +2102,19 @@ def train(
     start_gen = 0
     total_agent_steps = 0  # cumulative across all agents (drives Play Years)
     if resume:
-        ckpt = load_checkpoint(run_dir)
+        ckpt, ck_status = load_checkpoint_status(run_dir)
+        if ckpt is None and ck_status != LOAD_ABSENT:
+            # A checkpoint is PRESENT but unusable (corrupt / truncated / wrong
+            # schema). Silently restarting at gen 0 would discard the run and
+            # append gen-0 telemetry onto the old history. Fail loud + non-zero
+            # so the operator fixes it or drops --resume deliberately. (A3b)
+            print(
+                f"[checkpoint] --resume requested but the checkpoint is "
+                f"unusable ({ck_status}) at {checkpoint_path(run_dir)}; "
+                f"refusing to restart at gen 0. Fix/move it or drop --resume.",
+                file=sys.stderr, flush=True,
+            )
+            raise SystemExit(2)
         if ckpt is not None:
             genomes = ckpt["genomes"]
             archive = ckpt["archive"]
@@ -1936,8 +2155,12 @@ def train(
                 f"{go.size if go else 0} go-states, {len(taps)} taps",
                 flush=True,
             )
+            # Drop any telemetry/champion records for gens the checkpoint didn't
+            # cover (written between the last checkpoint and the crash); we're
+            # about to re-run and re-append them. (A3a)
+            _truncate_streams_on_resume(run_dir, start_gen)
         else:
-            print("[checkpoint] --resume set but no usable checkpoint; fresh start",
+            print("[checkpoint] --resume set but no checkpoint yet; fresh start",
                   flush=True)
 
     with TelemetryWriter(run_dir, resume=resume) as writer:
@@ -1957,6 +2180,33 @@ def train(
             psutil.cpu_percent(None)
 
             steps_done = 0
+            # Grow the topology padding budget before packing (A2). NEAT's
+            # add_node/add_conn grow genomes monotonically, so the gen-0 budget
+            # is eventually exceeded and Population.from_genomes raises
+            # ValueError — killing the run with no in-flight checkpoint. Sizing
+            # to the live population every gen also right-sizes on --resume (the
+            # budget otherwise resets to the gen-0 value while resumed genomes
+            # are already larger).
+            need_nodes = max(len(g.nodes) for g in genomes)
+            need_conns = max(len(g.conns) for g in genomes)
+            new_nodes, new_conns = _grow_topology_budget(
+                max_nodes, max_conns, need_nodes, need_conns
+            )
+            if new_nodes != max_nodes or new_conns != max_conns:
+                print(
+                    f"[gen {gen}] topology budget grown: "
+                    f"nodes {max_nodes}->{new_nodes} conns {max_conns}->{new_conns} "
+                    f"(need {need_nodes}/{need_conns})",
+                    flush=True,
+                )
+                max_nodes, max_conns = new_nodes, new_conns
+                # The live showcase froze the gen-0 budget at construction; keep
+                # it in step or its champion re-pack (and focus-mode packs of
+                # this gen's genomes) would hit the same ValueError off-thread.
+                if streamer is not None and getattr(streamer, "showcase", None):
+                    streamer.showcase.max_nodes = max_nodes
+                    streamer.showcase.max_conns = max_conns
+
             # Pack + compile the WHOLE population once per generation (lazily,
             # so it overlaps the first wave's fleet reset); waves slice rows.
             _cp_cache: list = []
@@ -2073,7 +2323,18 @@ def train(
                 recurrent_memory=recurrent_memory,
             )
             if trace is not None and trace.shape[0] >= 2:
-                miner_rollouts.append(trace)
+                # Dedup at the source (A9): the champion replay is a single
+                # DETERMINISTIC rollout, so an unchanged champion+spawn yields a
+                # byte-identical trace every gen. Feeding duplicates to the
+                # miner makes a one-time ramp score consistency=1.0 (a rewarded
+                # tap). Only distinct episodes enter the deque, so the
+                # `len(miner_rollouts) >= 4` gate below means 4 DISTINCT traces.
+                dup = any(
+                    t.shape == trace.shape and np.array_equal(t, trace)
+                    for t in miner_rollouts
+                )
+                if not dup:
+                    miner_rollouts.append(trace)
             _bt = _phase("replay", _bt)
 
             # Re-mine progress counters on schedule; install as obs taps.

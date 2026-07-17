@@ -4,13 +4,19 @@ An ordered list of human checkpoints keyed to map ids / badge bits (from the
 verified pokeyellow layout). Given the decoded game-states of the frontier,
 :func:`furthest_milestone` reports the deepest checkpoint reached. Trainer-facing
 only — never touches the reward path.
+
+QUARANTINE: the ladder below is entirely Yellow-specific (map ids + badge
+bits). The public functions take an optional ``manifest``; the ladder is only
+applied when there is no manifest (the legacy default) or the manifest names
+Yellow (:func:`game_is_yellow`). For any other game they return no milestones,
+so Yellow labels can never leak onto a second game.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pokeio.analytics.yellow import GameState
+from pokeio.analytics.yellow import GameState, game_is_yellow
 
 # (order index, label, predicate) — predicate is over a decoded GameState.
 # Ordered by natural playthrough progression; "reached" = any frontier state
@@ -47,8 +53,14 @@ class Milestone:
     label: str
 
 
-def milestones_reached(states: list[GameState]) -> list[Milestone]:
-    """All ladder checkpoints satisfied by at least one of ``states``."""
+def milestones_reached(states: list[GameState], manifest=None) -> list[Milestone]:
+    """All ladder checkpoints satisfied by at least one of ``states``.
+
+    Returns ``[]`` when a non-Yellow manifest is supplied (the Yellow ladder
+    must not label another game); no manifest or a Yellow manifest applies it.
+    """
+    if not (manifest is None or game_is_yellow(manifest)):
+        return []
     hit = []
     for i, (label, pred) in enumerate(_LADDER):
         if any(_safe(pred, s) for s in states):
@@ -56,9 +68,9 @@ def milestones_reached(states: list[GameState]) -> list[Milestone]:
     return hit
 
 
-def furthest_milestone(states: list[GameState]) -> Milestone | None:
+def furthest_milestone(states: list[GameState], manifest=None) -> Milestone | None:
     """The deepest ladder checkpoint any state reached (highest index hit)."""
-    hit = milestones_reached(states)
+    hit = milestones_reached(states, manifest)
     return hit[-1] if hit else None
 
 

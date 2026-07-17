@@ -31,12 +31,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from pokeio.analytics.yellow import game_is_yellow
 from pokeio.evo.forward import apply_activation
 from pokeio.evo.genome import BIAS as NODE_BIAS
 from pokeio.evo.genome import HIDDEN as NODE_HIDDEN
 from pokeio.evo.genome import INPUT as NODE_INPUT
 from pokeio.evo.genome import OUTPUT as NODE_OUTPUT
 from pokeio.evo.genome import Population
+from pokeio.manifest.generate import ram_addresses_from_manifest
 
 _SCREEN_H = 144
 _SCREEN_W = 160
@@ -48,6 +50,10 @@ _SW_W = 40
 _SW_H = 36
 
 # A handful of known / interesting Pokemon Yellow WRAM bytes to tap for the UI.
+# QUARANTINED: this is the game-specific FALLBACK, used only when no manifest is
+# present (legacy default, keeps the dashboard working) or when a Yellow
+# manifest declares no RAM taps. A non-Yellow manifest routes taps through
+# ``ram_taps_from_manifest`` instead, so these Yellow addresses never leak.
 INTERESTING_RAM = [
     0xD35E,  # current map id
     0xD361,  # player Y tile
@@ -58,6 +64,23 @@ INTERESTING_RAM = [
     0xD347,  # money (low byte, BCD)
     0xD16B,  # first party mon current HP (hi)
 ]
+
+
+def ram_taps_from_manifest(manifest) -> list[int]:
+    """RAM tap addresses for the UI, routed through a loaded Progress Manifest.
+
+    * ``manifest is None`` -> the legacy Yellow :data:`INTERESTING_RAM` table
+      (the current default; keeps the existing dashboard unchanged).
+    * manifest declares RAM taps -> those addresses (spatial + progress dims).
+    * a Yellow manifest with no RAM taps -> :data:`INTERESTING_RAM`.
+    * any other manifest with no RAM taps -> ``[]`` (no Yellow-label leak).
+    """
+    if manifest is None:
+        return list(INTERESTING_RAM)
+    taps = ram_addresses_from_manifest(manifest)
+    if taps:
+        return taps
+    return list(INTERESTING_RAM) if game_is_yellow(manifest) else []
 
 # Payload budgets — keep live.json small and the wire cheap.
 _CONN_CAP = 600
@@ -338,6 +361,7 @@ class ChampionShowcase:
         max_nodes: int,
         max_conns: int,
         ram_addrs: list[int] | None = None,
+        manifest=None,
     ) -> None:
         self.env = env
         self.encoder = encoder
@@ -346,7 +370,13 @@ class ChampionShowcase:
         self.forward_steps = int(forward_steps)
         self.max_nodes = int(max_nodes)
         self.max_conns = int(max_conns)
-        self.ram_addrs = ram_addrs if ram_addrs is not None else list(INTERESTING_RAM)
+        self.manifest = manifest
+        # Explicit ram_addrs win; else route the UI taps through the manifest
+        # (falling back to the quarantined Yellow table only when appropriate).
+        if ram_addrs is not None:
+            self.ram_addrs = list(ram_addrs)
+        else:
+            self.ram_addrs = ram_taps_from_manifest(manifest)
 
         self.genome = None
         self.genome_id = "none"
@@ -1085,4 +1115,5 @@ __all__ = [
     "b64_gray",
     "downscale_swarm",
     "INTERESTING_RAM",
+    "ram_taps_from_manifest",
 ]

@@ -33,6 +33,15 @@ from pathlib import Path
 CHECKPOINT_FILENAME = "checkpoint.pkl"
 _SCHEMA = 1
 
+# Load-status codes returned by :func:`load_checkpoint_status`. A ``--resume``
+# caller must treat ABSENT (no checkpoint yet — fine to start fresh) very
+# differently from CORRUPT / SCHEMA (a checkpoint is present but unusable —
+# restarting at gen 0 would silently discard the run and clobber its telemetry).
+LOAD_OK = "ok"
+LOAD_ABSENT = "absent"
+LOAD_CORRUPT = "corrupt"
+LOAD_SCHEMA = "schema_mismatch"
+
 
 def checkpoint_path(run_dir: str | Path) -> Path:
     return Path(run_dir) / CHECKPOINT_FILENAME
@@ -56,23 +65,40 @@ def save_checkpoint(run_dir: str | Path, state: dict) -> float:
     return time.perf_counter() - t0
 
 
-def load_checkpoint(run_dir: str | Path) -> dict | None:
-    """Load a checkpoint, or ``None`` if absent / unreadable / wrong schema."""
+def load_checkpoint_status(run_dir: str | Path) -> tuple[dict | None, str]:
+    """Load a checkpoint AND report *why* nothing loaded.
+
+    Returns ``(data, status)`` where ``status`` is one of :data:`LOAD_OK`,
+    :data:`LOAD_ABSENT`, :data:`LOAD_CORRUPT`, or :data:`LOAD_SCHEMA`. This lets
+    a ``--resume`` path distinguish "no checkpoint yet" (safe to start fresh)
+    from "checkpoint present but unreadable" (must abort, never silently
+    restart at gen 0). The technical reason is printed here; callers add the
+    user-facing decision.
+    """
     path = checkpoint_path(run_dir)
     if not path.exists():
-        return None
+        return None, LOAD_ABSENT
     try:
         with open(path, "rb") as fh:
             data = pickle.load(fh)
     except Exception as e:  # corrupt / truncated (a crash mid-fsync is possible)
-        print(f"[checkpoint] load failed ({e}); starting fresh", flush=True)
-        return None
+        print(f"[checkpoint] load failed ({e})", flush=True)
+        return None, LOAD_CORRUPT
     if data.get("schema") != _SCHEMA:
-        print(
-            f"[checkpoint] schema {data.get('schema')} != {_SCHEMA}; ignoring",
-            flush=True,
-        )
-        return None
+        print(f"[checkpoint] schema {data.get('schema')} != {_SCHEMA}", flush=True)
+        return None, LOAD_SCHEMA
+    return data, LOAD_OK
+
+
+def load_checkpoint(run_dir: str | Path) -> dict | None:
+    """Load a checkpoint, or ``None`` if absent / unreadable / wrong schema.
+
+    Backward-compatible wrapper over :func:`load_checkpoint_status` (which a
+    ``--resume`` path should prefer so it can tell absent from corrupt).
+    """
+    data, status = load_checkpoint_status(run_dir)
+    if status in (LOAD_CORRUPT, LOAD_SCHEMA):
+        print("[checkpoint] ignoring unusable checkpoint; starting fresh", flush=True)
     return data
 
 
@@ -119,5 +145,10 @@ __all__ = [
     "checkpoint_path",
     "save_checkpoint",
     "load_checkpoint",
+    "load_checkpoint_status",
+    "LOAD_OK",
+    "LOAD_ABSENT",
+    "LOAD_CORRUPT",
+    "LOAD_SCHEMA",
     "build_state",
 ]

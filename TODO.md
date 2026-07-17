@@ -8,6 +8,14 @@ network at its core, no per-game hand-coding, and no downloaded priors. First ta
 **Status:** Phase 0 COMPLETE (2026-07-16). Repo scaffolded, deps in, torch verified on P100, emulator +
 throughput + determinism proven, data contracts tested, GLM confined to one card. Next: Phase 1 (in progress).
 
+> **⚠️ ACTIVE (2026-07-17): fix ledger + efficacy/active-vision redesign → see
+> [`docs/specs/audit-fixes-and-active-vision.md`](docs/specs/audit-fixes-and-active-vision.md).**
+> A live-run diagnosis found gen-100 policies are near-constant, screen-blind linear perceptrons:
+> Go-Explore's restore+novelty harvested the fitness the policy should have earned, so evolution
+> applied ~0 pressure to see or act; the 8 RAM taps are never connected in topology. That doc tracks
+> all 39 verified audit findings + the efficacy redesign (fitness→policy coupling, RAM-tap wiring,
+> topology growth, decisive head) + the aggressive saccadic-fovea retina spine, before a fresh restart.
+
 ### Phase 0 — RESULTS (measured on this box)
 - **torch 2.7.1+cu126 runs on both P100s** (sm_60 kernels present, matmul OK on cuda:0 & cuda:1). Pin this; torch ≥2.8 drops Pascal.
 - **Single-core raw emulation: ~22,300 frames/s** (matches ~20k precedent).

@@ -125,12 +125,24 @@ def test_schema_version_is_int():
 # Config
 # --------------------------------------------------------------------------
 def test_config_defaults():
+    from pokeio.emu.env import ACTIONS
+
     c = Config()
     assert c.emu.frame_skip == 1  # Phase 1.5 default: per-frame reflex control
-    assert c.emu.action_space == 8
+    # A NOOP action was added (all buttons released) so the agent can stand
+    # still; the default action space is 9, not 8. Keep this pinned to the
+    # single source of truth in emu.env so the two can never silently drift.
+    assert c.emu.action_space == 9
+    assert "noop" in ACTIONS
+    assert len(ACTIONS) == c.emu.action_space
     assert c.evo.pop_size > 0
-    assert c.llm.model == "GLM-4.7-Flash"
+    # The served model name is lowercase (llama.cpp reports "glm-4.7-flash");
+    # the old "GLM-4.7-Flash" default case-mismatched and 404'd (audit A11).
+    assert c.llm.model == "glm-4.7-flash"
     assert c.llm.base_url.startswith("http")
+    # base_url must NOT carry the /v1 suffix (the client appends it) — a
+    # double-/v1 was one of the A11 findings.
+    assert not c.llm.base_url.rstrip("/").endswith("/v1")
     assert c.vision.n_channels >= 1
 
 

@@ -71,6 +71,33 @@ class WaveNovelty:
         # to decide when to capture a restorable state).
         self.last_key: list[bytes | None] = [None] * n_players
         self.last_new: list[bool] = [False] * n_players
+        # A7 — order-independent rarity baseline. ``archive.visit()`` is a shared
+        # MONOTONIC counter, so within one evaluation wave the k-th co-visitor of
+        # a fresh cell reads visit-count ``k-1`` and earns strictly less rarity
+        # credit than the (k-1)-th: a pure array-slot bias (low player index
+        # wins) that couples fitness to nothing but position. Instead we score
+        # every co-visitor of a cell against ONE baseline — the cell's visit
+        # count the first time it is reported this wave, which (because
+        # ``archive.visit`` only increases) equals its count at wave start. All
+        # co-visitors then share that baseline and earn EQUAL credit regardless
+        # of index/order. This intentionally changes rarity semantics: repeat
+        # visits to the same cell within a wave no longer see an escalating
+        # visit count. (WaveNovelty is per-wave, so this snapshot is per-wave;
+        # when the population fits one wave that is exactly the generation start.)
+        self._visit_baseline: dict[bytes, int] = {}
+
+    def _rarity_baseline(self, key: bytes, prior_visits: int) -> int:
+        """Return the shared, order-independent visit baseline for ``key``.
+
+        The first co-visitor of a cell this wave establishes the baseline; later
+        co-visitors reuse it. ``min`` makes it robust to any caller ordering
+        (``archive.visit`` is monotonic, so the first report already carries the
+        lowest count, but we do not rely on that)."""
+        base = self._visit_baseline.get(key)
+        if base is None or prior_visits < base:
+            base = int(prior_visits)
+            self._visit_baseline[key] = base
+        return base
 
     def observe(self, player_idx: int, screen: np.ndarray, wram: np.ndarray) -> bool:
         """Record one (screen, wram) for ``player_idx``.
@@ -107,7 +134,10 @@ class WaveNovelty:
             return False
 
         # rarity: rare / fresh cells are worth more; every distinct cell > 0.
-        self.fitness[player_idx] += self.floor + 1.0 / math.sqrt(1.0 + prior_visits)
+        # Score against the shared per-wave baseline (A7) so co-visitors of the
+        # same fresh cell earn equal credit regardless of player index.
+        base = self._rarity_baseline(key, prior_visits)
+        self.fitness[player_idx] += self.floor + 1.0 / math.sqrt(1.0 + base)
         return True
 
     def observe_key(
@@ -153,7 +183,9 @@ class WaveNovelty:
                 return True
             return False
 
-        self.fitness[player_idx] += self.floor + 1.0 / math.sqrt(1.0 + prior_visits)
+        # Shared per-wave baseline (A7): order-independent rarity credit.
+        base = self._rarity_baseline(key, prior_visits)
+        self.fitness[player_idx] += self.floor + 1.0 / math.sqrt(1.0 + base)
         return True
 
 

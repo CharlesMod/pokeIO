@@ -133,8 +133,12 @@ class RewardConfig:
 class LLMConfig:
     """GLM oversight client knobs (see TODO Phase 0 / Phase 3)."""
 
-    model: str = "GLM-4.7-Flash"
-    base_url: str = "http://127.0.0.1:8080/v1"
+    # Served model name is lowercase (llama.cpp reports "glm-4.7-flash"); the
+    # old "GLM-4.7-Flash" mismatched and 404'd. base_url must NOT carry the /v1
+    # suffix: the client appends "/v1/chat/completions" (and "/health") itself,
+    # so a trailing /v1 here produced a double "/v1/v1/..." 404. (audit A11)
+    model: str = "glm-4.7-flash"
+    base_url: str = "http://127.0.0.1:8080"
     # UD-Q3_K_XL (13.78GB): largest GLM-4.7-Flash quant that fits ENTIRELY on one
     # 16GB P100 with a 4k ctx (measured 13.75GB on card 0, card 1 free).
     quant: str = "UD-Q3_K_XL"

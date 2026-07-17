@@ -67,6 +67,7 @@ class MinerConfig:
     min_changes: int = 3            # need at least this many change-events (per candidate, summed)
     consider_pairs: bool = True     # also score 16-bit little-endian byte pairs
     mono_active_thresh: float = 0.75  # per-rollout monotonicity to count as "counter-like"
+    dedup_rollouts: bool = True     # drop byte-identical rollouts before scoring
 
     # -- activity band shape ----------------------------------------------
     activity_target: float = 0.15   # activity that scores best in the band
@@ -317,6 +318,24 @@ def mine(
     matrices = [m for m in matrices if m.shape[0] >= 2]
     if not matrices:
         return []
+
+    # De-duplicate byte-identical rollouts (audit A9). The champion replay that
+    # feeds this miner is a SINGLE deterministic rollout, so an unchanged
+    # champion+spawn produces the same trace every generation. Feeding N copies
+    # makes the cross-episode ``consistency`` feature read 1.0 for a one-time
+    # ramp (a rewarded tap): identical traces are not independent episodes. Keep
+    # one representative of each distinct trace so consistency reflects genuinely
+    # distinct rollouts.
+    if cfg.dedup_rollouts and len(matrices) > 1:
+        seen: set = set()
+        uniq: list[np.ndarray] = []
+        for m in matrices:
+            key = (m.shape, m.tobytes())
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(m)
+        matrices = uniq
 
     # sanity: all rollouts must share the WRAM width
     widths = {m.shape[1] for m in matrices}

@@ -446,9 +446,76 @@ _OP_STEP = 0
 _OP_RESET = 1
 _OP_SHUTDOWN = 2
 
-# Per-env emulator save_state blob is ~200 KB; bound the shared capture/restore
-# buffers a little above that. (Go-Explore state transport.)
-_MAX_STATE = 262144  # 256 KiB
+# Per-env emulator save_state blob is ~200 KB; this is only a FALLBACK bound for
+# the shared capture/restore buffers when the real size can't be probed (A5).
+# The live buffers are sized from an actual save_state measured at fleet init
+# (see ``_probe_state_len`` / ``_state_capacity``), so a larger-state game gets
+# buffers that fit instead of silently truncating every Go-Explore capture.
+_MAX_STATE = 262144  # 256 KiB (fallback only)
+
+# Headroom added over the probed save_state size so minor per-state variation
+# (RTC banks, mapper quirks) can never overflow the buffer and force a skip.
+_STATE_HEADROOM_MIN = 65536  # 64 KiB
+
+# --- A8: hung-worker watchdog -------------------------------------------------
+# The parent's barrier/ack hot-wait used to detect only a CRASHED worker
+# (is_alive()==False); a worker wedged in a pathological tick or a never-
+# returning save_state stays alive and busy-spins a parent core forever with no
+# diagnostic. A generous per-round wall-clock deadline turns that invisible hang
+# into a fail-fast RuntimeError naming the offending env index(es) + pid. The
+# budget is derived from the round's work (env count x steps) with a large
+# per-env-step margin so it can never false-trip a slow-but-legit round; it can
+# also be pinned via POKEIO_ROUND_DEADLINE_S (or the constructor) for tests.
+_PER_ENVSTEP_BUDGET_S = 0.5   # per env-step; ~40x the ~12 ms worst-case real step
+_ROUND_DEADLINE_FLOOR_S = 60.0
+try:
+    _ROUND_DEADLINE_ENV = float(os.environ.get("POKEIO_ROUND_DEADLINE_S", "") or 0.0)
+except ValueError:
+    _ROUND_DEADLINE_ENV = 0.0
+
+
+def _probe_state_len(rom_path, frame_skip, hold_frames, reset_state) -> int | None:
+    """Actual byte length of a PyBoy ``save_state`` for this ROM.
+
+    Mirrors :func:`_archive_key_len`: measure the real geometry once at fleet
+    init rather than trusting a hardcoded cap. Returns ``None`` if the probe
+    fails (caller falls back to :data:`_MAX_STATE`)."""
+    try:
+        import io as _io
+
+        from pokeio.emu.env import PokeEnv
+
+        env = PokeEnv(rom_path, frame_skip=frame_skip, hold_frames=hold_frames)
+        try:
+            env.reset(reset_state)
+            buf = _io.BytesIO()
+            env.pyboy.save_state(buf)  # exact call the workers make
+            return len(buf.getvalue())
+        finally:
+            env.close()
+    except Exception:
+        return None
+
+
+def _state_capacity(probe: int | None) -> int:
+    """Buffer size for a save_state blob: probed size + generous headroom."""
+    if not probe or probe <= 0:
+        return _MAX_STATE
+    return int(probe) + max(_STATE_HEADROOM_MIN, int(probe) // 4)
+
+
+def _store_capture(cap_state_row: np.ndarray, blob: bytes, cap: int) -> int:
+    """Write ``blob`` into ``cap_state_row`` iff it fits; NEVER truncate.
+
+    Returns the stored length, or ``-1`` when the blob is larger than the buffer
+    (the caller must then SKIP the capture — storing a truncated blob would
+    corrupt the archive entry and every restore made from it). This replaces the
+    old silent ``min(len(blob), _MAX_STATE)`` truncation (A5)."""
+    n = len(blob)
+    if n > cap:
+        return -1
+    cap_state_row[:n] = np.frombuffer(blob, dtype=np.uint8)
+    return n
 
 
 # Busy-spin by default. Counterintuitive but measured (2026-07 audit): on this
@@ -508,7 +575,7 @@ def _paced_wait(pred, nap: float = 2e-3) -> None:
 def _barrier_worker_main(
     slice_lo, slice_hi, rom_path, frame_skip, hold_frames, reset_state,
     obs_res, obs_ram, wram_stride, arch_kwargs, goexplore,
-    shm_names, n_envs, obs_dim, key_len, core,
+    shm_names, n_envs, obs_dim, key_len, core, state_cap,
 ):
     """Worker process: owns envs ``[slice_lo:slice_hi]``; hashes + encodes locally.
 
@@ -553,10 +620,11 @@ def _barrier_worker_main(
     dones = reg("dones", (n_envs,), np.uint8)
     cap_flag = reg("cap_flag", (n_envs,), np.uint8)
     cap_done = reg("cap_done", (n_envs,), np.uint8)
-    cap_state = reg("cap_state", (n_envs, _MAX_STATE), np.uint8)
+    cap_state = reg("cap_state", (n_envs, state_cap), np.uint8)
     cap_len = reg("cap_len", (n_envs,), np.int32)
+    cap_trunc = reg("cap_trunc", (n_envs,), np.int64)  # skipped (oversize) captures
     res_flag = reg("res_flag", (n_envs,), np.uint8)
-    res_state = reg("res_state", (n_envs, _MAX_STATE), np.uint8)
+    res_state = reg("res_state", (n_envs, state_cap), np.uint8)
     res_len = reg("res_len", (n_envs,), np.int32)
     # [0]=go_round [1]=op [2]=pace(1=realtime sleep-waits) [3+i]=wdone_i
     ctl = reg("ctl", (3 + n_envs,), np.int64)
@@ -573,6 +641,7 @@ def _barrier_worker_main(
         keys[global_i] = np.frombuffer(k, dtype=np.uint8)
 
     local_round = 1
+    warned_trunc = False
     try:
         while True:
             # Pace flag checked ONCE per round (not per spin iteration): when
@@ -606,10 +675,25 @@ def _barrier_worker_main(
                         buf = _io.BytesIO()
                         env.pyboy.save_state(buf)
                         blob = buf.getvalue()
-                        n = min(len(blob), _MAX_STATE)
-                        cap_state[gi, :n] = np.frombuffer(blob[:n], dtype=np.uint8)
-                        cap_len[gi] = n
-                        cap_done[gi] = 1
+                        n = _store_capture(cap_state[gi], blob, state_cap)
+                        if n < 0:
+                            # Too big for the buffer: SKIP, never truncate (a
+                            # truncated blob would corrupt every restore made
+                            # from this cell). Count it so the parent can flag it.
+                            cap_done[gi] = 0
+                            cap_trunc[gi] += 1
+                            if not warned_trunc:
+                                import sys as _sys
+                                print(
+                                    f"[fleet pid={os.getpid()}] save_state "
+                                    f"{len(blob)}B > cap {state_cap}B; SKIPPING "
+                                    f"Go-Explore capture (env {gi}) — raise "
+                                    f"buffer headroom", file=_sys.stderr, flush=True,
+                                )
+                                warned_trunc = True
+                        else:
+                            cap_len[gi] = n
+                            cap_done[gi] = 1
                     else:
                         cap_done[gi] = 0
                     screen, w64, done = env.step_fast(int(actions[gi]), wram_stride)
@@ -657,6 +741,7 @@ class BarrierFleet:
         wram_stride: int = 64,
         goexplore: bool = False,
         envs_per_worker: int = 1,
+        round_deadline_s: float | None = None,
     ):
         self.n_envs = int(n_envs)
         self.obs_dim = int(obs_dim)
@@ -666,6 +751,19 @@ class BarrierFleet:
         # Derive the fixed cell-key length from the archive's geometry.
         probe = _archive_key_len(archive_kwargs, wram_stride)
         self.key_len = probe
+
+        # A5: size the Go-Explore state buffers from an ACTUAL save_state (probed
+        # once here, mirroring the key-length probe) instead of a hardcoded cap,
+        # so a larger-state game never silently truncates a capture. Only worth
+        # the ~1 emulator boot when go-explore is on; otherwise the (unused)
+        # buffers stay at the fallback size.
+        self.state_cap = (
+            _state_capacity(
+                _probe_state_len(rom_path, frame_skip, hold_frames, reset_state)
+            )
+            if self.goexplore
+            else _MAX_STATE
+        )
 
         # ------------------------------------------------------------ shm
         self._blocks: dict[str, shared_memory.SharedMemory] = {}
@@ -685,10 +783,11 @@ class BarrierFleet:
         alloc("dones", (n,), np.uint8)
         alloc("cap_flag", (n,), np.uint8)
         alloc("cap_done", (n,), np.uint8)
-        alloc("cap_state", (n, _MAX_STATE), np.uint8)
+        alloc("cap_state", (n, self.state_cap), np.uint8)
         alloc("cap_len", (n,), np.int32)
+        alloc("cap_trunc", (n,), np.int64)  # A5: skipped (oversize) captures
         alloc("res_flag", (n,), np.uint8)
-        alloc("res_state", (n, _MAX_STATE), np.uint8)
+        alloc("res_state", (n, self.state_cap), np.uint8)
         alloc("res_len", (n,), np.int32)
         alloc("ctl", (3 + n,), np.int64)
 
@@ -702,6 +801,11 @@ class BarrierFleet:
         self._ctx = mp.get_context("spawn")
         core_order = _numa_core_order()
         epw = max(1, int(envs_per_worker))
+        self._epw = epw
+        # A8: generous per-round wall-clock deadline (see module constants).
+        self._round_budget = _ROUND_DEADLINE_ENV or round_deadline_s or max(
+            _ROUND_DEADLINE_FLOOR_S, epw * _PER_ENVSTEP_BUDGET_S
+        )
         self._procs: list = []
         self._slices: list[tuple[int, int]] = []
         wi = 0
@@ -714,7 +818,7 @@ class BarrierFleet:
                     lo, hi, rom_path, frame_skip, hold_frames, reset_state,
                     obs_res, obs_ram, self.wram_stride, dict(archive_kwargs),
                     self.goexplore, self._shm_names, n, self.obs_dim,
-                    self.key_len, core,
+                    self.key_len, core, self.state_cap,
                 ),
                 daemon=True,
             )
@@ -745,11 +849,31 @@ class BarrierFleet:
         self._release_round(op)
         self._await_round()
 
+    def _round_timeout_error(self, target: int) -> RuntimeError:
+        """Build a diagnostic for a round that blew its wall-clock deadline (A8).
+
+        A crashed worker never flips its flag AND fails ``is_alive`` (caught by
+        the liveness guard); a HUNG-but-alive worker never flips its flag yet
+        stays alive, so only the deadline catches it. Names the stuck env
+        index(es) and the owning worker pid so the wedge is actionable."""
+        wdone = self._ctl[3:3 + self.n_envs]
+        stuck = [i for i in range(self.n_envs) if int(wdone[i]) < target]
+        parts = []
+        for (lo, hi), p in zip(self._slices, self._procs):
+            owned = [i for i in stuck if lo <= i < hi]
+            if owned:
+                parts.append(f"envs{owned}@pid{p.pid}(alive={p.is_alive()})")
+        return RuntimeError(
+            f"BarrierFleet round exceeded {self._round_budget:.1f}s deadline; "
+            f"hung worker(s): {'; '.join(parts) or 'unknown'} — aborting"
+        )
+
     def _await_round(self) -> None:
         target = self._round
         ctl = self._ctl
         n = self.n_envs
         wdone = ctl[3:3 + n]
+        deadline = time.monotonic() + self._round_budget
         i = 0
         if self._paced:
             # Realtime spectate: the parent sleeps too (the p-state clamp is
@@ -757,31 +881,41 @@ class BarrierFleet:
             while not bool((wdone >= target).all()):
                 time.sleep(1e-3)
                 i += 1
-                if i % 1000 == 0 and any(not p.is_alive() for p in self._procs):
-                    raise RuntimeError(
-                        "BarrierFleet worker died mid-round; aborting (see stderr)"
-                    )
+                if i % 1000 == 0:
+                    if any(not p.is_alive() for p in self._procs):
+                        raise RuntimeError(
+                            "BarrierFleet worker died mid-round; aborting (see stderr)"
+                        )
+                    if time.monotonic() > deadline:
+                        raise self._round_timeout_error(target)
             return
         if not _NAP:
             # Hot wait (see _NAP): never sleep, or this core drops to 1.2 GHz and
-            # the next forward/bookkeeping phase runs 2.6x slow. Liveness guard
-            # kept on a coarse period.
+            # the next forward/bookkeeping phase runs 2.6x slow. Liveness +
+            # deadline guards kept on a coarse period.
             while not bool((wdone >= target).all()):
                 i += 1
-                if i % 200000 == 0 and any(not p.is_alive() for p in self._procs):
-                    raise RuntimeError(
-                        "BarrierFleet worker died mid-round; aborting (see stderr)"
-                    )
+                if i % 200000 == 0:
+                    if any(not p.is_alive() for p in self._procs):
+                        raise RuntimeError(
+                            "BarrierFleet worker died mid-round; aborting (see stderr)"
+                        )
+                    if time.monotonic() > deadline:
+                        raise self._round_timeout_error(target)
             return
         while not bool((wdone >= target).all()):
             i += 1
             if i >= 3000:
-                # Liveness guard: a crashed worker can never flip its flag, so
-                # spinning forever would wedge the whole run. Check periodically.
-                if i % 20000 == 0 and any(not p.is_alive() for p in self._procs):
-                    raise RuntimeError(
-                        "BarrierFleet worker died mid-round; aborting (see stderr)"
-                    )
+                # Liveness + deadline guards: a crashed worker can never flip its
+                # flag (caught by is_alive), a hung-but-alive one only by the
+                # deadline. Checked periodically so the spin stays cheap.
+                if i % 20000 == 0:
+                    if any(not p.is_alive() for p in self._procs):
+                        raise RuntimeError(
+                            "BarrierFleet worker died mid-round; aborting (see stderr)"
+                        )
+                    if time.monotonic() > deadline:
+                        raise self._round_timeout_error(target)
                 time.sleep(5e-5)
 
     # ------------------------------------------------------------------ control
@@ -793,11 +927,24 @@ class BarrierFleet:
         self.arr["res_flag"][:] = 0
         if restore and self.goexplore:
             for idx, blob in restore.items():
-                b = blob[:_MAX_STATE]
-                self.arr["res_state"][idx, : len(b)] = np.frombuffer(b, dtype=np.uint8)
-                self.arr["res_len"][idx] = len(b)
+                if len(blob) > self.state_cap:
+                    # Never restore a truncated state (A5): captures are never
+                    # stored truncated, so this should not happen — skip rather
+                    # than load a corrupt partial blob.
+                    continue
+                self.arr["res_state"][idx, : len(blob)] = np.frombuffer(
+                    blob, dtype=np.uint8
+                )
+                self.arr["res_len"][idx] = len(blob)
                 self.arr["res_flag"][idx] = 1
         self._release_round(_OP_RESET)
+
+    @property
+    def state_truncations(self) -> int:
+        """Total Go-Explore captures SKIPPED because the blob outgrew the buffer
+        (A5). Non-zero means the probed buffer headroom is too small — captures
+        are dropped, never truncated, so the archive stays uncorrupted."""
+        return int(self.arr["cap_trunc"].sum()) if "cap_trunc" in self.arr else 0
 
     def reset_all_end(self) -> np.ndarray:
         """Wait for the reset round released by :meth:`reset_all_begin`."""
@@ -922,7 +1069,7 @@ _OP_RUN = 3  # barrier ops: 0=step 1=reset 2=shutdown (shared numbering)
 def _async_worker_main(
     slice_lo, slice_hi, rom_path, frame_skip, hold_frames, reset_state,
     obs_res, obs_ram, wram_stride, arch_kwargs, goexplore,
-    shm_names, n_envs, obs_dim, key_len, core,
+    shm_names, n_envs, obs_dim, key_len, core, state_cap,
 ):
     """Free-running worker: owns envs ``[slice_lo:slice_hi]``.
 
@@ -963,10 +1110,11 @@ def _async_worker_main(
     act_seq = reg("act_seq", (n_envs,), np.int64)
     cap_flag = reg("cap_flag", (n_envs,), np.uint8)
     cap_done = reg("cap_done", (n_envs,), np.uint8)
-    cap_state = reg("cap_state", (n_envs, _MAX_STATE), np.uint8)
+    cap_state = reg("cap_state", (n_envs, state_cap), np.uint8)
     cap_len = reg("cap_len", (n_envs,), np.int32)
+    cap_trunc = reg("cap_trunc", (n_envs,), np.int64)  # skipped (oversize) captures
     res_flag = reg("res_flag", (n_envs,), np.uint8)
-    res_state = reg("res_state", (n_envs, _MAX_STATE), np.uint8)
+    res_state = reg("res_state", (n_envs, state_cap), np.uint8)
     res_len = reg("res_len", (n_envs,), np.int32)
     # [0]=round [1]=op [2]=pace [3]=target_steps [4+i]=ack_i
     ctl = reg("ctl", (4 + n_envs,), np.int64)
@@ -981,6 +1129,7 @@ def _async_worker_main(
 
     tap_ver = 0
     taps: list[tuple[int, int]] = []  # (obs column, GB address)
+    warned_trunc = False
 
     def _emit(gi, env, screen, w64):
         screens[gi] = screen
@@ -1050,13 +1199,25 @@ def _async_worker_main(
                         buf = _io.BytesIO()
                         env.pyboy.save_state(buf)
                         blob = buf.getvalue()
-                        nb = min(len(blob), _MAX_STATE)
-                        cap_state[gi, :nb] = np.frombuffer(
-                            blob[:nb], dtype=np.uint8
-                        )
-                        cap_len[gi] = nb
+                        nb = _store_capture(cap_state[gi], blob, state_cap)
                         cap_flag[gi] = 0
-                        cap_done[gi] = 1
+                        if nb < 0:
+                            # Too big: SKIP, never truncate (A5) — a truncated
+                            # blob would corrupt every restore from this cell.
+                            cap_done[gi] = 0
+                            cap_trunc[gi] += 1
+                            if not warned_trunc:
+                                import sys as _sys
+                                print(
+                                    f"[fleet pid={os.getpid()}] save_state "
+                                    f"{len(blob)}B > cap {state_cap}B; SKIPPING "
+                                    f"Go-Explore capture (env {gi}) — raise "
+                                    f"buffer headroom", file=_sys.stderr, flush=True,
+                                )
+                                warned_trunc = True
+                        else:
+                            cap_len[gi] = nb
+                            cap_done[gi] = 1
                     screen, w64, done = env.step_fast(
                         int(actions[gi]), wram_stride
                     )
@@ -1116,6 +1277,7 @@ class AsyncFleet:
         wram_stride: int = 64,
         goexplore: bool = False,
         envs_per_worker: int = 1,
+        round_deadline_s: float | None = None,
     ):
         self.n_envs = int(n_envs)
         self.obs_dim = int(obs_dim)
@@ -1123,6 +1285,14 @@ class AsyncFleet:
         self.goexplore = bool(goexplore)
         self.wram_stride = int(wram_stride)
         self.key_len = _archive_key_len(archive_kwargs, wram_stride)
+        # A5: probe the real save_state size to size the transport buffers.
+        self.state_cap = (
+            _state_capacity(
+                _probe_state_len(rom_path, frame_skip, hold_frames, reset_state)
+            )
+            if self.goexplore
+            else _MAX_STATE
+        )
 
         self._blocks: dict[str, shared_memory.SharedMemory] = {}
         self.arr: dict[str, np.ndarray] = {}
@@ -1143,10 +1313,11 @@ class AsyncFleet:
         alloc("act_seq", (n,), np.int64)
         alloc("cap_flag", (n,), np.uint8)
         alloc("cap_done", (n,), np.uint8)
-        alloc("cap_state", (n, _MAX_STATE), np.uint8)
+        alloc("cap_state", (n, self.state_cap), np.uint8)
         alloc("cap_len", (n,), np.int32)
+        alloc("cap_trunc", (n,), np.int64)  # A5: skipped (oversize) captures
         alloc("res_flag", (n,), np.uint8)
-        alloc("res_state", (n, _MAX_STATE), np.uint8)
+        alloc("res_state", (n, self.state_cap), np.uint8)
         alloc("res_len", (n,), np.int32)
         alloc("ctl", (4 + n,), np.int64)
         # mined progress-counter taps: [0]=version, [1:]=GB addresses (0=unset).
@@ -1163,7 +1334,13 @@ class AsyncFleet:
         self._ctx = mp.get_context("spawn")
         core_order = _numa_core_order()
         epw = max(1, int(envs_per_worker))
+        self._epw = epw
+        # A8: per-round/-wave wall-clock deadline. None -> derive generously in
+        # _await_acks from the wave's step budget (see _await_budget_for).
+        self._deadline_override = _ROUND_DEADLINE_ENV or round_deadline_s or None
+        self._await_budget = _ROUND_DEADLINE_FLOOR_S
         self._procs: list = []
+        self._slices: list[tuple[int, int]] = []
         wi = 0
         for lo in range(0, n, epw):
             hi = min(lo + epw, n)
@@ -1174,12 +1351,13 @@ class AsyncFleet:
                     lo, hi, rom_path, frame_skip, hold_frames, reset_state,
                     obs_res, obs_ram, self.wram_stride, dict(archive_kwargs),
                     self.goexplore, self._shm_names, n, self.obs_dim,
-                    self.key_len, core,
+                    self.key_len, core, self.state_cap,
                 ),
                 daemon=True,
             )
             p.start()
             self._procs.append(p)
+            self._slices.append((lo, hi))
             wi += 1
         self.n_workers = len(self._procs)
         self._closed = False
@@ -1205,21 +1383,55 @@ class AsyncFleet:
         cfg[0] += 1  # version bump LAST (x86 TSO: workers see addrs first)
 
     # ------------------------------------------------------------------ rounds
+    def _await_budget_for(self, op: int, target: int) -> float:
+        """Generous wall-clock deadline for the round just released (A8).
+
+        A free-run wave lets each owned env run ``target`` steps, so the budget
+        scales with ``envs_per_worker * target`` at a large per-env-step margin;
+        reset rounds get the floor. An explicit override (env/ctor) wins."""
+        if self._deadline_override:
+            return float(self._deadline_override)
+        if op == _OP_RUN:
+            return max(
+                _ROUND_DEADLINE_FLOOR_S,
+                self._epw * max(1, int(target)) * _PER_ENVSTEP_BUDGET_S,
+            )
+        return max(_ROUND_DEADLINE_FLOOR_S, self._epw * _PER_ENVSTEP_BUDGET_S)
+
     def _release(self, op: int, target: int = 0) -> None:
+        self._await_budget = self._await_budget_for(op, target)
         self._round += 1
         self._ctl[1] = op
         self._ctl[3] = target
         self._ctl[0] = self._round  # release LAST
 
+    def _acks_timeout_error(self, target: int) -> RuntimeError:
+        """Diagnostic for a wave/reset that blew its deadline: a hung-but-alive
+        worker never acks yet passes is_alive, so only the deadline catches it."""
+        acks = self._ctl[4:4 + self.n_envs]
+        stuck = [i for i in range(self.n_envs) if int(acks[i]) < target]
+        parts = []
+        for (lo, hi), p in zip(self._slices, self._procs):
+            owned = [i for i in stuck if lo <= i < hi]
+            if owned:
+                parts.append(f"envs{owned}@pid{p.pid}(alive={p.is_alive()})")
+        return RuntimeError(
+            f"AsyncFleet round exceeded {self._await_budget:.1f}s deadline; "
+            f"hung worker(s): {'; '.join(parts) or 'unknown'} — aborting"
+        )
+
     def _await_acks(self) -> None:
         acks = self._ctl[4:4 + self.n_envs]
         target = self._round
+        deadline = time.monotonic() + self._await_budget
         i = 0
         while not bool((acks >= target).all()):
             time.sleep(1e-3 if self._paced else 5e-5)
             i += 1
             if i % 2000 == 0:
                 self.check_alive()
+                if time.monotonic() > deadline:
+                    raise self._acks_timeout_error(target)
 
     def check_alive(self) -> None:
         if any(not p.is_alive() for p in self._procs):
@@ -1227,17 +1439,26 @@ class AsyncFleet:
                 "AsyncFleet worker died mid-wave; aborting (see stderr)"
             )
 
+    @property
+    def state_truncations(self) -> int:
+        """Total Go-Explore captures SKIPPED because the blob outgrew the buffer
+        (A5) — dropped, never truncated, so the archive stays uncorrupted."""
+        return int(self.arr["cap_trunc"].sum()) if "cap_trunc" in self.arr else 0
+
     # ------------------------------------------------------------------ control
     def reset_all_begin(self, restore: dict[int, bytes] | None = None) -> None:
         """Ship restore blobs + release the reset round WITHOUT waiting."""
         self.arr["res_flag"][:] = 0
         if restore and self.goexplore:
             for idx, blob in restore.items():
-                b = blob[:_MAX_STATE]
-                self.arr["res_state"][idx, : len(b)] = np.frombuffer(
-                    b, dtype=np.uint8
+                if len(blob) > self.state_cap:
+                    # Never restore a truncated state (A5); captures are never
+                    # stored truncated, so this is a defensive skip.
+                    continue
+                self.arr["res_state"][idx, : len(blob)] = np.frombuffer(
+                    blob, dtype=np.uint8
                 )
-                self.arr["res_len"][idx] = len(b)
+                self.arr["res_len"][idx] = len(blob)
                 self.arr["res_flag"][idx] = 1
         # No worker reads act_seq during a reset round; park every env before
         # the wave so nothing steps until the parent issues its first action.

@@ -55,6 +55,35 @@ DEFAULT_MODEL = "glm-4.7-flash"
 # runs/llm_cache/ relative to the repo root (…/pokeIO/pokeio/llm/client.py -> parents[2]).
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parents[2] / "runs" / "llm_cache"
 
+# Bump to invalidate every on-disk cache entry when the request/reply contract
+# changes (a prompt-format fix, a schema-handling change, …). Entries tagged
+# with a different version are treated as cache misses. See _cache_key/_cache_get.
+CACHE_VERSION = 1
+
+
+def _normalize_base_url(url: str | None) -> str:
+    """Normalize an LLM server base URL for this client.
+
+    The client always appends its own path (``/v1/chat/completions`` for the
+    chat API, ``/completion`` for the native one), so a ``base_url`` that
+    already ends in ``/v1`` would produce a double ``/v1`` on the wire. Strip
+    exactly one trailing ``/v1`` segment (plus any trailing slashes).
+    """
+    u = (url or DEFAULT_BASE_URL).strip().rstrip("/")
+    if u.endswith("/v1"):
+        u = u[:-3]
+    return u.rstrip("/")
+
+
+def _normalize_model(model: str | None) -> str:
+    """Normalize a model alias to the served (lowercase) form.
+
+    llama-swap routes on a lowercase alias in this project (``glm-4.7-flash``)
+    while the config default is mixed-case (``GLM-4.7-Flash``); lowercasing
+    avoids a routing miss. Applied defensively, only via :meth:`from_config`.
+    """
+    return (model or DEFAULT_MODEL).strip().lower()
+
 
 class LLMError(RuntimeError):
     """Raised when the server cannot be reached or returns an unusable reply."""
@@ -183,10 +212,42 @@ class LlamaClient:
     max_tokens: int = 1024
     cache_dir: Path = field(default_factory=lambda: DEFAULT_CACHE_DIR)
     schema_retries: int = 2  # extra repair attempts when a schema is supplied
+    # -- cache invalidation ------------------------------------------------- #
+    served_fingerprint: str | None = None  # served-model id/hash mixed into keys
+    cache_ttl: float | None = None  # seconds; older entries are treated as misses
+    cache_schema_replies: bool = True  # gate: cache schema-validated replies?
 
     def __post_init__(self) -> None:
         self.base_url = self.base_url.rstrip("/")
         self.cache_dir = Path(self.cache_dir)
+
+    # -- construction ------------------------------------------------------ #
+    @classmethod
+    def from_config(cls, cfg: Any) -> "LlamaClient":
+        """Build a client from an :class:`~pokeio.config.LLMConfig`-like object.
+
+        Normalizes defensively: strips a trailing ``/v1`` from ``base_url`` (the
+        client appends its own) and lowercases the ``model`` alias, so a config
+        whose ``base_url`` is ``http://host:8080/v1`` and whose ``model`` is
+        ``GLM-4.7-Flash`` does not double the path or miss llama-swap routing.
+        Maps ``timeout_s``/``max_retries``/``temperature``/``cache_dir`` across.
+        Duck-typed: any object exposing those attributes works, so this module
+        keeps zero import dependency on :mod:`pokeio.config`.
+        """
+        base_url = _normalize_base_url(getattr(cfg, "base_url", DEFAULT_BASE_URL))
+        model = _normalize_model(getattr(cfg, "model", DEFAULT_MODEL))
+        timeout = getattr(cfg, "timeout_s", None)
+        if timeout is None:
+            timeout = getattr(cfg, "timeout", 120.0)
+        cache_dir = getattr(cfg, "cache_dir", None) or DEFAULT_CACHE_DIR
+        return cls(
+            base_url=base_url,
+            model=model,
+            timeout=float(timeout),
+            max_retries=int(getattr(cfg, "max_retries", 3)),
+            temperature=float(getattr(cfg, "temperature", 0.7)),
+            cache_dir=Path(cache_dir),
+        )
 
     # -- public API -------------------------------------------------------- #
     def complete(
@@ -210,14 +271,19 @@ class LlamaClient:
         max_tokens = self.max_tokens if max_tokens is None else max_tokens
 
         key = self._cache_key(prompt, schema, system, temperature, max_tokens)
-        if use_cache:
+        # Schema replies can be plausible-but-wrong (validated once, still not
+        # what we wanted); gate their caching behind cache_schema_replies so a
+        # suspect reply can be forced to regenerate without touching free-text.
+        cache_ok = use_cache and (schema is None or self.cache_schema_replies)
+        if cache_ok:
             cached = self._cache_get(key)
             if cached is not None:
                 return cached["result"]
 
         if schema is None:
             text = self._request(prompt, system, temperature, max_tokens)
-            self._cache_put(key, {"result": text, "raw": text})
+            if cache_ok:
+                self._cache_put(key, {"result": text, "raw": text})
             return text
 
         # Schema path: request, parse, validate; repair-loop on failure.
@@ -242,7 +308,8 @@ class LlamaClient:
                     "Return corrected JSON only."
                 )
                 continue
-            self._cache_put(key, {"result": value, "raw": text})
+            if cache_ok:
+                self._cache_put(key, {"result": value, "raw": text})
             return value
         raise SchemaError(f"schema validation failed after retries: {last_err}")
 
@@ -349,6 +416,10 @@ class LlamaClient:
     ) -> str:
         blob = orjson.dumps(
             {
+                # cache_version + served-model fingerprint invalidate stale
+                # replies when the contract or the served weights change.
+                "cache_version": CACHE_VERSION,
+                "fingerprint": self.served_fingerprint or self.model,
                 "base_url": self.base_url,
                 "model": self.model,
                 "api": self.api,
@@ -370,14 +441,28 @@ class LlamaClient:
         if not path.exists():
             return None
         try:
-            return orjson.loads(path.read_bytes())
+            rec = orjson.loads(path.read_bytes())
         except (orjson.JSONDecodeError, OSError):
             return None
+        if not isinstance(rec, dict):
+            return None
+        # Entries written by an older CACHE_VERSION (or the pre-versioned format,
+        # which has no "v") are treated as misses so a bump invalidates cleanly.
+        if rec.get("v") != CACHE_VERSION:
+            return None
+        if self.cache_ttl is not None:
+            ts = rec.get("ts")
+            if not isinstance(ts, (int, float)) or (time.time() - ts) > self.cache_ttl:
+                return None
+        return rec
 
     def _cache_put(self, key: str, value: dict) -> None:
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            self._cache_path(key).write_bytes(orjson.dumps(value))
+            rec = dict(value)
+            rec["v"] = CACHE_VERSION
+            rec.setdefault("ts", time.time())
+            self._cache_path(key).write_bytes(orjson.dumps(rec))
         except OSError:
             pass  # cache is best-effort; never fail a completion over it
 

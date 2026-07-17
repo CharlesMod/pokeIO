@@ -9,6 +9,14 @@ Addresses are Pokémon YELLOW-specific (pret/pokeyellow); Yellow shifts a few
 vs Red/Blue. Every field is validated against real game states before being
 trusted — unverified/uninitialised reads surface as ``None`` rather than
 garbage. See MAP_NAMES / _ADDR below for the source-of-truth table.
+
+QUARANTINE: the hardcoded Yellow tables (``_ADDR``, ``MAP_NAMES``,
+``BADGE_NAMES``) are the game-specific fallback. When a Progress Manifest is
+passed, :func:`decode` only applies them if the manifest's ``game`` is Yellow
+(:func:`game_is_yellow`); for any other game it decodes generically from the
+manifest's spatial RAM taps, so Yellow labels can never leak onto a second
+game. With no manifest (the current default) the Yellow path is used, keeping
+the existing dashboard working unchanged.
 """
 
 from __future__ import annotations
@@ -109,8 +117,52 @@ def _bcd3(wram: np.ndarray, addr: int) -> int | None:
     return int(digits)
 
 
-def decode(wram: np.ndarray) -> GameState:
-    """Decode one WRAM snapshot into a :class:`GameState`."""
+def game_is_yellow(manifest) -> bool:
+    """True iff ``manifest`` names Pokémon Yellow (case-insensitive substring).
+
+    The gate that quarantines the Yellow tables: only a Yellow manifest may
+    apply Yellow map/badge labels. ``None`` returns False — callers treat a
+    missing manifest as the legacy Yellow default separately.
+    """
+    if manifest is None:
+        return False
+    game = str(getattr(manifest, "game", "") or "")
+    return "yellow" in game.lower()
+
+
+def _parse_addr(value) -> int | None:
+    """Coerce ``0xD35E`` / ``"0xD35E"`` / ``54622`` into an int, else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        try:
+            return int(s, 16) if s.lower().startswith("0x") else int(s)
+        except ValueError:
+            return None
+    return None
+
+
+def _manifest_spatial_addrs(manifest) -> dict[str, int]:
+    """Extract map_id/x/y taps from ``manifest.spatial.source.ram`` (best-effort)."""
+    out: dict[str, int] = {}
+    spatial = getattr(manifest, "spatial", None) or {}
+    if not isinstance(spatial, dict):
+        return out
+    src = spatial.get("source", {})
+    ram = src.get("ram", {}) if isinstance(src, dict) else {}
+    if isinstance(ram, dict):
+        for key in ("map_id", "x", "y"):
+            addr = _parse_addr(ram.get(key))
+            if addr is not None:
+                out[key] = addr
+    return out
+
+
+def _decode_yellow(wram: np.ndarray) -> GameState:
+    """Decode using the hardcoded Yellow tables (the game-specific fallback)."""
     mid = _b(wram, _ADDR["map_id"])
     party = _b(wram, _ADDR["party_count"])
     party_out = None if party in (0xFF,) else party if party <= 6 else None
@@ -128,4 +180,39 @@ def decode(wram: np.ndarray) -> GameState:
     )
 
 
-__all__ = ["GameState", "decode", "MAP_NAMES", "WRAM_BASE"]
+def _decode_generic(wram: np.ndarray, manifest) -> GameState:
+    """Decode a non-Yellow game from the manifest's spatial taps only.
+
+    No Yellow labels: map names are numeric and the semantic fields (party,
+    badges, money) surface as ``None`` since their meaning is game-specific and
+    unknown here. This is the leak-proof path for a second game.
+    """
+    addrs = _manifest_spatial_addrs(manifest)
+    mid = _b(wram, addrs["map_id"]) if "map_id" in addrs else 0
+    x = _b(wram, addrs["x"]) if "x" in addrs else 0
+    y = _b(wram, addrs["y"]) if "y" in addrs else 0
+    return GameState(
+        map_id=mid,
+        map_name=f"map ${mid:02X}",
+        pos=(x, y),
+        party_count=None,
+        badges=None,
+        badge_count=None,
+        money=None,
+        in_battle=False,
+    )
+
+
+def decode(wram: np.ndarray, manifest=None) -> GameState:
+    """Decode one WRAM snapshot into a :class:`GameState`.
+
+    With no manifest (the legacy default) or a Yellow manifest, the hardcoded
+    Yellow tables are used. With a non-Yellow manifest, decoding falls back to
+    the manifest's spatial RAM taps and emits no Yellow-specific labels.
+    """
+    if manifest is None or game_is_yellow(manifest):
+        return _decode_yellow(wram)
+    return _decode_generic(wram, manifest)
+
+
+__all__ = ["GameState", "decode", "game_is_yellow", "MAP_NAMES", "WRAM_BASE"]

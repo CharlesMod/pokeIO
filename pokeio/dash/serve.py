@@ -6,6 +6,18 @@ over Tailscale (never localhost for this box).
 
     python -m pokeio.dash.serve --port 8600 [--run <run_id>]
 
+HONESTY NOTE — what the served data actually reflects
+-----------------------------------------------------
+The live signal this server exposes (``/api/telemetry``, ``/api/live``) is the
+REAL run: **novelty + mined-progress** reward terms and the champion network.
+There is **no live "GLM judge", no co-evolved reward-genome population, and no
+anti-Goodhart oversight loop** running — LLM oversight is NOT yet wired. Some
+``wall.html`` panels (notably "Reward Genome" with its "co-evolved · unsupervised"
+and "LLM judge" labels, and the "GLM judge" tag on GPU 0) are **static
+placeholder mock-ups**, not backed by any endpoint here; treat them as
+aspirational UI, not telemetry. Those strings live in ``wall.html`` (not owned by
+this module); this server never fabricates a judge/co-evolution signal.
+
 Endpoints
 ---------
 * ``GET /``                      → wall.html

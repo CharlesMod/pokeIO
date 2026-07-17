@@ -10,8 +10,16 @@ the CPU, but as a single batched set of torch tensors and with **zero per-frame
     motion   (N, S, S)   (coarse_t - coarse_{t-1} + 1) / 2  (0.5 on first frame)
     ram_aux  (N, K)      placeholder zeros (kept for shape-parity with ObsBuilder)
 
-Exactness vs the CPU reference
-------------------------------
+EXPERIMENTAL / benchmark-only, NOT for production
+-------------------------------------------------
+This module backs the throughput benchmarks (``scripts/bench_40k.py``); the
+production obs path is the CPU ``vision.preprocess.ObsBuilder``. Its shade
+normalization is **NOT bit-identical** to ObsBuilder (see the LUT caveat below),
+so do not wire it into a real run expecting parity — fix the LUT to match
+ObsBuilder's per-frame ranking first.
+
+Parity vs the CPU reference
+---------------------------
 * **coarse** uses the *identical* area-overlap resample matrices ObsBuilder
   builds (ported from ``preprocess._area_matrix``), so it is an exact
   area-average downscale — not ``F.interpolate``, whose non-integer-ratio 'area'
@@ -21,12 +29,16 @@ Exactness vs the CPU reference
   trips to the CPU) and applies the same ``(d+1)/2`` mapping.
 * **shade normalization** uses a cached 256-entry LUT instead of ``np.unique``.
   The LUT maps the (fixed, hardware) DMG palette shade values onto the evenly
-  spaced levels ObsBuilder assigns when all shades are present. This is exact
-  for any frame whose distinct shades are the full palette (the overwhelmingly
-  common case, incl. all real gameplay frames). It only diverges from
-  ObsBuilder's *per-frame re-ranking* on a frame that contains a strict interior
-  subset of the palette (e.g. only the two middle shades) — a degenerate case
-  that does not occur in normal play. See ``normalize_shades`` for the fallback.
+  spaced levels ObsBuilder assigns *when all four shades are present*. It is
+  exact only for full-palette frames. ObsBuilder instead re-ranks the shades
+  **present in each frame**, so the LUT DIVERGES on any partial-palette frame:
+    - **uniform frame** (one shade): ObsBuilder returns all-zeros (a flat frame
+      is "darkest"); the LUT returns that shade's full-palette level — so an
+      all-bright frame INVERTS (LUT ~1.0 vs CPU 0.0).
+    - **interior subset** (e.g. only the two middle shades): ObsBuilder ranks
+      them to {0, 1}; the LUT keeps their full-palette levels {1/3, 2/3}.
+  These do not occur in typical gameplay but are real divergences, hence
+  benchmark-only. See ``normalize_shades``.
 
 Kernel strategy: the whole thing is a handful of large batched torch ops
 (indexing gather + two matmuls + a slice + a subtract). For batches of a few
@@ -51,12 +63,13 @@ from pokeio.vision.preprocess import _area_matrix
 DMG_SHADES = (24, 88, 184, 248)
 
 
-def build_shade_lut(shades=DMG_SHADES, n_levels: int = 4) -> np.ndarray:
+def build_shade_lut(shades=DMG_SHADES) -> np.ndarray:
     """(256,) float32 LUT: palette value -> normalized level; others -> v/255.
 
-    Replicates ObsBuilder.normalize_shades for the full-palette case without a
-    per-frame ``np.unique``. Non-palette bytes fall back to ``v/255`` so a stray
-    value never crashes (it just won't be bit-exact — irrelevant for DMG).
+    Replicates ObsBuilder.normalize_shades for the FULL-palette case only,
+    without a per-frame ``np.unique``. Non-palette bytes fall back to ``v/255``
+    so a stray value never crashes. Partial-palette frames diverge from
+    ObsBuilder's per-frame ranking (see module docstring) — benchmark-only.
     """
     lut = (np.arange(256, dtype=np.float32) / 255.0)
     shades = sorted(set(int(s) for s in shades))
@@ -106,7 +119,7 @@ class GPUVision:
         self._row = torch.from_numpy(row).to(self.device, torch.float64)
         self._col = torch.from_numpy(col).to(self.device, torch.float64)
 
-        lut = build_shade_lut(shades, self.shades)
+        lut = build_shade_lut(shades)
         self._lut = torch.from_numpy(lut).to(self.device)     # (256,) float32
 
         # Fovea crop geometry (may overhang; we zero-pad exactly like ObsBuilder).
