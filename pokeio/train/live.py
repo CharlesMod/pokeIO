@@ -32,6 +32,7 @@ import numpy as np
 import torch
 
 from pokeio.analytics.yellow import game_is_yellow
+from pokeio.emu.fleet import FovealEncoder
 from pokeio.evo.forward import apply_activation
 from pokeio.evo.genome import BIAS as NODE_BIAS
 from pokeio.evo.genome import HIDDEN as NODE_HIDDEN
@@ -42,7 +43,11 @@ from pokeio.manifest.generate import ram_addresses_from_manifest
 
 _SCREEN_H = 144
 _SCREEN_W = 160
-N_OUT = 9  # up down left right A B START SELECT NOOP
+# Active-vision head (spec §3.1): the genome now emits 11 outputs — a Discrete-9
+# button head (argmax, ACTIONS order) + 2 raw saccade commands out[9]/out[10].
+# The dashboard renders the 9 button values; the saccade/gaze are exposed
+# separately. The full output width is read from the compiled genome (cp.n_out).
+N_BUTTONS = 9  # up down left right A B START SELECT NOOP (the argmax button slice)
 WRAM_BASE = 0xC000
 
 # Swarm downscale target (must divide the native screen evenly: 160/40, 144/36 = 4).
@@ -103,6 +108,80 @@ def downscale_swarm(screen: np.ndarray) -> np.ndarray:
         axis=(1, 3)
     )
     return small.astype(np.uint8)
+
+
+# --------------------------------------------------------------------------
+# active-vision obs decoding (foveal block layout — spec §2.1)
+# --------------------------------------------------------------------------
+# A FovealEncoder obs vector is a contiguous [periph|fovea|motion|proprio|ram]
+# layout with G = periph_grid: periph [0:G^2], fovea [G^2:2G^2], motion
+# [2G^2:3G^2], proprio [3G^2:3G^2+14], ram trailing. These helpers pull the
+# optical views + gaze back out of a raw obs vector so the spectator can SEE
+# both the low-res periphery and the high-acuity fovea crop the agent looks at.
+def _block2d(vec, grid: int, block: str) -> np.ndarray:
+    """Extract a ``grid``x``grid`` optical block ('periph'|'fovea'|'motion')."""
+    n = grid * grid
+    off = {"periph": 0, "fovea": n, "motion": 2 * n}[block]
+    a = np.asarray(vec[off : off + n], dtype=np.float32)
+    if a.size < n:  # defensive: short/legacy vector -> pad
+        a = np.concatenate([a, np.zeros(n - a.size, np.float32)])
+    return a.reshape(grid, grid)
+
+
+def _b64_block(block2d) -> str:
+    """base64 grayscale of a [0,1] optical block (fovea/periphery/motion view)."""
+    g = np.clip(np.asarray(block2d, dtype=np.float32), 0.0, 1.0) * 255.0
+    return b64_gray(g)
+
+
+def _gaze_from_proprio(vec, grid: int, screen_h: int, screen_w: int):
+    """Recover the (gy, gx) screen-px fovea centre from a foveal obs vector.
+
+    proprio[0]=gx*2/W-1, proprio[1]=gy*2/H-1 (spec §2.1), so the gaze a stored
+    obs was cropped at is recoverable without the encoder that built it (used to
+    show where a focus swarm-agent was looking)."""
+    off = 3 * grid * grid
+    if off + 1 >= len(vec):
+        return float(screen_h) / 2.0, float(screen_w) / 2.0
+    gx = (float(vec[off]) + 1.0) * 0.5 * screen_w
+    gy = (float(vec[off + 1]) + 1.0) * 0.5 * screen_h
+    return gy, gx
+
+
+def _gaze_payload(gy, gx, screen_h, screen_w, fovea_px) -> dict:
+    """Attention-box telemetry: fovea centre (px + normalised) + box size (frac).
+
+    ``x01/y01`` are the normalised centre and ``w01/h01`` the box size as a
+    fraction of the frame, so the dashboard can draw the fixation rectangle over
+    the full-res frame directly."""
+    return {
+        "gy": round(float(gy), 2),
+        "gx": round(float(gx), 2),
+        "y01": round(float(gy) / screen_h, 4),
+        "x01": round(float(gx) / screen_w, 4),
+        "w01": round(float(fovea_px) / screen_w, 4),
+        "h01": round(float(fovea_px) / screen_h, 4),
+    }
+
+
+def _saccade_payload(dx, dy) -> dict:
+    """Raw (pre-tanh) saccade command out[9]/out[10]; update_gaze applies tanh."""
+    return {"dx": round(float(dx), 4), "dy": round(float(dy), 4)}
+
+
+def _split_head(out_np: np.ndarray):
+    """Split a raw (N_out,) genome output into (button, dx, dy) — spec §3.1.
+
+    Replicated inline (NOT imported from ``train.loop`` — that would be a circular
+    import: ``loop`` imports this module). ``out[:9].argmax()`` is the button
+    (ACTIONS order); ``out[9]``/``out[10]`` are the RAW saccade commands — the
+    gaze integrator (``FovealEncoder.update_gaze``) applies tanh, so no tanh here.
+    """
+    a = np.asarray(out_np, dtype=np.float32).ravel()
+    button = int(a[:N_BUTTONS].argmax())
+    dx = float(a[N_BUTTONS]) if a.size > N_BUTTONS else 0.0
+    dy = float(a[N_BUTTONS + 1]) if a.size > N_BUTTONS + 1 else 0.0
+    return button, dx, dy
 
 
 def build_swarm(
@@ -364,23 +443,45 @@ class ChampionShowcase:
         manifest=None,
     ) -> None:
         self.env = env
-        self.encoder = encoder
         self.device = device
         self.reset_state = reset_state
         self.forward_steps = int(forward_steps)
         self.max_nodes = int(max_nodes)
         self.max_conns = int(max_conns)
         self.manifest = manifest
+        # Active-vision spine (§2/§3): the showcase drives a movable fovea, so it
+        # needs its OWN stateful gaze/motion. The passed ``encoder`` is the
+        # PARENT's FovealEncoder (its env slot 0 is used concurrently by the
+        # solo champion/miner replay), so we build a PRIVATE single-env encoder
+        # from the same vision knobs rather than share slot 0 and stomp its
+        # gaze/motion/step state. Taps are synced off the parent each install.
+        self._parent_encoder = encoder
+        self.encoder = FovealEncoder(
+            1,
+            periph_grid=int(getattr(encoder, "G", 12)),
+            fovea_native_px=int(getattr(encoder, "F", 48)),
+            n_ram=int(getattr(encoder, "n_ram", 8)),
+            saccade_gain=float(getattr(encoder, "gain", 32.0)),
+            saccade_every_k=int(getattr(encoder, "every_k", 1)),
+            screen_h=int(getattr(encoder, "H", _SCREEN_H)),
+            screen_w=int(getattr(encoder, "W", _SCREEN_W)),
+            shades=int(getattr(encoder, "shades", 4)),
+            episode_steps=int(getattr(encoder, "episode_steps", 1024)),
+        )
+        self._G = int(self.encoder.G)
+        self._F = int(self.encoder.F)
         # Explicit ram_addrs win; else route the UI taps through the manifest
         # (falling back to the quarantined Yellow table only when appropriate).
         if ram_addrs is not None:
             self.ram_addrs = list(ram_addrs)
         else:
             self.ram_addrs = ram_taps_from_manifest(manifest)
+        self._sync_taps()
 
         self.genome = None
         self.genome_id = "none"
         self.cp = None
+        self.n_out = N_BUTTONS  # full genome output width (set from cp on install)
         self._id_to_slot: dict[int, int] = {}
         self._net_nodes: list[dict] = []
         self._net_conns: list[dict] = []
@@ -388,9 +489,17 @@ class ChampionShowcase:
 
         self.screen: np.ndarray | None = None
         self.wram: np.ndarray | None = None
-        self.obs_vis: np.ndarray | None = None
-        self.last_action = 0
-        self.last_probs: list[float] = [0.0] * N_OUT
+        self._last_obs: np.ndarray | None = None  # last 454-d obs (block decode)
+        self.obs_vis: np.ndarray | None = None     # periphery view (GxG, [0,1])
+        self.fovea_vis: np.ndarray | None = None    # fovea crop view (GxG, [0,1])
+        self.motion_vis: np.ndarray | None = None   # motion view (GxG, [0,1])
+        self.last_action = 8  # NOOP until the first action lands (efference copy)
+        self.last_probs: list[float] = [0.0] * N_BUTTONS  # 9 button values
+        self.saccade: tuple[float, float] = (0.0, 0.0)  # raw (dx,dy) out[9]/out[10]
+        self._gaze_disp: tuple[float, float] = (
+            float(self.encoder.H) / 2.0,
+            float(self.encoder.W) / 2.0,
+        )  # (gy,gx) that cropped the displayed fovea
         # recent frame signatures: catches both dead-still fixed points and
         # short pixel loops (wall-bump animation is a 2-frame cycle).
         self._still_ring: deque = deque(maxlen=4)
@@ -400,6 +509,22 @@ class ChampionShowcase:
         self.spawn_state: bytes | None = None
         self._act: dict[str, float] = {}
         self._genes: dict = {"nodes": [], "conns": []}
+
+    def _sync_taps(self) -> None:
+        """Point the private encoder's RAM tail at the parent's live mined taps.
+
+        The parent keeps its encoder tap-synced with the progress miner's counter
+        addresses (``encoder.set_taps`` each miner cycle); mirror them so the
+        showcase obs's ram block matches what the champion actually trained on.
+        Falls back to the UI ``ram_addrs`` (manifest / quarantined Yellow) when
+        the parent has none set yet."""
+        taps = list(getattr(self._parent_encoder, "tap_addrs", []) or [])
+        if not taps:
+            taps = list(self.ram_addrs)
+        try:
+            self.encoder.set_taps(taps)
+        except Exception:
+            pass
 
     # -- champion swap -----------------------------------------------------
     def set_champion(
@@ -418,6 +543,8 @@ class ChampionShowcase:
             [self.genome], max_nodes=self.max_nodes, max_conns=self.max_conns
         )
         self.cp = pop.compile(self.device)
+        self.n_out = int(self.cp.n_out)  # 11 (9 button + 2 saccade) for the spine
+        self._sync_taps()  # pick up any taps the miner added since the last swap
         self._prepare_net()
         # Every install replays from the champion's own spawn. A deterministic
         # argmax policy in a deterministic env converges to a fixed point
@@ -426,22 +553,31 @@ class ChampionShowcase:
         self._reset_run()
 
     def _reset_run(self) -> None:
+        self.encoder.reset(0)  # gaze -> centre (72,80), motion -> 0.5 (new episode)
+        self.last_action = 8   # NOOP: no button applied yet (efference copy)
         if self.spawn_state is not None:
             self.env.load_state(self.spawn_state)
             self.screen = self.env.reset(None)  # clear held input + settle a frame
         else:
             self.screen = self.env.reset(self.reset_state)
         self.wram = self.env.raw_wram()
-        self.obs_vis = self._encode_vis(self.screen, self.wram)
+        # Seed a valid first-frame obs view (motion -> 0.5 on frame 1 by design).
+        x0 = self.encoder.encode(0, self.screen, self.wram, button=self.last_action)
+        self._set_obs_views(x0)
+        self.saccade = (0.0, 0.0)
+        self._gaze_disp = self.encoder.gaze(0)
         self._still_ring.clear()
         self._still_n = 0
         self._fis = 0  # frames into the current agent-step (advance() path)
         self._state = None  # new episode → clear recurrent memory
 
-    def _encode_vis(self, screen, wram) -> np.ndarray:
-        res = self.encoder.res
-        obs = self.encoder.encode(screen, wram)
-        return obs[: res * res].reshape(res, res)
+    def _set_obs_views(self, obs_vec) -> None:
+        """Decode the periphery / fovea / motion optical views from a foveal obs."""
+        self._last_obs = obs_vec
+        g = self._G
+        self.obs_vis = _block2d(obs_vec, g, "periph")
+        self.fovea_vis = _block2d(obs_vec, g, "fovea")
+        self.motion_vis = _block2d(obs_vec, g, "motion")
 
     def _prepare_net(self) -> None:
         """Pick a bounded, self-consistent subgraph (hidden+out + strong inputs)."""
@@ -454,11 +590,17 @@ class ChampionShowcase:
 
     # -- stepping ----------------------------------------------------------
     def _forward_choose(self):
-        """One captured forward pass on the current obs; sets last_action.
+        """One captured forward pass on the current obs; drives the movable fovea.
 
+        Active-vision spine (§3): foveal-encode the current screen (gaze +
+        efference copy of the last applied button), forward the champion to an
+        11-d output, split into the Discrete-9 button + raw (dx,dy) saccade, then
+        steer the NEXT step's fovea via ``update_gaze`` (the one-tick efference
+        delay is intentional — the saccade from obs t crops the fovea of t+1).
         Returns ``(act_state, out)`` for the caller to publish probs/acts.
         """
-        x = self.encoder.encode(self.screen, self.wram)
+        x = self.encoder.encode(0, self.screen, self.wram, button=int(self.last_action))
+        self._set_obs_views(x)
         xt = torch.from_numpy(x[None, :]).to(self.device).unsqueeze(1)  # (1,1,dim)
         # seed with the previous step's node state so the cage carries the same
         # cross-step recurrent memory the champion had in training
@@ -466,13 +608,21 @@ class ChampionShowcase:
             self.cp, xt, self.forward_steps, state=self._state
         )  # (1,1,M)
         self._state = act_state
-        out = act_state[0, 0, self.cp.n_in + 1 : self.cp.n_in + 1 + N_OUT]
-        self.last_action = int(out.argmax().item())
+        out = act_state[0, 0, self.cp.n_in + 1 : self.cp.n_in + 1 + self.n_out]
+        outv = out.detach().to("cpu").numpy()
+        button, dx, dy = _split_head(outv)
+        self.last_action = int(button)
+        self.saccade = (dx, dy)
+        # gaze that cropped THIS obs (captured before update moves it for t+1)
+        self._gaze_disp = self.encoder.gaze(0)
+        self.encoder.update_gaze(0, dx, dy)  # steer next fovea (tanh applied inside)
         return act_state, out
 
     def _publish_forward(self, act_state, out) -> None:
-        """Expose the last forward's probs + per-node activations (slot space)."""
-        self.last_probs = [round(float(v), 4) for v in out.tolist()]
+        """Expose the last forward's button probs + per-node activations (slots)."""
+        # Render the 9 button values only (out[:9]); the 2 saccade outputs are
+        # surfaced separately (payload ``saccade`` / gaze), never as buttons.
+        self.last_probs = [round(float(v), 4) for v in out[:N_BUTTONS].tolist()]
         vec = act_state[0, 0].detach().to("cpu").numpy()
         self._act = {
             str(nid): round(float(vec[slot]), 4)
@@ -514,7 +664,9 @@ class ChampionShowcase:
         if self._stuck_check():
             return
         self._publish_forward(act_state, out)
-        self.obs_vis = self._encode_vis(self.screen, self.wram)
+        # obs/fovea views + gaze are set inside _forward_choose (from the exact
+        # obs the champion acted on) — no stateful re-encode here (that would
+        # corrupt the encoder's motion/prev-periphery state).
 
     def advance(self, n_frames: int) -> None:
         """Advance ``n_frames`` game frames (realtime pace: 60/s of wall clock).
@@ -548,7 +700,9 @@ class ChampionShowcase:
                 return
         if out is not None:
             self._publish_forward(act_state, out)
-        self.obs_vis = self._encode_vis(self.screen, self.wram)
+        # obs/fovea views + gaze track the last forward (set in _forward_choose);
+        # within an agent-step the gaze is fixed, so the fovea box holds steady
+        # while realtime frames render, then jumps at the next step boundary.
 
     # -- payload -----------------------------------------------------------
     def _ram_bytes(self) -> dict:
@@ -562,26 +716,37 @@ class ChampionShowcase:
         return out
 
     def payload(self) -> dict:
-        buttons = [0] * N_OUT
-        if 0 <= self.last_action < N_OUT:
+        buttons = [0] * N_BUTTONS
+        if 0 <= self.last_action < N_BUTTONS:
             buttons[self.last_action] = 1
         obs_gray = (
             np.clip(self.obs_vis, 0.0, 1.0) * 255.0 if self.obs_vis is not None else None
         )
+        gy, gx = self._gaze_disp
+        dx, dy = self.saccade
         return {
             "genome_id": self.genome_id,
             "spawn": "frontier" if self.spawn_state is not None else "newgame",
             "frame_w": _SCREEN_W,
             "frame_h": _SCREEN_H,
             "frame_b64": b64_gray(self.screen) if self.screen is not None else "",
-            "obs_res": int(self.encoder.res),
+            # optical view: the low-res periphery the agent actually sees (GxG).
+            "obs_res": int(self._G),
             "obs_b64": b64_gray(obs_gray) if obs_gray is not None else "",
+            # active vision: the high-acuity fovea crop + where it is looking +
+            # the raw saccade command that will move it next step.
+            "fovea_res": int(self._G),
+            "fovea_px": int(self._F),
+            "fovea_b64": _b64_block(self.fovea_vis) if self.fovea_vis is not None else "",
+            "motion_b64": _b64_block(self.motion_vis) if self.motion_vis is not None else "",
+            "gaze": _gaze_payload(gy, gx, _SCREEN_H, _SCREEN_W, self._F),
+            "saccade": _saccade_payload(dx, dy),
             "action": int(self.last_action),
             "buttons": buttons,
             "ram": self._ram_bytes(),
             "net": {
                 "n_in": int(self.encoder.dim),
-                "n_out": N_OUT,
+                "n_out": int(self.n_out),
                 "nodes": self._net_nodes,
                 "conns": self._net_conns,
                 "act": self._act,
@@ -873,24 +1038,32 @@ class LiveStreamer:
     # -- focus payloads -----------------------------------------------------
     def _focus_champion(self) -> dict:
         sc = self.showcase
-        buttons = [0] * N_OUT
-        if 0 <= sc.last_action < N_OUT:
+        buttons = [0] * N_BUTTONS
+        if 0 <= sc.last_action < N_BUTTONS:
             buttons[sc.last_action] = 1
         obs_gray = (
             np.clip(sc.obs_vis, 0.0, 1.0) * 255.0 if sc.obs_vis is not None else None
         )
+        gy, gx = sc._gaze_disp
+        dx, dy = sc.saccade
         return {
             "idx": -1,
             "genome_id": sc.genome_id,
             "frame_b64": b64_gray(sc.screen) if sc.screen is not None else "",
-            "obs_res": int(sc.encoder.res),
+            "obs_res": int(sc._G),
             "obs_b64": b64_gray(obs_gray) if obs_gray is not None else "",
+            "fovea_res": int(sc._G),
+            "fovea_px": int(sc._F),
+            "fovea_b64": _b64_block(sc.fovea_vis) if sc.fovea_vis is not None else "",
+            "motion_b64": _b64_block(sc.motion_vis) if sc.motion_vis is not None else "",
+            "gaze": _gaze_payload(gy, gx, _SCREEN_H, _SCREEN_W, sc._F),
+            "saccade": _saccade_payload(dx, dy),
             "action": int(sc.last_action),
             "buttons": buttons,
             "probs": list(sc.last_probs),
             "net": {
                 "n_in": int(sc.encoder.dim),
-                "n_out": N_OUT,
+                "n_out": int(sc.n_out),
                 "nodes": sc._net_nodes,
                 "conns": sc._net_conns,
                 "act": sc._act,
@@ -930,8 +1103,10 @@ class LiveStreamer:
         x = np.ascontiguousarray(obs[idx], dtype=np.float32)
         xt = torch.from_numpy(x[None, :]).to(sc.device).unsqueeze(1)  # (1,1,dim)
         act_state = _forward_capture(cp, xt, sc.forward_steps)  # (1,1,M)
-        out = act_state[0, 0, cp.n_in + 1 : cp.n_in + 1 + N_OUT]
-        probs = [round(float(v), 4) for v in out.tolist()]
+        out = act_state[0, 0, cp.n_in + 1 : cp.n_in + 1 + cp.n_out]
+        outv = out.detach().to("cpu").numpy()
+        probs = [round(float(v), 4) for v in outv[:N_BUTTONS]]  # 9 button values
+        _btn, gdx, gdy = _split_head(outv)  # this genome's saccade command
         vec = act_state[0, 0].detach().to("cpu").numpy()
         node_ids = entry["node_ids"]
         act = {
@@ -940,24 +1115,33 @@ class LiveStreamer:
             if slot < vec.shape[0] and int(nid) in node_ids
         }
 
-        action = int(actions[idx])
-        buttons = [0] * N_OUT
-        if 0 <= action < N_OUT:
+        action = int(actions[idx])  # the button the fleet actually applied
+        buttons = [0] * N_BUTTONS
+        if 0 <= action < N_BUTTONS:
             buttons[action] = 1
-        res = sc.encoder.res
-        obs_img = np.clip(np.asarray(obs[idx][: res * res]).reshape(res, res), 0.0, 1.0) * 255.0
+        g = sc._G
+        # Optical views decoded straight from the stored 454-d obs the fleet fed
+        # this agent; gaze recovered from its proprio block (where it was looking).
+        obs_img = _block2d(obs[idx], g, "periph")
+        gy, gx = _gaze_from_proprio(obs[idx], g, sc.encoder.H, sc.encoder.W)
         return {
             "idx": int(idx),
             "genome_id": entry["genome_id"],
             "frame_b64": b64_gray(screens[idx]),
-            "obs_res": int(res),
-            "obs_b64": b64_gray(obs_img),
+            "obs_res": int(g),
+            "obs_b64": _b64_block(obs_img),
+            "fovea_res": int(g),
+            "fovea_px": int(sc._F),
+            "fovea_b64": _b64_block(_block2d(obs[idx], g, "fovea")),
+            "motion_b64": _b64_block(_block2d(obs[idx], g, "motion")),
+            "gaze": _gaze_payload(gy, gx, _SCREEN_H, _SCREEN_W, sc._F),
+            "saccade": _saccade_payload(gdx, gdy),
             "action": action,
             "buttons": buttons,
             "probs": probs,
             "net": {
                 "n_in": int(sc.encoder.dim),
-                "n_out": N_OUT,
+                "n_out": int(cp.n_out),
                 "nodes": entry["nodes"],
                 "conns": entry["conns"],
                 "act": act,

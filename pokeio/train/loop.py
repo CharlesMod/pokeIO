@@ -40,8 +40,8 @@ import torch
 
 from pokeio.config import Config
 from pokeio.emu.env import PokeEnv
-from pokeio.emu.fleet import AsyncFleet, BarrierFleet, ObsEncoder
-from pokeio.evo.forward import population_forward_sparse
+from pokeio.emu.fleet import AsyncFleet, BarrierFleet, FovealEncoder, ObsEncoder
+from pokeio.evo.forward import TANH, population_forward_sparse
 from pokeio.evo.genome import InnovationTracker, Population, make_genome
 from pokeio.evo.ops import MutationRates, Speciation, compatibility_distance
 from pokeio.reward.archive import NoveltyArchive
@@ -68,8 +68,78 @@ from pokeio.telemetry.schema import (
 
 _SCREEN_H = 144
 _SCREEN_W = 160
-N_OUT = 9  # Discrete(9): up down left right A B START SELECT NOOP
+N_OUT = 11  # 9 button logits (argmax) + saccade dx,dy (tanh); rebound from config.evo.n_out in train()
+N_BUTTONS = 9  # up down left right A B START SELECT NOOP (the argmax-consumed head slice)
 FORWARD_STEPS = 4  # propagation hops per inference (covers evolved depth)
+
+
+def _split_head(outv: np.ndarray, softmax_temp: float = 0.0):
+    """Split the raw (n, N_OUT) tanh output into (buttons, saccade_dx, saccade_dy).
+
+    Active-vision spine §3.1: ``out[..., 0:9]`` is the Discrete-9 button head
+    (argmax, or temperature-softmax sample when ``softmax_temp > 0``); ``out[9]``
+    / ``out[10]`` are the RAW saccade commands.  The gaze integrator applies
+    ``tanh`` internally (``FovealEncoder.update_gaze`` / the fleet workers), so
+    the raw values are forwarded verbatim — no tanh here (double-tanh bug).
+    """
+    logits = outv[:, :N_BUTTONS]
+    if softmax_temp and softmax_temp > 0.0:
+        z = logits / float(softmax_temp)
+        z = z - z.max(axis=1, keepdims=True)
+        p = np.exp(z)
+        p /= p.sum(axis=1, keepdims=True)
+        r = np.random.random((logits.shape[0], 1))
+        buttons = (p.cumsum(axis=1) > r).argmax(axis=1).astype(np.int32)
+    else:
+        buttons = logits.argmax(axis=1).astype(np.int32)
+    dx = np.ascontiguousarray(outv[:, N_BUTTONS], dtype=np.float32)
+    dy = np.ascontiguousarray(outv[:, N_BUTTONS + 1], dtype=np.float32)
+    return buttons, dx, dy
+
+
+def _resp_scores(btn_hist, o_sum, o_sq, o_cnt, w_resp_var):
+    """R_resp per genome (§6.3): button-histogram Shannon entropy (bits) + a
+    variance term ``w_resp_var * mean_t ||o_t - o_bar||^2`` over the raw output.
+
+    ``btn_hist`` (n, 9) counts, ``o_sum`` (n, N_OUT) running sum, ``o_sq`` (n,)
+    running sum of ``||o_t||^2``, ``o_cnt`` (n,) step counts.  A constant-button
+    agent scores H≈0; a policy that varies its output scores higher."""
+    cnt = np.maximum(o_cnt.astype(np.float64), 1.0)
+    tot = np.maximum(btn_hist.sum(axis=1, keepdims=True), 1.0)
+    p = btn_hist / tot
+    with np.errstate(divide="ignore", invalid="ignore"):
+        logp = np.where(p > 0.0, np.log2(p), 0.0)
+    H = -(p * logp).sum(axis=1)
+    mean = o_sum / cnt[:, None]
+    var = o_sq / cnt - (mean ** 2).sum(axis=1)
+    var = np.clip(var, 0.0, None)
+    return H + float(w_resp_var) * var
+
+
+def _blind_ablation_gate(cp, probe_obs, device, *, beta, dmin, optical_hi=432):
+    """E3 blind-ablation gate (§6.2): the dominant selection multiplier.
+
+    Runs ONE batched population forward over the probe buffer ``P`` twice — real
+    obs vs optical blocks ``[0:optical_hi]`` zeroed (proprio+ram preserved) — and
+    scores ``Δ_i = mean_P || a_real − a_blind ||_1`` over the N_OUT output, then
+    ``gate_i = sigmoid(beta*(Δ_i − dmin))``.  A screen-blind policy (Δ≈0) gates
+    to ~0; a screen-dependent one to ~1.  RAM held constant isolates the OPTICAL
+    dependence.  Returns ``(gate (N,), median_delta)``."""
+    n = int(cp.n)
+    if probe_obs is None or len(probe_obs) == 0:
+        return np.ones(n, dtype=np.float64), 0.0
+    P = np.ascontiguousarray(np.asarray(probe_obs, dtype=np.float32))
+    Pb = P.copy()
+    Pb[:, :optical_hi] = 0.0
+    with torch.no_grad():
+        xt = torch.from_numpy(P).to(device)          # (P, dim) -> expands to (N,P,dim)
+        real = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
+        xtb = torch.from_numpy(Pb).to(device)
+        blind = population_forward_sparse(cp, xtb, steps=FORWARD_STEPS)
+        d = (real - blind).abs().sum(dim=2).mean(dim=1)  # (N,): L1 over out, mean over P
+    delta = d.detach().cpu().numpy().astype(np.float64)
+    gate = 1.0 / (1.0 + np.exp(-float(beta) * (delta - float(dmin))))
+    return gate, float(np.median(delta))
 
 
 # --------------------------------------------------------------------------
@@ -445,7 +515,7 @@ def _slice_compiled(cp, lo: int, hi: int):
 def evaluate_wave(
     genomes,
     envs,
-    encoder: ObsEncoder,
+    encoder: FovealEncoder,
     archive: NoveltyArchive,
     device: torch.device,
     episode_steps: int,
@@ -459,8 +529,13 @@ def evaluate_wave(
     goexplore: GoExplore | None = None,
     restore_prob: float = 0.5,
     spawn_out: dict[int, bytes] | None = None,
+    spawn_key_out: dict[int, bytes] | None = None,
     wave_offset: int = 0,
     recurrent_memory: bool = True,
+    softmax_temp: float = 0.0,
+    w_resp_var: float = 0.5,
+    probe_sink: list | None = None,
+    probe_quota: int = 0,
 ) -> int:
     """Evaluate one wave of genomes in lockstep; sets genome.fitness in place.
 
@@ -479,6 +554,7 @@ def evaluate_wave(
     wrams = []
     base_depth = np.zeros(n, dtype=np.int64)  # cumulative chain depth per player
     for i in range(n):
+        encoder.reset(i)  # gaze -> centre, motion -> 0.5 (per episode/restore)
         entry = None
         if (
             goexplore is not None
@@ -492,11 +568,21 @@ def evaluate_wave(
             if spawn_out is not None:
                 # record the champion-candidate's true spawn for the showcase
                 spawn_out[wave_offset + i] = entry.state
+            if spawn_key_out is not None:  # E2: cell identity for the baseline
+                spawn_key_out[wave_offset + i] = entry.key
         else:
             obs = envs[i].reset(reset_state)
         screens.append(obs)
         wrams.append(envs[i].raw_wram())
     dead = [False] * n
+    last_button = np.full(n, 8, dtype=np.int32)  # NOOP until the first action lands
+
+    # R_resp accumulators (§6.3): 9-button histogram + running output moments.
+    btn_hist = np.zeros((n, N_BUTTONS), dtype=np.int64)
+    o_sum = np.zeros((n, N_OUT), dtype=np.float64)
+    o_sq = np.zeros(n, dtype=np.float64)
+    o_cnt = np.zeros(n, dtype=np.int64)
+    probe_taken = 0
 
     pop = Population.from_genomes(genomes, max_nodes=max_nodes, max_conns=max_conns)
     cp = pop.compile(device)
@@ -512,7 +598,7 @@ def evaluate_wave(
             goexplore.feed_capture_budget(1.0)  # note() admits against this
         X = np.empty((n, encoder.dim), dtype=np.float32)
         for i in range(n):
-            X[i] = encoder.encode(screens[i], wrams[i])
+            X[i] = encoder.encode(i, screens[i], wrams[i], button=int(last_button[i]))
         xt = torch.from_numpy(X).to(device).unsqueeze(1)  # (n, 1, dim)
         if recurrent_memory:
             out, state_t = population_forward_sparse(
@@ -520,10 +606,23 @@ def evaluate_wave(
             )
         else:
             out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
-        actions = out[:, 0, :].argmax(dim=1).cpu().numpy()
+        outv = out[:, 0, :].detach().cpu().numpy()
+        actions, gdx, gdy = _split_head(outv, softmax_temp)
+        # R_resp bookkeeping (all rows step every round in lockstep).
+        btn_hist[np.arange(n), actions] += 1
+        o_sum += outv
+        o_sq += (outv * outv).sum(axis=1)
+        o_cnt += 1
+        if probe_sink is not None and probe_quota > 0 and probe_taken < probe_quota:
+            take = min(probe_quota - probe_taken, n)
+            probe_sink.extend(X[k].copy() for k in range(take))
+            probe_taken += take
 
         for i in range(n):
+            # Efference copy: obs t's saccade steers obs t+1's fovea (§3.3).
+            encoder.update_gaze(i, float(gdx[i]), float(gdy[i]))
             screen, wram, done, _info = envs[i].step(int(actions[i]))
+            last_button[i] = actions[i]
             screens[i] = screen
             wrams[i] = wram
             dead[i] = dead[i] or bool(done)
@@ -542,8 +641,10 @@ def evaluate_wave(
                 obs=X, actions=actions, round_t=t,
             )
 
+    resp = _resp_scores(btn_hist, o_sum, o_sq, o_cnt, w_resp_var)
     for i, g in enumerate(genomes):
         g.fitness = float(wave.fitness[i])
+        g._resp = float(resp[i])
     return n * episode_steps
 
 
@@ -567,8 +668,13 @@ def evaluate_wave_parallel(
     pace: PaceController | None = None,
     waves_left: int = 0,
     spawn_out: dict[int, bytes] | None = None,
+    spawn_key_out: dict[int, bytes] | None = None,
     taps: list[dict] | None = None,  # accepted for API parity; furnace-only v1
     recurrent_memory: bool = True,
+    softmax_temp: float = 0.0,
+    w_resp_var: float = 0.5,
+    probe_sink: list | None = None,
+    probe_quota: int = 0,
 ) -> int:
     """Parallel-barrier equivalent of :func:`evaluate_wave`.
 
@@ -595,7 +701,7 @@ def evaluate_wave_parallel(
     if streamer is not None:
         streamer.set_phase("evolving", "restoring frontier")
     restore, base_depth = _sample_restores(
-        goexplore, n, restore_prob, spawn_out, wave_offset
+        goexplore, n, restore_prob, spawn_out, wave_offset, spawn_key_out
     )
     _t = _mark("go_sample", _t)
     # Release the reset round, then pack/compile WHILE the workers reset.
@@ -623,6 +729,12 @@ def evaluate_wave_parallel(
     cap_flags = np.zeros(n_envs, dtype=np.uint8)
     pending: dict[int, tuple[bytes, int]] = {}
     actions_full = np.zeros(n_envs, dtype=np.int32)
+    # R_resp accumulators (§6.3); all n envs step every barrier round.
+    btn_hist = np.zeros((n, N_BUTTONS), dtype=np.int64)
+    o_sum = np.zeros((n, N_OUT), dtype=np.float64)
+    o_sq = np.zeros(n, dtype=np.float64)
+    o_cnt = np.zeros(n, dtype=np.int64)
+    probe_taken = 0
 
     import os as _os
     _prof = _os.environ.get("POKEIO_PROF") == "1"
@@ -647,9 +759,19 @@ def evaluate_wave_parallel(
             )
         else:
             out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
-        actions = out[:, 0, :].argmax(dim=1).cpu().numpy()
+        outv = out[:, 0, :].detach().cpu().numpy()
+        actions, gdx, gdy = _split_head(outv, softmax_temp)  # buttons + RAW saccade
         actions_full[:] = 0
         actions_full[:n] = actions
+        # R_resp bookkeeping.
+        btn_hist[np.arange(n), actions] += 1
+        o_sum += outv
+        o_sq += (outv * outv).sum(axis=1)
+        o_cnt += 1
+        if probe_sink is not None and probe_quota > 0 and probe_taken < probe_quota:
+            take = min(probe_quota - probe_taken, n)
+            probe_sink.extend(X[k].copy() for k in range(take))
+            probe_taken += take
         if _prof:
             _c1 = time.perf_counter()
             _t_fwd += _c1 - _c0
@@ -659,8 +781,13 @@ def evaluate_wave_parallel(
         if pace is not None:
             pace.before_round()
 
+        # Workers integrate the RAW saccade (tanh applied inside update_gaze)
+        # into gaze BEFORE building next round's obs (§3.3/§3.4).
         obs, keys, dones, captured = fleet.step_all(
-            actions_full, cap_flags if goexplore is not None else None
+            actions_full,
+            cap_flags if goexplore is not None else None,
+            gaze_dx=gdx,
+            gaze_dy=gdy,
         )
         if pace is not None:
             pace.after_round()
@@ -723,8 +850,10 @@ def evaluate_wave_parallel(
               f"book={_t_book/episode_steps*1000:.2f}ms/round")
     _mark("rounds", _t)
 
+    resp = _resp_scores(btn_hist, o_sum, o_sq, o_cnt, w_resp_var)
     for i, g in enumerate(genomes):
         g.fitness = float(wave.fitness[i])
+        g._resp = float(resp[i])
     return n * episode_steps
 
 
@@ -734,6 +863,7 @@ def _sample_restores(
     restore_prob: float,
     spawn_out: dict[int, bytes] | None = None,
     wave_offset: int = 0,
+    spawn_key_out: dict[int, bytes] | None = None,
 ) -> tuple[dict[int, bytes], np.ndarray]:
     """Pick each player's spawn: a Go-Explore frontier restore or newgame.
 
@@ -742,6 +872,10 @@ def _sample_restores(
     newgame spawns). Cells discovered this episode store ``base_depth + t`` so
     restore chains accumulate distance-from-newgame instead of resetting per
     episode (which made Go-Explore's depth preference meaningless).
+
+    ``spawn_key_out`` (optional) records the restored cell's KEY per global
+    genome index — the identity the E2 per-cell baseline groups on (§6.1); two
+    genomes restored from the same frontier cell share a key.
     """
     restore: dict[int, bytes] = {}
     base_depth = np.zeros(n, dtype=np.int64)
@@ -750,6 +884,8 @@ def _sample_restores(
         for i, entry in zip(idxs, goexplore.sample_many(len(idxs))):
             restore[i] = entry.state
             base_depth[i] = entry.depth
+            if spawn_key_out is not None:
+                spawn_key_out[wave_offset + i] = entry.key
         goexplore.n_restores += len(restore)
         if spawn_out is not None:
             for i, blob in restore.items():
@@ -777,8 +913,13 @@ def evaluate_wave_async(
     pace: PaceController | None = None,
     waves_left: int = 0,
     spawn_out: dict[int, bytes] | None = None,
+    spawn_key_out: dict[int, bytes] | None = None,
     taps: list[dict] | None = None,
     recurrent_memory: bool = True,
+    softmax_temp: float = 0.0,
+    w_resp_var: float = 0.5,
+    probe_sink: list | None = None,
+    probe_quota: int = 0,
 ) -> int:
     """Free-running ("furnace") equivalent of :func:`evaluate_wave_parallel`.
 
@@ -817,7 +958,7 @@ def evaluate_wave_async(
     if streamer is not None:
         streamer.set_phase("evolving", "restoring frontier")
     restore, base_depth = _sample_restores(
-        goexplore, n, restore_prob, spawn_out, wave_offset
+        goexplore, n, restore_prob, spawn_out, wave_offset, spawn_key_out
     )
     _t = _mark("go_sample", _t)
     fleet.reset_all_begin(restore if restore else None)
@@ -859,7 +1000,7 @@ def evaluate_wave_async(
             with torch.cuda.stream(warm):
                 for _ in range(3):
                     _o = population_forward_sparse(cp, x_static, steps=FORWARD_STEPS)
-                    _ = _o[:, 0, :].argmax(dim=1)
+                    _ = _o[:, 0, :N_BUTTONS].argmax(dim=1)
             torch.cuda.current_stream(device).wait_stream(warm)
             torch.cuda.synchronize(device)
             # recurrent memory needs the node-state tensor as a static graph
@@ -875,7 +1016,7 @@ def evaluate_wave_async(
                             cp, x_static, steps=FORWARD_STEPS,
                             state=st_static, return_state=True,
                         )
-                        _ = _o[:, 0, :].argmax(dim=1)
+                        _ = _o[:, 0, :N_BUTTONS].argmax(dim=1)
                 torch.cuda.current_stream(device).wait_stream(warm)
                 torch.cuda.synchronize(device)
             _graph = torch.cuda.CUDAGraph()
@@ -887,7 +1028,10 @@ def evaluate_wave_async(
                     )
                 else:
                     _o = population_forward_sparse(cp, x_static, steps=FORWARD_STEPS)
-                _acts_static = _o[:, 0, :].argmax(dim=1).to(torch.int32)
+                # Capture the RAW output rows (not the fused argmax): the parent
+                # splits buttons + saccade (dx,dy) and accumulates R_resp from
+                # the same tensor, so the graph and eager paths share one seam.
+                _out_static = _o[:, 0, :].contiguous()
             torch.cuda.synchronize(device)
 
             def graph_fwd(X_np, cur_state):
@@ -898,7 +1042,7 @@ def evaluate_wave_async(
                 # _st_out lives in the graph pool; the caller copies the fresh
                 # rows it needs out (state_t[idx]=) before the next replay.
                 return (
-                    _acts_static.cpu().numpy(),
+                    _out_static.cpu().numpy(),
                     _st_out if recurrent_memory else None,
                 )
         except RuntimeError as e:
@@ -927,6 +1071,12 @@ def evaluate_wave_async(
     pending: dict[int, tuple[bytes, int]] = {}
     last_X = None
     last_actions = np.zeros(n, dtype=np.int32)
+    # R_resp accumulators (§6.3): only rows that actually stepped (ready) tick.
+    btn_hist = np.zeros((n, N_BUTTONS), dtype=np.int64)
+    o_sum = np.zeros((n, N_OUT), dtype=np.float64)
+    o_sq = np.zeros(n, dtype=np.float64)
+    o_cnt = np.zeros(n, dtype=np.int64)
+    probe_taken = 0
     # Per-env recurrent node-state (N,1,M), zeroed at wave start (= episode
     # start). Advances ONLY for envs that actually consume an action this
     # cycle — the batched forward computes new state for all n envs, but a
@@ -1049,21 +1199,36 @@ def evaluate_wave_async(
         if ready.any():
             X = np.ascontiguousarray(obs_shm[:n], dtype=np.float32)
             if graph_fwd is not None:
-                acts, new_state = graph_fwd(X, state_t)
+                outv, new_state = graph_fwd(X, state_t)  # outv: (n, N_OUT)
             elif recurrent_memory:
                 xt = torch.from_numpy(X).to(device).unsqueeze(1)
                 out, new_state = population_forward_sparse(
                     cp, xt, steps=FORWARD_STEPS, state=state_t, return_state=True
                 )
-                acts = out[:, 0, :].argmax(dim=1).cpu().numpy().astype(np.int32)
+                outv = out[:, 0, :].detach().cpu().numpy()
             else:
                 xt = torch.from_numpy(X).to(device).unsqueeze(1)
                 out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
-                acts = out[:, 0, :].argmax(dim=1).cpu().numpy().astype(np.int32)
+                outv = out[:, 0, :].detach().cpu().numpy()
                 new_state = None
+            # Split the tanh head: buttons (argmax) + RAW saccade (dx,dy). The
+            # worker applies tanh inside update_gaze, so pass the raw floats.
+            acts, gdx, gdy = _split_head(outv, softmax_temp)
             idx = np.nonzero(ready)[0]
-            actions_shm[idx] = acts[idx]
-            act_seq[idx] = snap[idx]  # publish AFTER the action rows (x86 TSO)
+            # R_resp: accumulate only the rows that actually consume an action.
+            btn_hist[idx, acts[idx]] += 1
+            o_sum[idx] += outv[idx]
+            o_sq[idx] += (outv[idx] * outv[idx]).sum(axis=1)
+            o_cnt[idx] += 1
+            if (
+                probe_sink is not None and probe_quota > 0
+                and probe_taken < probe_quota
+            ):
+                take = min(probe_quota - probe_taken, len(idx))
+                probe_sink.extend(X[int(k)].copy() for k in idx[:take])
+                probe_taken += take
+            # submit_actions publishes gaze + buttons FIRST, act_seq LAST (§3.4).
+            fleet.submit_actions(idx, acts[idx], gdx[idx], gdy[idx], snap[idx])
             acted[idx] = snap[idx]
             # advance memory ONLY for envs that stepped (ready rows)
             if new_state is not None:
@@ -1110,9 +1275,11 @@ def evaluate_wave_async(
     fleet.end_wave()
     _mark("rounds", _t)
 
+    resp = _resp_scores(btn_hist, o_sum, o_sq, o_cnt, w_resp_var)
     for i, g in enumerate(genomes):
         g.fitness = float(wave.fitness[i])
         g.progress = float(progress[i])  # mined-counter advancement (0 w/o taps)
+        g._resp = float(resp[i])
     return n * R
 
 
@@ -1127,28 +1294,96 @@ def _quantile_ranks(vals: np.ndarray) -> np.ndarray:
     return (sums[inv] / cnt[inv] + 0.5) / len(vals)
 
 
-def cohort_rank_normalize(
-    genomes, restored: set[int], progress_weight: float = 0.0
-) -> None:
-    """Replace ``g.fitness`` with within-spawn-cohort quantile ranks.
+def _cell_baseline_advantage(
+    raw_f: np.ndarray,
+    restored: set[int],
+    spawn_keys: dict[int, bytes] | None,
+) -> np.ndarray:
+    """E2 per-cell leave-one-out advantage (§6.1) — the difference-reward that
+    cancels cross-cell spawn-value luck.
 
-    Players restored into Go-Explore frontier cells earn systematically more
-    novelty than newgame spawns regardless of policy quality; ranking within
-    each cohort and mapping to (rank+0.5)/n quantiles makes the two comparable
-    before selection. With Go-Explore off (``restored`` empty) this reduces to
-    a plain global rank-normalization, which still tames the heavy-tailed
-    novelty skew that lets one champion's species swallow the population.
+    For each restore cell ``c`` with member set ``M_c``:
+      ``|M_c| >= 2``: ``A_i = f_i − (Σ_{j∈M_c} f_j − f_i)/(|M_c|−1)`` (leave-one-out);
+      ``|M_c| == 1``: ``A_i = 0`` (no counterfactual);
+      newgame (shared fixed spawn): ``A_i = f_i`` (no cross-spawn luck to cancel).
 
-    When mined progress counters are live (``g.progress`` set by the wave and
-    ``progress_weight`` > 0), the selection fitness is a blend of the novelty
-    quantile and the progress quantile — novelty explores the state space,
-    progress creates the gradient novelty cannot (winning battles, XP, story
-    flags) — but only once ANY player registered progress signal this gen, so
-    a dead counter set never dilutes selection with rank noise.
+    Two genomes restored to the SAME cell with identical policy get equal ``A_i``,
+    so a screen-blind constant at a rich spawn can no longer out-rank a seeing
+    policy at a poor one.  Grouping is by the Go-Explore cell KEY (``spawn_keys``);
+    a restored genome with no recorded key is treated as its own singleton.
     """
+    raw_f = np.asarray(raw_f, dtype=np.float64)
+    A = raw_f.copy()  # newgame default: A_i = f_i
+    groups: dict = {}
+    for i in restored:
+        key = (spawn_keys or {}).get(i)
+        if key is None:
+            key = ("__singleton__", int(i))  # unknown cell -> own singleton
+        groups.setdefault(key, []).append(int(i))
+    for members in groups.values():
+        m = len(members)
+        if m >= 2:
+            s = float(sum(raw_f[j] for j in members))
+            for i in members:
+                A[i] = raw_f[i] - (s - raw_f[i]) / (m - 1)
+        else:
+            A[members[0]] = 0.0
+    return A
+
+
+def cohort_rank_normalize(
+    genomes,
+    restored: set[int],
+    progress_weight: float = 0.0,
+    *,
+    spawn_keys: dict[int, bytes] | None = None,
+    gate: np.ndarray | None = None,
+    resp: np.ndarray | None = None,
+    emp: np.ndarray | None = None,
+    w_resp: float = 0.0,
+    w_emp: float = 0.0,
+    restore_baseline: bool = False,
+    blind_gate: bool = False,
+) -> None:
+    """Replace ``g.fitness`` with the coupled within-cohort selection fitness (§6.5).
+
+    Ledger 2 (policy fitness). Within each spawn cohort (restored / newgame), map
+    each component to ``(rank+0.5)/n`` quantiles via :func:`_quantile_ranks` and
+    combine::
+
+        policy_i = gate_i · q(A_i) + w_resp · q(R_resp_i) + w_emp · q(Emp_i)
+        sel_i    = (1−w_prog)·q(policy_i) + w_prog·q(progress_i)   if progress live
+                 = q(policy_i)                                     otherwise
+
+    where ``A_i`` is the E2 per-cell leave-one-out advantage (``restore_baseline``;
+    replaces raw novelty ``f_i`` as the task-credit input), ``gate_i`` the E3
+    blind-ablation multiplier (``blind_gate``; ~0 for screen-blind policies),
+    ``R_resp_i`` responsiveness (``g._resp`` from the wave), and ``Emp_i``
+    empowerment (Phase 1+, ``emp``/``w_emp``; 0-effect in Phase 0).
+
+    Backward compatible: with all keyword extras at their defaults this reduces to
+    the previous plain within-cohort rank-normalize (``q(A_i)=q(f_i)`` idempotent
+    under re-ranking), so existing callers and the progress blend are unchanged.
+    """
+    n = len(genomes)
+    raw_f = np.array([g.fitness for g in genomes], dtype=np.float64)
+    # E2: A_i replaces raw f_i as the novelty/task-credit input.
+    A = (
+        _cell_baseline_advantage(raw_f, restored, spawn_keys)
+        if restore_baseline else raw_f
+    )
+    if resp is None:
+        resp = np.array(
+            [float(getattr(g, "_resp", 0.0)) for g in genomes], dtype=np.float64
+        )
+    else:
+        resp = np.asarray(resp, dtype=np.float64)
+    gate_v = None if gate is None else np.asarray(gate, dtype=np.float64)
+    emp_v = None if emp is None else np.asarray(emp, dtype=np.float64)
+
     cohorts = (
-        [i for i in range(len(genomes)) if i in restored],
-        [i for i in range(len(genomes)) if i not in restored],
+        [i for i in range(n) if i in restored],
+        [i for i in range(n) if i not in restored],
     )
     w = float(progress_weight)
     blend = w > 0.0 and any(
@@ -1157,16 +1392,25 @@ def cohort_rank_normalize(
     for idxs in cohorts:
         if not idxs:
             continue
-        f = np.array([genomes[i].fitness for i in idxs], dtype=np.float64)
-        q = _quantile_ranks(f)
+        ia = np.asarray(idxs, dtype=np.intp)
+        qA = _quantile_ranks(A[ia])
+        # gate is the DOMINANT multiplier on the task-credit quantile.
+        policy = (gate_v[ia] * qA) if (blind_gate and gate_v is not None) else qA
+        if w_resp:
+            policy = policy + float(w_resp) * _quantile_ranks(resp[ia])
+        if w_emp and emp_v is not None:
+            policy = policy + float(w_emp) * _quantile_ranks(emp_v[ia])
+        qpolicy = _quantile_ranks(policy)
         if blend:
             p = np.array(
                 [float(getattr(genomes[i], "progress", 0.0)) for i in idxs],
                 dtype=np.float64,
             )
-            q = (1.0 - w) * q + w * _quantile_ranks(p)
+            sel = (1.0 - w) * qpolicy + w * _quantile_ranks(p)
+        else:
+            sel = qpolicy
         for j, i in enumerate(idxs):
-            genomes[i].fitness = float(q[j])
+            genomes[i].fitness = float(sel[j])
 
 
 def idle_autonomous_bytes(
@@ -1233,7 +1477,7 @@ def calibrate_wram_mask(
             env.reset(reset_state)
             prev = None
             for _t in range(steps):
-                env.step(int(rng.integers(0, N_OUT)))
+                env.step(int(rng.integers(0, N_BUTTONS)))  # buttons only (0..8)
                 q = env.raw_wram()[::wram_stride] // step_q
                 if prev is not None:
                     if changes is None:
@@ -1256,7 +1500,7 @@ def calibrate_wram_mask(
 def replay_champion(
     genome,
     env,
-    encoder: ObsEncoder,
+    encoder: FovealEncoder,
     archive: NoveltyArchive,
     device: torch.device,
     steps: int,
@@ -1267,6 +1511,7 @@ def replay_champion(
     spawn_state: bytes | None = None,
     record_wram: bool = False,
     recurrent_memory: bool = True,
+    softmax_temp: float = 0.0,
 ) -> np.ndarray | None:
     """Replay the generation champion solo and log a few ChampionSteps.
 
@@ -1275,9 +1520,13 @@ def replay_champion(
     context the champion actually earned its fitness in, which is exactly the
     data the progress-counter miner needs (battles, dialogue, shops).
     ``record_wram``: return the (steps, 8192) WRAM trace for the miner.
+
+    The champion drives the movable fovea: each step's saccade steers the next
+    step's fovea crop through ``encoder.update_gaze`` (parent path, env slot 0).
     """
     pop = Population.from_genomes([genome], max_nodes=max_nodes, max_conns=max_conns)
     cp = pop.compile(device)
+    encoder.reset(0)  # gaze -> centre, motion -> 0.5 (solo replay uses env slot 0)
     if spawn_state is not None:
         env.load_state(spawn_state)
         screen = env.reset(None)  # clear held input + settle a frame
@@ -1286,8 +1535,9 @@ def replay_champion(
     wram = env.raw_wram()
     trace = np.empty((steps, wram.size), dtype=np.uint8) if record_wram else None
     state = None  # recurrent node-state carried across the replay episode
+    last_button = 8  # NOOP until the first action lands
     for t in range(steps):
-        x = encoder.encode(screen, wram)
+        x = encoder.encode(0, screen, wram, button=int(last_button))
         xt = torch.from_numpy(x[None, :]).to(device).unsqueeze(1)  # (1,1,dim)
         if recurrent_memory:
             out, state = population_forward_sparse(
@@ -1295,7 +1545,11 @@ def replay_champion(
             )
         else:
             out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
-        action = int(out[0, 0, :].argmax().item())
+        outv = out[0, 0, :].detach().cpu().numpy()[None, :]  # (1, N_OUT)
+        acts, gdx, gdy = _split_head(outv, softmax_temp)
+        action = int(acts[0])
+        encoder.update_gaze(0, float(gdx[0]), float(gdy[0]))  # steer next fovea
+        last_button = action
         screen, wram, _done, info = env.step(action)
         time.sleep(0)  # cooperative GIL handoff for the live pump thread
         # READ-ONLY: the replay is telemetry, not evaluation — writing here
@@ -1854,8 +2108,8 @@ def train(
     species_target: int = 6,
     parallel: bool = True,
     envs_per_worker: int = 1,
-    init_connect: str = "sparse",
-    init_k: int = 12,
+    init_connect: str = "full",  # §8: fan-in-scaled full seed (was "sparse")
+    init_k: int = 32,  # §8: sparse-fallback fan-in (was 12)
     engine: str = "furnace",
     boot_gauntlet_every: int = 10,
     boot_gauntlet_steps: int = 0,  # 0 = auto (4 * episode_steps)
@@ -1871,8 +2125,34 @@ def train(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(config.run.seed))
 
-    encoder = ObsEncoder(obs_res, config.vision.obs_ram_bytes)
-    n_in = encoder.dim
+    # Output layout is config-driven (§3.1): 9 button logits + 2 saccade = 11.
+    global N_OUT
+    N_OUT = int(config.evo.n_out)
+
+    # Active-vision spine (§2/§3): stateful foveal obs (periphery + gaze-driven
+    # fovea + motion + proprio + connect-protected RAM taps). The parent encoder
+    # is used for the solo champion/miner replay (env slot 0) and the serial
+    # (non-parallel) wave path; fleet workers auto-select their own FovealEncoder
+    # when obs_dim == 3*periph_grid^2 + 14 + n_ram. Sized to `players` so the
+    # serial path can encode a whole sub-wave.
+    encoder = FovealEncoder(
+        max(1, players),
+        periph_grid=config.vision.periph_grid,
+        fovea_native_px=config.vision.fovea_native_px,
+        n_ram=config.vision.obs_ram_bytes,
+        saccade_gain=config.vision.saccade_gain,
+        saccade_every_k=config.vision.saccade_every_k,
+        episode_steps=episode_steps,
+    )
+    n_in = encoder.dim  # 454 for the committed defaults
+    softmax_temp = float(getattr(config.evo, "softmax_temp", 0.0))
+    w_resp = float(getattr(config.reward, "w_resp", 0.0))
+    w_emp = float(getattr(config.reward, "w_emp", 0.0))
+    w_resp_var = float(getattr(config.reward, "w_resp_var", 0.5))
+    restore_baseline = bool(getattr(config.reward, "restore_baseline", True))
+    blind_gate_on = bool(getattr(config.reward, "blind_gate", True))
+    blind_gate_beta = float(getattr(config.reward, "blind_gate_beta", 8.0))
+    blind_gate_dmin = float(getattr(config.reward, "blind_gate_dmin", 0.05))
     # Budgets: sized to the seed density + slack to grow. Sparse seeds are
     # ~(init_k+1)*N_OUT conns, so the pack/compile tensors shrink ~10x vs full.
     if init_connect == "full":
@@ -1908,8 +2188,11 @@ def train(
         config=config,
     )
 
+    _G = config.vision.periph_grid
     print(
-        f"[train] device={device} n_in={n_in} (res={obs_res}^2+{config.vision.obs_ram_bytes} ram) "
+        f"[train] device={device} n_in={n_in} N_OUT={N_OUT} "
+        f"(foveal: 3x{_G}^2 periph/fovea/motion + 14 proprio + "
+        f"{config.vision.obs_ram_bytes} ram) "
         f"pop={pop_size} players={players} episode_steps={episode_steps} gens={gens}"
     )
     print(f"[train] run_dir={run_dir}  reset_state={config.emu.reset_state}")
@@ -1919,18 +2202,32 @@ def train(
         make_genome(
             n_in, N_OUT, tracker, rng,
             connect=init_connect, weight_scale=1.0, sparse_k=init_k,
+            # Decisive TANH head (§8) + connect-protect the trailing sensory
+            # block: proprio(14) then RAM taps(obs_ram_bytes) are wired to every
+            # output at init and exempted from toggle/split, so they are never
+            # topologically dead (the measured Δoutput=0 pathology).
+            output_act=TANH,
+            n_ram=int(config.vision.obs_ram_bytes),
+            n_proprio=14,
+            protect_ram_taps=bool(config.evo.protect_ram_taps),
+            protect_proprio=bool(config.evo.protect_proprio),
         )
         for _ in range(pop_size)
     ]
     n_c0 = sum(len(g.conns) for g in genomes) // max(1, len(genomes))
     print(f"[train] seed genomes: connect={init_connect} (~{n_c0} conns/genome)")
 
-    # Weight-mutation scales anchored to the seed's fan-in-scaled init std:
-    # perturb sigma 0.1*init_std, reset scale = init_std, clamp 4*init_std.
-    # This pins the perturb/reset random walk's stationary weight std at
-    # ~init_std; the legacy defaults (0.5/1.0, unclamped) drift to std ~1.8
-    # and re-saturate the outputs within ~10 gens (constant-action collapse).
-    init_std = 1.0 / math.sqrt(init_k + 1) if init_connect == "sparse" else 1.0
+    # Weight-mutation scales anchored to the seed's fan-in-scaled init std (§8):
+    # full -> 1/sqrt(n_in+1), sparse -> 1/sqrt(init_k+1); perturb sigma
+    # 0.1*init_std, reset scale = init_std, clamp 4*init_std. This pins the
+    # perturb/reset random walk's stationary weight std at ~init_std; the legacy
+    # defaults (0.5/1.0, unclamped) drift to std ~1.8 and re-saturate the outputs
+    # within ~10 gens (constant-action collapse). The vision fix is STRUCTURAL —
+    # keep sigma at 0.1*init_std; a larger sigma just re-saturates the head.
+    init_std = (
+        1.0 / math.sqrt(n_in + 1) if init_connect == "full"
+        else 1.0 / math.sqrt(init_k + 1)
+    )
     rates = MutationRates(
         add_node=config.evo.mutate_add_node,
         add_conn=config.evo.mutate_add_conn,
@@ -2003,6 +2300,13 @@ def train(
             wram_stride=archive.wram_stride,
             goexplore=bool(go),
             envs_per_worker=envs_per_worker,
+            # Active-vision knobs: with obs_dim=454 (=3*12^2+14+8) the workers
+            # auto-select FovealEncoder and must match the parent's geometry.
+            periph_grid=config.vision.periph_grid,
+            fovea_native_px=config.vision.fovea_native_px,
+            saccade_gain=config.vision.saccade_gain,
+            saccade_every_k=config.vision.saccade_every_k,
+            episode_steps=episode_steps,
         )
         print(f"[train] fleet up: {fleet.n_workers} worker procs")
         # A single parent-side env for the per-generation champion replay.
@@ -2116,6 +2420,22 @@ def train(
             )
             raise SystemExit(2)
         if ckpt is not None:
+            # Resume guard (§2.2): changing n_in or N_OUT shifts every node-id /
+            # innovation number, so an old-shape checkpoint cannot load into the
+            # new obs/head. Refuse loudly rather than silently corrupt the pack.
+            ck_tracker = ckpt["tracker"]
+            ck_pair = (int(ck_tracker.n_in), int(ck_tracker.n_out))
+            if ck_pair != (int(n_in), int(N_OUT)):
+                print(
+                    "[checkpoint] --resume refused: checkpoint shape "
+                    f"(n_in={ck_pair[0]}, n_out={ck_pair[1]}) != freshly built "
+                    f"(n_in={n_in}, n_out={N_OUT}). The active-vision restart "
+                    "changed the obs/head; old 584/9 checkpoints are unloadable "
+                    "(the Go-Explore archive survives on its own). Start a fresh "
+                    "run id, or drop --resume.",
+                    file=sys.stderr, flush=True,
+                )
+                raise SystemExit(2)
             genomes = ckpt["genomes"]
             archive = ckpt["archive"]
             go = ckpt["goexplore"]
@@ -2225,6 +2545,12 @@ def train(
             # restored players appear; the rest spawned from newgame). Blobs
             # are refs into the Go-Explore archive, not copies.
             spawn_states: dict[int, bytes] = {}
+            # genome idx -> restored cell KEY (E2 per-cell baseline grouping).
+            spawn_key_states: dict[int, bytes] = {}
+            # E3 probe buffer: real obs sampled across the whole population this
+            # gen (fixed within the gen), fed to the blind-ablation gate below.
+            probe_sink: list = []
+            probe_quota = max(1, 256 // max(1, n_waves))  # ~256 total, spread
             for wi, a in enumerate(range(0, pop_size, players)):
                 wave = genomes[a : a + players]
                 # Give the streamer this wave's slot -> genome mapping so the
@@ -2256,8 +2582,13 @@ def train(
                         pace=pace,
                         waves_left=n_waves - 1 - wi,
                         spawn_out=spawn_states,
+                        spawn_key_out=spawn_key_states,
                         taps=taps if (taps and engine == "furnace") else None,
                         recurrent_memory=recurrent_memory,
+                        softmax_temp=softmax_temp,
+                        w_resp_var=w_resp_var,
+                        probe_sink=probe_sink,
+                        probe_quota=probe_quota,
                     )
                 else:
                     steps_done += evaluate_wave(
@@ -2277,14 +2608,34 @@ def train(
                         goexplore=go,
                         restore_prob=restore_prob,
                         spawn_out=spawn_states,
+                        spawn_key_out=spawn_key_states,
                         wave_offset=a,
                         recurrent_memory=recurrent_memory,
+                        softmax_temp=softmax_temp,
+                        w_resp_var=w_resp_var,
+                        probe_sink=probe_sink,
+                        probe_quota=probe_quota,
                     )
 
             _bt = time.perf_counter()
             fits = np.array([g.fitness for g in genomes], dtype=np.float64)
-            champ_idx = int(fits.argmax())
+            champ_idx = int(fits.argmax())  # champion by RAW wave fitness (unchanged)
             champion = genomes[champ_idx]
+
+            # E3 blind-ablation gate (§6.2): the dominant selection multiplier
+            # AND the smoke's input-sensitivity metric. Two batched forwards over
+            # the shared probe buffer on the memoized full-population cp; median Δ
+            # must clear Δ_min and rise across gens if the terms bite.
+            gate = None
+            gate_median_delta = 0.0
+            if blind_gate_on and probe_sink:
+                _cp_gate = _cp_provider()
+                gate, gate_median_delta = _blind_ablation_gate(
+                    _cp_gate, probe_sink, device,
+                    beta=blind_gate_beta, dmin=blind_gate_dmin,
+                    optical_hi=encoder._o_proprio,  # zero periphery+fovea+motion
+                )
+            _bt = _phase("blind_gate", _bt)
 
             # Update the showcase to this generation's real champion and push a
             # fresh live frame at the generation boundary.
@@ -2321,6 +2672,7 @@ def train(
                 spawn_state=spawn_states.get(champ_idx),
                 record_wram=True,
                 recurrent_memory=recurrent_memory,
+                softmax_temp=softmax_temp,
             )
             if trace is not None and trace.shape[0] >= 2:
                 # Dedup at the source (A9): the champion replay is a single
@@ -2537,6 +2889,7 @@ def train(
                 f"[gen {gen:2d}] best={rec.fitness_best:6.1f} med={rec.fitness_median:6.1f} "
                 f"worst={rec.fitness_worst:5.1f} species={rec.n_species:3d} "
                 f"cells={rec.archive_cells:6d} (+{rec.archive_delta:4d}) "
+                f"blindΔ={gate_median_delta:.4f} "
                 f"{gen_dt:5.1f}s  {sps:7.1f} steps/s"
             )
 
@@ -2544,16 +2897,21 @@ def train(
             if gen < gens - 1:
                 if streamer is not None:
                     streamer.set_phase("evolving", "reproduction")
-                # SELECTION-ONLY fitness transform (raw fitness already went
-                # to champion pick + telemetry above): rank-normalize within
-                # spawn cohort, then merge. Restored players spawn beside
-                # low-visit territory and systematically outscore newgame
-                # players for the same policy quality, so raw cross-cohort
-                # comparison ranks spawn luck (audit REWARD#3). Quantile
-                # ranks also cap the champion's fitness at 1.0, defusing the
-                # species-mean allocation blowup under extreme skew.
+                # SELECTION-ONLY fitness transform (§6.5): couple selection to
+                # POLICY, not spawn luck. Within each spawn cohort combine the E2
+                # per-cell leave-one-out advantage q(A_i), gated by the E3 blind-
+                # ablation multiplier (screen-blind -> gate~0), shaped by R_resp
+                # responsiveness, then blended with mined progress exactly as
+                # before. Raw fitness already drove the champion pick + telemetry.
                 cohort_rank_normalize(
-                    genomes, set(spawn_states), progress_weight=progress_weight
+                    genomes, set(spawn_states),
+                    progress_weight=progress_weight,
+                    spawn_keys=spawn_key_states,
+                    gate=gate,
+                    w_resp=w_resp,
+                    w_emp=w_emp,
+                    restore_baseline=restore_baseline,
+                    blind_gate=blind_gate_on,
                 )
                 genomes = fast_reproduce(
                     genomes, species, tracker, rng, rates,
@@ -2718,12 +3076,13 @@ def main() -> None:
                          "lockstep spin-barrier fleet (legacy)")
     # -- gen-0 seeding ------------------------------------------------------
     ap.add_argument("--init-connect", choices=("sparse", "full", "none"),
-                    default="sparse",
-                    help="gen-0 wiring: sparse (FS-NEAT style, default) gives each "
-                         "output --init-k random inputs + bias with fan-in-scaled "
-                         "weights; full saturates every output at wide input")
-    ap.add_argument("--init-k", type=int, default=12,
-                    help="inputs per output for --init-connect sparse")
+                    default="full",
+                    help="gen-0 wiring: full (default; §8) fan-in-scales every "
+                         "input->output edge so the decisive TANH head stays "
+                         "responsive and every latent/proprio/RAM-tap input is "
+                         "wired; sparse gives each output --init-k random inputs")
+    ap.add_argument("--init-k", type=int, default=32,
+                    help="inputs per output for --init-connect sparse (§8)")
     args = ap.parse_args()
 
     cfg = build_config(args)

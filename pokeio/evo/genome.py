@@ -71,6 +71,11 @@ class ConnGene:
     weight: float
     enabled: bool
     innov: int
+    # A protected edge is a connect+protected RAM-tap / proprioception shortcut
+    # (see :func:`make_genome`).  Evolution may re-weight it, but mutation must
+    # never disable or split it, so the sensory channel stays live from gen 0.
+    # Not packed into the batched tensors (Python-side mutation guard only).
+    protected: bool = False
 
 
 @dataclass
@@ -160,20 +165,48 @@ def make_genome(
     hidden_act: int = TANH,
     output_act: int = SIGMOID,
     sparse_k: int = 12,
+    n_ram: int = 0,
+    n_proprio: int = 0,
+    protect_ram_taps: bool = True,
+    protect_proprio: bool = True,
 ) -> Genome:
     """Create a minimal genome (inputs + bias + outputs).
 
-    ``connect='full'`` wires every input and the bias to every output with
-    random weights; ``connect='none'`` leaves it unconnected.
+    ``connect='full'`` wires every input and the bias to every output;
+    ``connect='none'`` leaves it unconnected; ``connect='sparse'`` (FS-NEAT
+    style) wires each output to ``sparse_k`` random inputs + the bias.
 
-    ``connect='sparse'`` (FS-NEAT style) wires each output to ``sparse_k``
-    random inputs + the bias, with fan-in-scaled weights.  At wide input
-    (n_in in the hundreds) 'full' is pathological: pre-activations have std
-    ~sqrt(n_in), every sigmoid output saturates to an exact 0.0/1.0, argmax
-    ties break by index, and the policy degenerates to a constant action
-    regardless of the screen.  Sparse seeds also give each genome a distinct
-    input subset — real behavioral diversity and meaningful disjoint-gene
-    distances for speciation — and honor NEAT's start-minimal principle.
+    Fan-in-scaled init (both modes)
+    -------------------------------
+    Weights are drawn ``N(0, std)`` with ``std = weight_scale / sqrt(fan_in+1)``
+    (``fan_in = n_in`` for ``full``, ``sparse_k`` for ``sparse``).  At wide input
+    (n_in in the hundreds) an **unscaled** ``full`` init is pathological:
+    pre-activations have std ~sqrt(n_in), a TANH/SIGMOID head saturates to exact
+    ±1 / {0,1}, argmax ties break by index, and the policy degenerates to a
+    constant action regardless of the screen.  Fan-in scaling keeps the head in
+    its responsive region so *every* wired input (all latent/pixel dims, all
+    proprio, all RAM taps) actually influences the output at gen 0.
+
+    RAM-tap / proprioception connect+protect (spec §7)
+    --------------------------------------------------
+    The trailing ``n_ram + n_proprio`` input ids
+    (``range(n_in - n_ram - n_proprio, n_in)``) are the sensory-shortcut block:
+    the last ``n_ram`` ids are mined RAM taps, the ``n_proprio`` before them are
+    the efference-copy proprioception vector.
+
+    * ``full`` already wires every input (incl. the whole block) to every output.
+    * ``sparse`` additionally wires **every** id in that block to **every**
+      output unconditionally (on top of the ``k`` random picks), so taps +
+      proprio are live from generation 0 rather than topologically dead.
+
+    Those tap->output / proprio->output edges are flagged ``protected=True``
+    (gated by ``protect_ram_taps`` / ``protect_proprio``); ``ops.mutate_toggle``
+    and ``ops.mutate_add_node`` skip protected edges, so evolution may re-weight
+    the channel but never sever it.
+
+    Safe defaults: with ``n_ram = n_proprio = 0`` (every existing caller) the
+    block is empty, nothing is protected, and ``sparse`` adds no extra edges —
+    the only change from before is the fan-in-scaled ``full`` weight std.
     """
     g = Genome(n_in=n_in, n_out=n_out)
     for i in g.input_ids():
@@ -182,13 +215,27 @@ def make_genome(
     for o in g.output_ids():
         g.nodes[o] = NodeGene(id=o, type=OUTPUT, act=output_act, bias=0.0)
 
+    # trailing connect-protected block:  [ ... proprio (n_proprio) | ram (n_ram) ]
+    ram_lo = n_in - n_ram
+    proprio_lo = ram_lo - n_proprio
+
+    def _protected_src(s: int) -> bool:
+        """Is input id ``s`` a protected tap/proprio shortcut source?"""
+        if n_ram and protect_ram_taps and ram_lo <= s < n_in:
+            return True
+        if n_proprio and protect_proprio and proprio_lo <= s < ram_lo:
+            return True
+        return False
+
     if connect == "full":
+        std = weight_scale / math.sqrt(n_in + 1)  # fan-in scaled: unsaturated head
         src_ids = list(g.input_ids()) + [g.bias_id]
         for s in src_ids:
+            prot = _protected_src(s)
             for o in g.output_ids():
                 innov = tracker.conn_innov(s, o)
-                w = float(rng.normal(0.0, weight_scale))
-                g.conns[innov] = ConnGene(s, o, w, True, innov)
+                w = float(rng.normal(0.0, std))
+                g.conns[innov] = ConnGene(s, o, w, True, innov, protected=prot)
     elif connect == "sparse":
         inputs = list(g.input_ids())
         k = max(1, min(int(sparse_k), len(inputs)))
@@ -203,6 +250,22 @@ def make_genome(
             g.conns[innov] = ConnGene(
                 g.bias_id, o, float(rng.normal(0.0, std)), True, innov
             )
+        # connect+protect: wire every trailing tap/proprio id to every output so
+        # the sensory channel is live from gen 0 (in addition to the random picks).
+        for s in range(proprio_lo, n_in):
+            prot = _protected_src(s)
+            for o in g.output_ids():
+                innov = tracker.conn_innov(s, o)
+                existing = g.conns.get(innov)
+                if existing is not None:
+                    # a random pick already created this edge; just protect it.
+                    existing.enabled = True
+                    if prot:
+                        existing.protected = True
+                else:
+                    g.conns[innov] = ConnGene(
+                        s, o, float(rng.normal(0.0, std)), True, innov, protected=prot
+                    )
     return g
 
 

@@ -42,7 +42,22 @@ _MODES = ("rarity", "per_gen", "global")
 
 
 class WaveNovelty:
-    """Tracks per-player novelty fitness for one evaluation wave."""
+    """Tracks per-player novelty fitness for one evaluation wave.
+
+    Two-ledger separation (active-vision spine §6). This class is **Ledger 1 —
+    exploration credit**: the rarity-novelty ``self.fitness[i]`` (``floor +
+    1/sqrt(1+prior_visits)`` per distinct reached cell) grows the archive/Go-
+    Explore frontier and picks restore cells.  It is deliberately *not* the
+    genome's NEAT selection fitness — a screen-blind constant at a rare restore
+    can rack up rarity credit for standing still.
+
+    The rarity credit semantics are unchanged from before; the only addition is
+    that the per-player raw ``f_i`` is now the documented input the training loop
+    reads (via :attr:`fitness` / :meth:`raw_fitness`) to compute the **Ledger 2**
+    policy fitness — the E2 per-cell leave-one-out advantage ``A_i`` that decouples
+    selection from spawn luck.  Ledger 2 lives in the loop
+    (``cohort_rank_normalize``); this class never mixes the two.
+    """
 
     def __init__(
         self,
@@ -85,6 +100,15 @@ class WaveNovelty:
         # visit count. (WaveNovelty is per-wave, so this snapshot is per-wave;
         # when the population fits one wave that is exactly the generation start.)
         self._visit_baseline: dict[bytes, int] = {}
+
+    def raw_fitness(self) -> np.ndarray:
+        """The per-player raw rarity credit ``f_i`` (Ledger 1) as a copy.
+
+        This is the exploration ledger only — the training loop feeds it, via the
+        E2 per-cell baseline, into the *separate* Ledger-2 policy fitness; it is
+        never itself the NEAT selection scalar.  Returned as a copy so callers
+        cannot mutate the live per-wave accumulator."""
+        return self.fitness.copy()
 
     def _rarity_baseline(self, key: bytes, prior_visits: int) -> int:
         """Return the shared, order-independent visit baseline for ``key``.

@@ -97,8 +97,19 @@ def mutate_add_connection(
     rates: MutationRates,
     weight_scale: float = 1.0,
     tries: int = 20,
+    prefer_unconnected: bool = True,
+    prefer_unconnected_weight: float = 4.0,
 ) -> bool:
-    """Add a new enabled connection between two currently-unlinked nodes."""
+    """Add a new enabled connection between two currently-unlinked nodes.
+
+    Prefer-unconnected source sampling (spec §8): with ``prefer_unconnected`` on,
+    INPUT nodes that currently have **zero out-edges** are sampled as the source
+    with weight ``prefer_unconnected_weight`` (default 4.0) relative to 1.0 for
+    every other source.  This applies wiring pressure toward the many
+    still-unwired optical/latent inputs instead of re-wiring already-connected
+    ones (the diagnosed "only 111/576 pixels wired" pathology).  With the
+    defaults off / weight 1.0 the sampler is exactly uniform (back-compatible).
+    """
     # sources: anything that can emit (not, by convention, into an input/bias)
     src_pool = [nid for nid, ng in g.nodes.items() if ng.type != OUTPUT] + [
         nid for nid, ng in g.nodes.items() if ng.type == OUTPUT and not rates.feedforward
@@ -107,9 +118,29 @@ def mutate_add_connection(
     if not src_pool or not dst_pool:
         return False
 
+    # weighted source distribution: boost unwired INPUT nodes (else uniform).
+    src_p = None
+    if prefer_unconnected and prefer_unconnected_weight != 1.0:
+        out_deg: dict[int, int] = {}
+        for c in g.conns.values():
+            out_deg[c.in_id] = out_deg.get(c.in_id, 0) + 1
+        w = np.fromiter(
+            (
+                prefer_unconnected_weight
+                if (g.nodes[nid].type == INPUT and out_deg.get(nid, 0) == 0)
+                else 1.0
+                for nid in src_pool
+            ),
+            dtype=np.float64,
+            count=len(src_pool),
+        )
+        total = w.sum()
+        if total > 0.0:
+            src_p = w / total
+
     existing = {(c.in_id, c.out_id) for c in g.conns.values()}
     for _ in range(tries):
-        s = int(rng.choice(src_pool))
+        s = int(rng.choice(src_pool, p=src_p))
         d = int(rng.choice(dst_pool))
         if s == d or (s, d) in existing:
             continue
@@ -129,8 +160,12 @@ def mutate_add_node(
     g: Genome, tracker: InnovationTracker, rng: np.random.Generator
 ) -> bool:
     """Split an enabled connection: disable it, insert a hidden node, add
-    ``in->new`` (weight 1) and ``new->out`` (old weight)."""
-    enabled = [c for c in g.conns.values() if c.enabled]
+    ``in->new`` (weight 1) and ``new->out`` (old weight).
+
+    Protected edges (connect+protected RAM-tap / proprio shortcuts) are excluded
+    from the split-candidate list: splitting disables the original edge, which
+    would sever the protected sensory channel."""
+    enabled = [c for c in g.conns.values() if c.enabled and not c.protected]
     if not enabled:
         return False
     c = enabled[int(rng.integers(len(enabled)))]
@@ -148,9 +183,12 @@ def mutate_add_node(
 
 
 def mutate_toggle(g: Genome, rng: np.random.Generator) -> None:
-    if not g.conns:
+    # never toggle a protected edge — it must stay live (evolution re-weights,
+    # not re-wires, the connect+protected sensory shortcuts).
+    candidates = [c for c in g.conns.values() if not c.protected]
+    if not candidates:
         return
-    c = list(g.conns.values())[int(rng.integers(len(g.conns)))]
+    c = candidates[int(rng.integers(len(candidates)))]
     c.enabled = not c.enabled
 
 
@@ -202,13 +240,20 @@ def crossover(
         if c2 is not None:
             # matching gene -> pick a parent's weight at random
             src = c1 if rng.random() < 0.5 else c2
-            gene = ConnGene(src.in_id, src.out_id, src.weight, True, innov)
+            # protection is a structural property of the edge (same innov in both
+            # parents), so it survives crossover — the channel is never severed.
+            prot = c1.protected or c2.protected
+            gene = ConnGene(src.in_id, src.out_id, src.weight, True, innov, protected=prot)
             if (not c1.enabled or not c2.enabled) and rng.random() < disabled_inherit_prob:
                 gene.enabled = False
+            if prot:
+                gene.enabled = True  # never let a protected channel be disabled
             child.conns[innov] = gene
         else:
             # disjoint/excess -> inherit from fitter parent
-            child.conns[innov] = ConnGene(c1.in_id, c1.out_id, c1.weight, c1.enabled, innov)
+            child.conns[innov] = ConnGene(
+                c1.in_id, c1.out_id, c1.weight, c1.enabled, innov, protected=c1.protected
+            )
 
     # collect the nodes the child needs; take gene attrs from p1, else p2.
     needed: set[int] = set()

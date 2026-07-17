@@ -42,7 +42,7 @@ from multiprocessing import shared_memory  # noqa: E402
 import numpy as np  # noqa: E402
 import psutil  # noqa: E402
 
-from pokeio.config import Config
+from pokeio.config import Config, VisionConfig
 from pokeio.vision.preprocess import ObsBuilder
 
 # NUMA topology of the target box (2x Xeon E5-2690 v4). Kept here so pinning is
@@ -439,6 +439,258 @@ class ObsEncoder:
 
 
 # ==========================================================================
+# FovealEncoder — active-vision obs (periphery + movable fovea + motion +
+# proprioception + connect-protected RAM taps).  See
+# docs/specs/active-vision-spine.md §2 (obs tensor) and §3.3-§3.4 (saccade).
+# ==========================================================================
+# Drop-in replacement for ObsEncoder.  Torch-free (numpy only) so the spawned
+# barrier/async workers can import it without pulling torch into 32 processes;
+# loop.py (the parent) imports the SAME class so the parent encode and BOTH
+# worker _emit paths call one code path and emit byte-identical vectors.
+#
+# Fixed 454-dim float32 layout (G = periph_grid = 12, F = fovea_native_px = 48,
+# n_ram = 8), all blocks contiguous:
+#     periphery [0:144]     144x160 -> area-resample to GxG                [0,1]
+#     fovea     [144:288]   native FxF crop @ gaze (gy,gx) -> resample F->G [0,1]
+#     motion    [288:432]   (periph_t - periph_{t-1} + 1)/2; 0.5 if no prev [0,1]
+#     proprio   [432:446]   14-d efference copy (see _proprio)            [-1,1]
+#     ram       [446:454]   mined tap bytes (connect-protected trailing)   [0,1]
+#
+# Stateful PER ENV (indexed by env id): gaze (gy,gx), last saccade (dx,dy),
+# previous periphery (motion), and a per-episode step counter (step_frac).
+class FovealEncoder:
+    """Stateful periphery+fovea+motion+proprio+ram encoder (spec §2/§3).
+
+    Usage (identical in the parent and in both worker _emit paths)::
+
+        enc = FovealEncoder(n_envs, periph_grid=12, fovea_native_px=48,
+                            n_ram=8, saccade_gain=32, saccade_every_k=1,
+                            episode_steps=<wave/episode length>)
+        enc.reset()                              # gaze -> center, motion -> 0.5
+        # per agent-step, for env i:
+        enc.update_gaze(i, dx, dy)               # §3.3 saccade dynamics + store
+        vec = enc.encode(i, screen, wram, button=applied_button)
+
+    ``.dim`` is 454 for the committed defaults.  ``.reset(i)`` resets one env;
+    ``.reset()`` resets all.  Gaze resets to screen centre ``(gy, gx)=(72, 80)``.
+    """
+
+    def __init__(
+        self,
+        n_envs: int = 1,
+        *,
+        periph_grid: int = 12,
+        fovea_native_px: int = 48,
+        n_ram: int = 8,
+        saccade_gain: float = 32.0,
+        saccade_every_k: int = 1,
+        screen_h: int = _SCREEN_H,
+        screen_w: int = _SCREEN_W,
+        shades: int = 4,
+        episode_steps: int = 1024,
+    ) -> None:
+        self.n_envs = int(n_envs)
+        self.G = int(periph_grid)
+        self.F = int(fovea_native_px)
+        self.n_ram = int(n_ram)
+        self.gain = float(saccade_gain)
+        self.every_k = max(1, int(saccade_every_k))
+        self.H = int(screen_h)
+        self.W = int(screen_w)
+        self.shades = int(shades)
+        self.episode_steps = max(1, int(episode_steps))
+
+        g = self.G
+        self.n_periph = g * g
+        self.n_fovea = g * g
+        self.n_motion = g * g
+        self.n_proprio = 14
+        self.dim = self.n_periph + self.n_fovea + self.n_motion + self.n_proprio + self.n_ram
+
+        # Block offsets (contiguous).
+        self._o_periph = 0
+        self._o_fovea = self.n_periph
+        self._o_motion = self._o_fovea + self.n_fovea
+        self._o_proprio = self._o_motion + self.n_motion
+        self._o_ram = self._o_proprio + self.n_proprio
+
+        # Fovea centre clamp: keep the FxF window fully on-screen (spec §3.3).
+        self._half = self.F // 2
+        self._gx_lo, self._gx_hi = float(self._half), float(self.W - self._half)
+        self._gy_lo, self._gy_hi = float(self._half), float(self.H - self._half)
+        self._cy = self.H // 2  # 72 (row centre)
+        self._cx = self.W // 2  # 80 (col centre)
+
+        # Area-resample matrices (built once).
+        self._prow = _area_matrix(self.H, g)     # (G, H) periphery rows
+        self._pcol = _area_matrix(self.W, g).T   # (W, G) periphery cols
+        self._frow = _area_matrix(self.F, g)     # (G, F) fovea rows
+        self._fcol = _area_matrix(self.F, g).T   # (F, G) fovea cols
+
+        # Reuse the EXACT per-frame shade ranking used by the rest of the
+        # pipeline (ObsBuilder.normalize_shades) so grayscale is consistent.
+        self._shade = ObsBuilder(
+            VisionConfig(shades=self.shades, screen_height=self.H, screen_width=self.W)
+        )
+
+        # Per-env state.
+        self._gy = np.empty(self.n_envs, np.float64)
+        self._gx = np.empty(self.n_envs, np.float64)
+        self._last_dx = np.zeros(self.n_envs, np.float64)
+        self._last_dy = np.zeros(self.n_envs, np.float64)
+        self._nstep = np.zeros(self.n_envs, np.int64)
+        self._prev_periph: list = [None] * self.n_envs
+        self.tap_addrs: list[int] = []  # parent-path mined taps (see set_taps)
+        self.reset()
+
+    # ------------------------------------------------------------------ reset
+    def reset(self, env_idx: int | None = None) -> None:
+        """Reset gaze to centre + clear motion/efference for one env (or all)."""
+        idxs = range(self.n_envs) if env_idx is None else (int(env_idx),)
+        for i in idxs:
+            self._gy[i] = float(self._cy)
+            self._gx[i] = float(self._cx)
+            self._last_dx[i] = 0.0
+            self._last_dy[i] = 0.0
+            self._nstep[i] = 0
+            self._prev_periph[i] = None
+
+    # -------------------------------------------------------------- saccade
+    def update_gaze(self, env_idx: int, dx: float, dy: float) -> tuple[float, float]:
+        """Integrate one saccade command into the gaze centre (spec §3.3).
+
+        ``gx <- clip(gx + GAIN*tanh(dx), F/2, W-F/2)`` = clip(.., 24, 136);
+        ``gy <- clip(gy + GAIN*tanh(dy), F/2, H-F/2)`` = clip(.., 24, 120).
+        Applied every ``saccade_every_k`` steps; the raw command ``(dx, dy)`` is
+        always stored as the efference copy and the per-episode step counter is
+        advanced.  Returns the new ``(gy, gx)``.
+        """
+        i = int(env_idx)
+        self._last_dx[i] = float(dx)
+        self._last_dy[i] = float(dy)
+        if int(self._nstep[i]) % self.every_k == 0:
+            self._gx[i] = float(np.clip(
+                self._gx[i] + self.gain * np.tanh(float(dx)), self._gx_lo, self._gx_hi))
+            self._gy[i] = float(np.clip(
+                self._gy[i] + self.gain * np.tanh(float(dy)), self._gy_lo, self._gy_hi))
+        self._nstep[i] += 1
+        return float(self._gy[i]), float(self._gx[i])
+
+    def gaze(self, env_idx: int) -> tuple[float, float]:
+        """Current ``(gy, gx)`` fovea centre for an env (for telemetry/tests)."""
+        i = int(env_idx)
+        return float(self._gy[i]), float(self._gx[i])
+
+    def set_taps(self, addrs: list[int] | None) -> None:
+        """Point the RAM tail at mined counter addresses (parent path).
+
+        When set, :meth:`encode` overlays ``wram[addr-0xC000]`` onto the ram
+        block from the FULL wram it is passed (mirrors ObsEncoder.set_taps).
+        Workers leave this empty and overlay from live emulator memory in
+        ``_emit`` instead (they only hold a strided wram slice)."""
+        self.tap_addrs = list(addrs) if addrs else []
+
+    # --------------------------------------------------------------- helpers
+    def _crop(self, norm: np.ndarray, gy: float, gx: float) -> np.ndarray:
+        """Native FxF crop centred at (gy,gx); zero-padded on edge overhang."""
+        f, half = self.F, self._half
+        out = np.zeros((f, f), np.float64)
+        top = int(np.floor(gy + 0.5)) - half   # round gaze to nearest pixel
+        left = int(np.floor(gx + 0.5)) - half
+        sr0, sr1 = max(0, top), min(self.H, top + f)
+        sc0, sc1 = max(0, left), min(self.W, left + f)
+        if sr1 > sr0 and sc1 > sc0:
+            dr0, dc0 = sr0 - top, sc0 - left
+            out[dr0 : dr0 + (sr1 - sr0), dc0 : dc0 + (sc1 - sc0)] = norm[sr0:sr1, sc0:sc1]
+        return out
+
+    def _proprio(self, i: int, button: int) -> np.ndarray:
+        """14-d efference copy (spec §2.1), all in [-1,1].
+
+        [gx*2/W-1, gy*2/H-1, dx_prev, dy_prev,
+         up,down,left,right,A,B,START,SELECT,NOOP one-hot, step_frac]."""
+        p = np.zeros(self.n_proprio, np.float32)
+        p[0] = self._gx[i] / self.W * 2.0 - 1.0
+        p[1] = self._gy[i] / self.H * 2.0 - 1.0
+        p[2] = np.float32(self._last_dx[i])
+        p[3] = np.float32(self._last_dy[i])
+        b = int(button)
+        if 0 <= b < 9:  # button ids match emu.env.ACTIONS ordering
+            p[4 + b] = 1.0
+        p[13] = min(float(self._nstep[i]) / float(self.episode_steps), 1.0)
+        return p
+
+    def _ram(self, wram: np.ndarray | None) -> np.ndarray:
+        """Blind stride sample of WRAM into the ram block (taps overlaid after).
+
+        Byte-identical whether given the full 8 KB wram (parent) or the strided
+        slice the workers hold, because ``stride = size//n_ram`` composes: e.g.
+        raw[::1024][:8] == raw[::64][::16][:8] (1024 % 64 == 0)."""
+        ram = np.zeros(self.n_ram, np.float32)
+        if self.n_ram > 0 and wram is not None:
+            w = np.asarray(wram)
+            if w.size:
+                stride = max(1, w.size // self.n_ram)
+                seg = (w[::stride][: self.n_ram].astype(np.float32)) / 255.0
+                ram[: seg.size] = seg
+        return ram
+
+    # ------------------------------------------------------------------ encode
+    def encode(
+        self,
+        env_idx: int,
+        screen: np.ndarray,
+        wram: np.ndarray | None = None,
+        *,
+        button: int = 8,
+        taps: list[tuple[int, float]] | None = None,
+    ) -> np.ndarray:
+        """Build the 454-d obs vector for env ``env_idx`` from its current state.
+
+        ``screen`` is a raw (H,W) uint8 frame; ``wram`` is the full 8 KB block
+        (parent) or the strided slice (worker).  ``button`` is the button id
+        just applied (0..8, defaults to NOOP for the reset obs).  ``taps`` is an
+        optional list of ``(ram_slot, value01)`` overlays.  Call
+        :meth:`update_gaze` first each step so the fovea crop and proprio see
+        the freshly-integrated gaze (the workers do exactly this in ``_emit``).
+        """
+        i = int(env_idx)
+        norm = self._shade.normalize_shades(screen)          # (H,W) float32 [0,1]
+        normd = norm.astype(np.float64)
+
+        periph = (self._prow @ normd @ self._pcol).astype(np.float32)   # (G,G)
+        crop = self._crop(normd, self._gy[i], self._gx[i])             # (F,F)
+        fov = (self._frow @ crop @ self._fcol).astype(np.float32)      # (G,G)
+
+        prev = self._prev_periph[i]
+        if prev is None:
+            motion = np.full((self.G, self.G), 0.5, np.float32)
+        else:
+            motion = (((periph - prev) + 1.0) * 0.5).astype(np.float32)
+        self._prev_periph[i] = periph
+
+        proprio = self._proprio(i, button)
+        ram = self._ram(wram)
+        if self.tap_addrs and wram is not None:  # parent path: overlay from wram
+            for j, a in enumerate(self.tap_addrs[: self.n_ram]):
+                idx = a - 0xC000
+                if 0 <= idx < wram.size:
+                    ram[j] = wram[idx] / 255.0
+        if taps:  # explicit (slot, value01) overlay
+            for slot, v in taps:
+                if 0 <= slot < self.n_ram:
+                    ram[slot] = np.float32(v)
+
+        vec = np.empty(self.dim, np.float32)
+        vec[self._o_periph : self._o_fovea] = periph.ravel()
+        vec[self._o_fovea : self._o_motion] = fov.ravel()
+        vec[self._o_motion : self._o_proprio] = motion.ravel()
+        vec[self._o_proprio : self._o_ram] = proprio
+        vec[self._o_ram : self.dim] = ram
+        return vec
+
+
+# ==========================================================================
 # BarrierFleet — shared-memory, spin-barrier, in-worker hashing/encoding
 # ==========================================================================
 # Ops signalled to workers via the shared control block.
@@ -576,6 +828,7 @@ def _barrier_worker_main(
     slice_lo, slice_hi, rom_path, frame_skip, hold_frames, reset_state,
     obs_res, obs_ram, wram_stride, arch_kwargs, goexplore,
     shm_names, n_envs, obs_dim, key_len, core, state_cap,
+    periph_grid, fovea_native_px, saccade_gain, saccade_every_k, episode_steps,
 ):
     """Worker process: owns envs ``[slice_lo:slice_hi]``; hashes + encodes locally.
 
@@ -599,7 +852,20 @@ def _barrier_worker_main(
     except Exception:
         pass
 
-    encoder = ObsEncoder(obs_res, obs_ram)
+    # Active-vision foveal encoder (stateful per env; §2/§3) when the requested
+    # obs_dim matches the foveal layout; else fall back to the legacy flat
+    # ObsEncoder (back-compat for callers that still ask for res^2+ram obs).
+    # n_envs-wide so it can be indexed by the GLOBAL env id (= shm obs rows).
+    _foveal_dim = 3 * periph_grid * periph_grid + 14 + obs_ram
+    use_foveal = int(obs_dim) == int(_foveal_dim)
+    if use_foveal:
+        encoder = FovealEncoder(
+            n_envs, periph_grid=periph_grid, fovea_native_px=fovea_native_px,
+            n_ram=obs_ram, saccade_gain=saccade_gain,
+            saccade_every_k=saccade_every_k, episode_steps=episode_steps,
+        )
+    else:
+        encoder = ObsEncoder(obs_res, obs_ram)
     archive = NoveltyArchive(**arch_kwargs)  # used only as a stateless key hasher
 
     def _attach(name, shape, dtype):
@@ -617,6 +883,8 @@ def _barrier_worker_main(
     screens = reg("screens", (n_envs, _SCREEN_H, _SCREEN_W), np.uint8)
     keys = reg("keys", (n_envs, key_len), np.uint8)
     actions = reg("actions", (n_envs,), np.int32)
+    gaze_dx = reg("gaze_dx", (n_envs,), np.float32)  # saccade cmd (exact float)
+    gaze_dy = reg("gaze_dy", (n_envs,), np.float32)
     dones = reg("dones", (n_envs,), np.uint8)
     cap_flag = reg("cap_flag", (n_envs,), np.uint8)
     cap_done = reg("cap_done", (n_envs,), np.uint8)
@@ -628,15 +896,31 @@ def _barrier_worker_main(
     res_len = reg("res_len", (n_envs,), np.int32)
     # [0]=go_round [1]=op [2]=pace(1=realtime sleep-waits) [3+i]=wdone_i
     ctl = reg("ctl", (3 + n_envs,), np.int64)
+    # mined progress-counter taps: [0]=version, [1:]=GB addresses (0=unset).
+    tapcfg = reg("tapcfg", (1 + obs_ram,), np.int64)
 
     envs = [
         PokeEnv(rom_path, frame_skip=frame_skip, hold_frames=hold_frames)
         for _ in range(slice_lo, slice_hi)
     ]
 
-    def _emit(local_i, global_i, screen, w64):
+    tap_ver = 0
+    taps: list[tuple[int, int]] = []  # (obs column, GB address)
+    _tap_base = obs_dim - obs_ram
+
+    def _emit(local_i, global_i, screen, w64, button):
+        env = envs[local_i]
         screens[global_i] = screen
-        obs[global_i] = encoder.encode_compact(screen, w64)
+        if use_foveal:
+            obs[global_i] = encoder.encode(global_i, screen, w64, button=button)
+        else:
+            obs[global_i] = encoder.encode_compact(screen, w64)
+        # Overlay mined counter taps identically to the async path (was MISSING
+        # here — connect-protected taps otherwise saw the blind stride sample).
+        if taps:
+            mem = env.pyboy.memory
+            for col, a in taps:
+                obs[global_i, col] = mem[a] / 255.0
         k = archive.cell_key_compact(screen, w64)
         keys[global_i] = np.frombuffer(k, dtype=np.uint8)
 
@@ -655,9 +939,18 @@ def _barrier_worker_main(
             op = int(ctl[1])
             if op == _OP_SHUTDOWN:
                 break
+            if op == _OP_RESET and int(tapcfg[0]) != tap_ver:  # new mined taps
+                tap_ver = int(tapcfg[0])
+                taps = [
+                    (_tap_base + j, int(tapcfg[1 + j]))
+                    for j in range(obs_ram)
+                    if int(tapcfg[1 + j]) > 0
+                ]
             for li, gi in enumerate(range(slice_lo, slice_hi)):
                 env = envs[li]
                 if op == _OP_RESET:
+                    if use_foveal:
+                        encoder.reset(gi)  # gaze -> centre, motion -> 0.5
                     if goexplore and res_flag[gi]:
                         env.load_state(bytes(res_state[gi, : int(res_len[gi])]))
                         env.pyboy.tick(1, True)
@@ -667,8 +960,12 @@ def _barrier_worker_main(
                         screen = env.reset(reset_state)
                         w64 = env.wram_strided(wram_stride)
                     dones[gi] = 0
-                    _emit(li, gi, screen, w64)
+                    _emit(li, gi, screen, w64, 8)  # reset obs: last button = NOOP
                 else:  # _OP_STEP
+                    # Integrate this step's saccade command BEFORE _emit builds
+                    # the obs, so the fovea crop + proprio see the new gaze (§3.4).
+                    if use_foveal:
+                        encoder.update_gaze(gi, float(gaze_dx[gi]), float(gaze_dy[gi]))
                     # Deferred Go-Explore capture: save the state we are STILL in
                     # (from last round) before applying this round's action.
                     if goexplore and cap_flag[gi]:
@@ -698,7 +995,7 @@ def _barrier_worker_main(
                         cap_done[gi] = 0
                     screen, w64, done = env.step_fast(int(actions[gi]), wram_stride)
                     dones[gi] = 1 if done else 0
-                    _emit(li, gi, screen, w64)
+                    _emit(li, gi, screen, w64, int(actions[gi]))
             # signal this round complete
             for gi in range(slice_lo, slice_hi):
                 ctl[3 + gi] = local_round
@@ -742,11 +1039,21 @@ class BarrierFleet:
         goexplore: bool = False,
         envs_per_worker: int = 1,
         round_deadline_s: float | None = None,
+        periph_grid: int = 12,
+        fovea_native_px: int = 48,
+        saccade_gain: float = 32.0,
+        saccade_every_k: int = 1,
+        episode_steps: int = 1024,
     ):
         self.n_envs = int(n_envs)
         self.obs_dim = int(obs_dim)
+        self.obs_ram = int(obs_ram)
         self.goexplore = bool(goexplore)
         self.wram_stride = int(wram_stride)
+        self._foveal = (
+            int(periph_grid), int(fovea_native_px), float(saccade_gain),
+            int(saccade_every_k), int(episode_steps),
+        )
 
         # Derive the fixed cell-key length from the archive's geometry.
         probe = _archive_key_len(archive_kwargs, wram_stride)
@@ -780,6 +1087,8 @@ class BarrierFleet:
         alloc("screens", (n, _SCREEN_H, _SCREEN_W), np.uint8)
         alloc("keys", (n, self.key_len), np.uint8)
         alloc("actions", (n,), np.int32)
+        alloc("gaze_dx", (n,), np.float32)  # saccade cmd dx (exact, per env)
+        alloc("gaze_dy", (n,), np.float32)  # saccade cmd dy (exact, per env)
         alloc("dones", (n,), np.uint8)
         alloc("cap_flag", (n,), np.uint8)
         alloc("cap_done", (n,), np.uint8)
@@ -790,6 +1099,8 @@ class BarrierFleet:
         alloc("res_state", (n, self.state_cap), np.uint8)
         alloc("res_len", (n,), np.int32)
         alloc("ctl", (3 + n,), np.int64)
+        # mined progress-counter taps: [0]=version, [1:]=GB addresses (0=unset).
+        alloc("tapcfg", (1 + self.obs_ram,), np.int64)
 
         self._ctl = self.arr["ctl"]
         self._ctl[:] = 0
@@ -819,6 +1130,7 @@ class BarrierFleet:
                     obs_res, obs_ram, self.wram_stride, dict(archive_kwargs),
                     self.goexplore, self._shm_names, n, self.obs_dim,
                     self.key_len, core, self.state_cap,
+                    *self._foveal,
                 ),
                 daemon=True,
             )
@@ -960,15 +1272,37 @@ class BarrierFleet:
         self.reset_all_begin(restore)
         return self.reset_all_end()
 
-    def step_all(self, actions: np.ndarray, capture_flags: np.ndarray | None = None):
+    def step_all(
+        self,
+        actions: np.ndarray,
+        capture_flags: np.ndarray | None = None,
+        gaze_dx: np.ndarray | None = None,
+        gaze_dy: np.ndarray | None = None,
+    ):
         """Advance one agent-step; return ``(obs, keys, dones, captured)``.
 
+        ``actions`` (len n int) is the per-env button id. ``gaze_dx``/``gaze_dy``
+        (len n float, exact — no quantization) are the per-env saccade commands;
+        each worker integrates them into its gaze (§3.3) BEFORE building the obs.
+        Omit them (None) to hold the gaze fixed this step (dx=dy=0).
         ``capture_flags`` (len n, uint8) requests a Go-Explore state capture for
         the flagged envs BEFORE they apply this step's action — i.e. it captures
         the state reported in the *previous* round.  ``captured`` maps env index
         -> state bytes for envs that captured this round.
+
+        ``capture_flags`` stays the 2nd positional arg for back-compat with the
+        pre-saccade call ``step_all(actions, capture_flags)``; pass the saccade
+        by keyword: ``step_all(actions, capture_flags=cf, gaze_dx=..., gaze_dy=...)``.
         """
         self.arr["actions"][: len(actions)] = np.asarray(actions, dtype=np.int32)
+        if gaze_dx is not None:
+            self.arr["gaze_dx"][: len(gaze_dx)] = np.asarray(gaze_dx, dtype=np.float32)
+        else:
+            self.arr["gaze_dx"][:] = 0.0
+        if gaze_dy is not None:
+            self.arr["gaze_dy"][: len(gaze_dy)] = np.asarray(gaze_dy, dtype=np.float32)
+        else:
+            self.arr["gaze_dy"][:] = 0.0
         if self.goexplore and capture_flags is not None:
             self.arr["cap_flag"][:] = capture_flags
         else:
@@ -994,6 +1328,20 @@ class BarrierFleet:
 
     def key_bytes(self, i: int) -> bytes:
         return self.arr["keys"][i].tobytes()
+
+    def set_tap_addrs(self, addrs: list[int]) -> None:
+        """Point the obs RAM tail at mined progress-counter addresses.
+
+        Workers re-read the tap config at the next reset round (generation
+        boundary), so call this BEFORE :meth:`reset_all_begin`. Up to
+        ``obs_ram`` GB addresses; unset slots keep the blind stride sample.
+        Mirrors :meth:`AsyncFleet.set_tap_addrs` so the barrier path overlays
+        the same connect-protected taps (previously it never did)."""
+        cfg = self.arr["tapcfg"]
+        k = min(len(addrs), self.obs_ram)
+        cfg[1 : 1 + k] = np.asarray(addrs[:k], dtype=np.int64)
+        cfg[1 + k :] = 0
+        cfg[0] += 1  # version bump LAST (x86 TSO: workers see addrs first)
 
     # ------------------------------------------------------------------ shutdown
     def close(self) -> None:
@@ -1070,6 +1418,7 @@ def _async_worker_main(
     slice_lo, slice_hi, rom_path, frame_skip, hold_frames, reset_state,
     obs_res, obs_ram, wram_stride, arch_kwargs, goexplore,
     shm_names, n_envs, obs_dim, key_len, core, state_cap,
+    periph_grid, fovea_native_px, saccade_gain, saccade_every_k, episode_steps,
 ):
     """Free-running worker: owns envs ``[slice_lo:slice_hi]``.
 
@@ -1091,7 +1440,19 @@ def _async_worker_main(
     except Exception:
         pass
 
-    encoder = ObsEncoder(obs_res, obs_ram)
+    # Active-vision foveal encoder (stateful per env; §2/§3) when obs_dim matches
+    # the foveal layout; else the legacy flat ObsEncoder (back-compat). Indexed
+    # by GLOBAL env id to match the shm obs rows.
+    _foveal_dim = 3 * periph_grid * periph_grid + 14 + obs_ram
+    use_foveal = int(obs_dim) == int(_foveal_dim)
+    if use_foveal:
+        encoder = FovealEncoder(
+            n_envs, periph_grid=periph_grid, fovea_native_px=fovea_native_px,
+            n_ram=obs_ram, saccade_gain=saccade_gain,
+            saccade_every_k=saccade_every_k, episode_steps=episode_steps,
+        )
+    else:
+        encoder = ObsEncoder(obs_res, obs_ram)
     archive = NoveltyArchive(**arch_kwargs)  # stateless key hasher
 
     shms = []
@@ -1105,6 +1466,8 @@ def _async_worker_main(
     screens = reg("screens", (n_envs, _SCREEN_H, _SCREEN_W), np.uint8)
     keys = reg("keys", (n_envs, key_len), np.uint8)
     actions = reg("actions", (n_envs,), np.int32)
+    gaze_dx = reg("gaze_dx", (n_envs,), np.float32)  # saccade cmd (exact float)
+    gaze_dy = reg("gaze_dy", (n_envs,), np.float32)
     dones = reg("dones", (n_envs,), np.uint8)
     obs_seq = reg("obs_seq", (n_envs,), np.int64)
     act_seq = reg("act_seq", (n_envs,), np.int64)
@@ -1131,9 +1494,12 @@ def _async_worker_main(
     taps: list[tuple[int, int]] = []  # (obs column, GB address)
     warned_trunc = False
 
-    def _emit(gi, env, screen, w64):
+    def _emit(gi, env, screen, w64, button):
         screens[gi] = screen
-        obs[gi] = encoder.encode_compact(screen, w64)
+        if use_foveal:
+            obs[gi] = encoder.encode(gi, screen, w64, button=button)
+        else:
+            obs[gi] = encoder.encode_compact(screen, w64)
         # Mined counter taps replace the blind stride sample in the RAM tail:
         # the agent SEES its progress counters, and the parent reads them from
         # the obs rows it already books to score progress fitness.
@@ -1168,6 +1534,8 @@ def _async_worker_main(
                     ]
                 for li, gi in enumerate(my):
                     env = envs[li]
+                    if use_foveal:
+                        encoder.reset(gi)  # gaze -> centre, motion -> 0.5
                     if goexplore and res_flag[gi]:
                         env.load_state(bytes(res_state[gi, : int(res_len[gi])]))
                         env.pyboy.tick(1, True)
@@ -1177,13 +1545,15 @@ def _async_worker_main(
                         screen = env.reset(reset_state)
                         w64 = env.wram_strided(wram_stride)
                     dones[gi] = 0
-                    _emit(gi, env, screen, w64)
+                    _emit(gi, env, screen, w64, 8)  # reset obs: last button = NOOP
                     obs_seq[gi] = 0
                     ctl[4 + gi] = local_round
                 local_round += 1
                 continue
             # ---- _OP_RUN: free-run until every owned env reaches the target
             target = int(ctl[3])
+            if use_foveal:
+                encoder.episode_steps = max(1, target)  # step_frac denominator
             spins = 0
             while True:
                 progressed = False
@@ -1192,6 +1562,10 @@ def _async_worker_main(
                     if k >= target or act_seq[gi] != k:
                         continue
                     env = envs[li]
+                    # Integrate obs k's saccade command into the gaze BEFORE the
+                    # step + _emit build obs k+1 (§3.4; one-tick efference delay).
+                    if use_foveal:
+                        encoder.update_gaze(gi, float(gaze_dx[gi]), float(gaze_dy[gi]))
                     # Deferred Go-Explore capture: save the state we are STILL
                     # in (obs k) before applying obs k's action — same semantics
                     # as the barrier engine, minus the fleet-wide stall.
@@ -1222,7 +1596,7 @@ def _async_worker_main(
                         int(actions[gi]), wram_stride
                     )
                     dones[gi] = 1 if done else 0
-                    _emit(gi, env, screen, w64)
+                    _emit(gi, env, screen, w64, int(actions[gi]))
                     obs_seq[gi] = k + 1  # publish AFTER the payload rows
                     progressed = True
                 if progressed:
@@ -1278,12 +1652,21 @@ class AsyncFleet:
         goexplore: bool = False,
         envs_per_worker: int = 1,
         round_deadline_s: float | None = None,
+        periph_grid: int = 12,
+        fovea_native_px: int = 48,
+        saccade_gain: float = 32.0,
+        saccade_every_k: int = 1,
+        episode_steps: int = 1024,
     ):
         self.n_envs = int(n_envs)
         self.obs_dim = int(obs_dim)
         self.obs_ram = int(obs_ram)
         self.goexplore = bool(goexplore)
         self.wram_stride = int(wram_stride)
+        self._foveal = (
+            int(periph_grid), int(fovea_native_px), float(saccade_gain),
+            int(saccade_every_k), int(episode_steps),
+        )
         self.key_len = _archive_key_len(archive_kwargs, wram_stride)
         # A5: probe the real save_state size to size the transport buffers.
         self.state_cap = (
@@ -1308,6 +1691,8 @@ class AsyncFleet:
         alloc("screens", (n, _SCREEN_H, _SCREEN_W), np.uint8)
         alloc("keys", (n, self.key_len), np.uint8)
         alloc("actions", (n,), np.int32)
+        alloc("gaze_dx", (n,), np.float32)  # saccade cmd dx (exact, per env)
+        alloc("gaze_dy", (n,), np.float32)  # saccade cmd dy (exact, per env)
         alloc("dones", (n,), np.uint8)
         alloc("obs_seq", (n,), np.int64)
         alloc("act_seq", (n,), np.int64)
@@ -1352,6 +1737,7 @@ class AsyncFleet:
                     obs_res, obs_ram, self.wram_stride, dict(archive_kwargs),
                     self.goexplore, self._shm_names, n, self.obs_dim,
                     self.key_len, core, self.state_cap,
+                    *self._foveal,
                 ),
                 daemon=True,
             )
@@ -1381,6 +1767,27 @@ class AsyncFleet:
         cfg[1 : 1 + k] = np.asarray(addrs[:k], dtype=np.int64)
         cfg[1 + k :] = 0
         cfg[0] += 1  # version bump LAST (x86 TSO: workers see addrs first)
+
+    # ------------------------------------------------------------------ actions
+    def submit_actions(self, idx, buttons, gaze_dx, gaze_dy, obs_idx) -> None:
+        """Publish per-env button + saccade for a batch of ready envs (§3.4).
+
+        Replaces the parent's inline ``actions[idx]=..; act_seq[idx]=..`` in the
+        free-run act/observe loop. ``idx`` is the int array of env indices whose
+        newest obs is being answered; ``buttons`` the argmax button ids for those
+        envs; ``gaze_dx``/``gaze_dy`` the EXACT saccade floats (no quantization);
+        ``obs_idx`` the obs-sequence index each action answers (the value to
+        write into ``act_seq``). Payload rows (gaze + actions) are written FIRST
+        and ``act_seq`` LAST, so a worker reading ``act_seq==k`` is guaranteed to
+        see this step's gaze/action (x86 TSO), never a stale one.
+
+        The arrays may be full-length (indexed by ``idx``) or already sliced to
+        ``idx`` — both are accepted, matching ``actions_shm[idx] = acts[idx]``.
+        """
+        self.arr["gaze_dx"][idx] = gaze_dx
+        self.arr["gaze_dy"][idx] = gaze_dy
+        self.arr["actions"][idx] = buttons
+        self.arr["act_seq"][idx] = obs_idx  # publish LAST (x86 TSO)
 
     # ------------------------------------------------------------------ rounds
     def _await_budget_for(self, op: int, target: int) -> float:
@@ -1465,6 +1872,8 @@ class AsyncFleet:
         self.arr["act_seq"][:] = -1
         self.arr["cap_flag"][:] = 0
         self.arr["cap_done"][:] = 0
+        self.arr["gaze_dx"][:] = 0.0  # no saccade until the first action lands
+        self.arr["gaze_dy"][:] = 0.0
         self._release(_OP_RESET)
 
     def reset_all_end(self) -> np.ndarray:
@@ -1540,4 +1949,7 @@ def _archive_key_len(archive_kwargs: dict, wram_stride: int) -> int:
     return len(a.cell_key_compact(dummy_screen, dummy_w))
 
 
-__all__ = ["VecFleet", "BarrierFleet", "AsyncFleet", "ObsEncoder", "NUMA_NODES"]
+__all__ = [
+    "VecFleet", "BarrierFleet", "AsyncFleet",
+    "ObsEncoder", "FovealEncoder", "NUMA_NODES",
+]

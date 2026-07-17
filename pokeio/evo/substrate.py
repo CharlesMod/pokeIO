@@ -1,5 +1,8 @@
 """ES-HyperNEAT substrate layout for the pokeIO vision encoder (Lane B).
 
+EXPERIMENTAL / PARKED: not wired into the training loop (see pokeio/evo/cppn.py).
+
+
 A *substrate* is the fixed geometric arrangement of the phenotype's neurons in a
 low-dimensional coordinate space.  A CPPN (see :mod:`pokeio.evo.cppn`) is then
 queried once per potential connection with the SOURCE and TARGET coordinates of

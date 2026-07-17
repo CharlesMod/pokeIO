@@ -47,19 +47,36 @@ def test_boot_progress_pure_metric():
 
 
 @pytest.mark.skipif(not ROM.exists(), reason="ROM assets not present")
-def test_gauntlet_is_read_only():
+def test_gauntlet_foveal_path():
+    """Port smoke: the gauntlet runs under the active-vision FovealEncoder /
+    11-output head — produces a depth score, mutates NO archive counters, and
+    the movable fovea actually moves (spec §2/§3, boot-gauntlet.md invariant 1).
+    """
     import torch
 
     from pokeio.emu.env import PokeEnv
-    from pokeio.emu.fleet import ObsEncoder
-    from pokeio.evo.genome import InnovationTracker, make_genome
+    from pokeio.emu.fleet import FovealEncoder
+    from pokeio.evo.genome import TANH, InnovationTracker, make_genome
 
     env = PokeEnv(rom_path=str(ROM), frame_skip=24)
     try:
-        encoder = ObsEncoder(24, 8)
+        # Foveal obs: 454-d (3*12^2 periph/fovea/motion + 14 proprio + 8 ram),
+        # 11-output head (9 buttons + dx,dy saccade), TANH decisive head.
+        encoder = FovealEncoder(
+            1,
+            periph_grid=12,
+            fovea_native_px=48,
+            n_ram=8,
+            saccade_gain=32.0,
+            saccade_every_k=1,
+            episode_steps=64,
+        )
+        assert encoder.dim == 454
+        n_out = 11
+
         archive = NoveltyArchive()
         go = _go_with({b"seed-cell": 42})
-        # pre-populate the novelty archive so mutation would be detectable
+        # pre-populate the novelty archive so any mutation would be detectable
         archive.add(b"pre-existing")
         archive.visit(b"pre-existing")
         before = (
@@ -71,18 +88,44 @@ def test_gauntlet_is_read_only():
         )
 
         rng = np.random.default_rng(0)
-        tracker = InnovationTracker(n_in=encoder.dim, n_out=9)
+        tracker = InnovationTracker(n_in=encoder.dim, n_out=n_out)
         genome = make_genome(
-            encoder.dim, 9, tracker, rng, connect="sparse", sparse_k=4
+            encoder.dim, n_out, tracker, rng,
+            connect="sparse", sparse_k=6, output_act=TANH,
+            n_ram=8, n_proprio=14,
         )
+
+        # Record every integrated gaze position to prove the fovea moves.
+        gaze_seen: list[tuple[float, float]] = []
+        _real_update = encoder.update_gaze
+
+        def _spy_update(env_idx, dx, dy):
+            gy, gx = _real_update(env_idx, dx, dy)
+            gaze_seen.append((gy, gx))
+            return gy, gx
+
+        encoder.update_gaze = _spy_update  # type: ignore[method-assign]
+
+        steps = 24
         metrics = run_boot_gauntlet(
             genome, env, encoder, archive, go, torch.device("cpu"),
-            steps=12, max_nodes=encoder.dim + 32, max_conns=256,
+            steps=steps, max_nodes=encoder.dim + 64, max_conns=4096,
             reset_state=str(STATE),
         )
-        assert metrics["boot_steps"] == 12.0
+
+        # A real depth score came back over a well-formed metric dict.
+        assert metrics["boot_steps"] == float(steps)
         assert metrics["boot_cells"] >= 1.0
-        # STRICTLY read-only: nothing about either archive may change
+        assert metrics["boot_depth"] >= 0.0
+        assert 0.0 <= metrics["boot_depth_frac"] <= 1.0
+        assert metrics["boot_cells_known"] >= 0.0
+
+        # The fovea moved: at least one integrated gaze left the screen centre
+        # (72, 80). update_gaze was called once per step.
+        assert len(gaze_seen) == steps
+        assert any(pos != (72.0, 80.0) for pos in gaze_seen), gaze_seen
+
+        # STRICTLY read-only: nothing about either archive may change.
         after = (
             archive.size,
             dict(archive._visits),

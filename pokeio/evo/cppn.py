@@ -1,5 +1,11 @@
 """CPPN substrate-painter for ES-HyperNEAT (Lane B vision encoder).
 
+EXPERIMENTAL / PARKED: Lane B (CPPN/ES-HyperNEAT) is NOT wired into the training
+loop. The live system uses direct-encoded NEAT over a foveated obs (Phase 0) and a
+learned SPR retina (Phase 1) — see docs/specs/active-vision-spine.md. This module
+is kept for future indirect-encoding experiments; it has standalone exercisers only.
+
+
 A CPPN is an ordinary NEAT genome (:class:`pokeio.evo.genome.Genome`) with
 ``n_in = 4`` (the connection coordinates ``x1, y1, x2, y2``) and ``n_out = 1``
 (the painted connection weight).  The standard NEAT bias node supplies the fifth

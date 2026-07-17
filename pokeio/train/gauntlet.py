@@ -76,24 +76,40 @@ def run_boot_gauntlet(
 ) -> dict[str, float]:
     """Run the champion solo from ``reset_state``; return the metric dict.
 
-    Mirrors the champion-replay loop (compile a 1-genome population, then per
-    step: encode → sparse forward → argmax → step) at full speed, collecting
-    ``archive.cell_key`` per step. Key compatibility with the worker compact
-    path is guaranteed by :meth:`NoveltyArchive.cell_key_compact` (verified
-    byte-identical), so ``goexplore.cells`` membership is exact.
+    Mirrors the champion-replay loop (``replay_champion`` in ``train/loop.py``)
+    under **active-vision (foveal) obs**: compile a 1-genome population, reset
+    the stateful :class:`~pokeio.emu.fleet.FovealEncoder` (env slot 0), then per
+    step ``encode → sparse forward → split head → update gaze → step`` at full
+    speed, collecting ``archive.cell_key`` per step.
+
+    ``encoder`` is the parent :class:`FovealEncoder` (used at slot 0, exactly as
+    ``replay_champion`` does — the gauntlet runs at the generation boundary, so
+    no wave shares that slot). Each step the champion emits an 11-d row: the
+    first 9 outputs are the Discrete-9 button head (``argmax``, order =
+    ``pokeio.emu.env.ACTIONS``), ``out[9]``/``out[10]`` are the RAW saccade
+    ``(dx, dy)``. The RAW commands go straight to :meth:`FovealEncoder.update_gaze`,
+    which applies ``tanh`` internally (no tanh here — the double-tanh bug). Gaze
+    is integrated **before** the next step's ``encode`` builds the fovea crop, so
+    the one-tick efference-copy delay matches the fleet worker path (spec §3.3/§3.4).
+
+    Key compatibility with the worker compact path is guaranteed by
+    :meth:`NoveltyArchive.cell_key_compact` (verified byte-identical), so
+    ``goexplore.cells`` membership is exact — ``archive.cell_key`` is used as-is.
 
     STRICTLY READ-ONLY vs both archives: no add/observe/visit, no note, no
     captures — key construction and dict membership only.
     """
     pop = Population.from_genomes([genome], max_nodes=max_nodes, max_conns=max_conns)
     cp = pop.compile(device)
+    encoder.reset(0)  # gaze -> centre, motion -> 0.5 (solo gauntlet uses env slot 0)
     screen = env.reset(reset_state)
     wram = env.raw_wram()
     seen_keys: set[bytes] = set()
     state = None  # recurrent node-state carried across the gauntlet episode
+    last_button = 8  # NOOP until the first action lands (proprio efference copy)
     n = 0
     for _t in range(int(steps)):
-        x = encoder.encode(screen, wram)
+        x = encoder.encode(0, screen, wram, button=int(last_button))
         xt = torch.from_numpy(x[None, :]).to(device).unsqueeze(1)
         if recurrent_memory:
             out, state = population_forward_sparse(
@@ -101,8 +117,17 @@ def run_boot_gauntlet(
             )
         else:
             out = population_forward_sparse(cp, xt, steps=forward_steps)
-        action = int(out[0, 0, :].argmax().item())
-        screen, wram, _done, _info = env.step(action)
+        # Split the 11-d head inline (importing loop.py would be circular):
+        # 9 button logits (argmax) + 2 RAW saccade commands (tanh in update_gaze).
+        outv = out[0, 0, :].detach().cpu().numpy()
+        button = int(outv[:9].argmax())
+        dx = float(outv[9])
+        dy = float(outv[10])
+        # Integrate the saccade BEFORE the next step's encode builds the fovea
+        # crop (one-tick efference-copy delay; matches the worker _emit order).
+        encoder.update_gaze(0, dx, dy)
+        last_button = button
+        screen, wram, _done, _info = env.step(button)
         seen_keys.add(archive.cell_key(screen, wram))
         n += 1
         time.sleep(0)  # cooperative GIL handoff for the live pump thread

@@ -70,8 +70,19 @@ class VisionConfig:
     fovea_size: int = 64  # side length of the native-resolution center crop
     # Small square grayscale obs fed to the direct-encoded NEAT loop (train/loop.py).
     # The full 6176-dim obs is too wide for direct NEAT; obs_res x obs_res is tractable.
-    obs_res: int = 24  # side length -> obs_res*obs_res flattened grayscale inputs
+    obs_res: int = 24  # (legacy) side length of the old flat grayscale obs
     obs_ram_bytes: int = 8  # count of strided normalized WRAM bytes appended to obs
+    # -- Active-vision spine (docs/specs/active-vision-spine.md) --------------
+    # obs mode selector / phased-fallback rung:
+    #   "foveal"       Phase-0 pixel obs: periphery + gaze-driven fovea + motion + proprio + ram
+    #   "fovea_static" sub-fallback: fovea fixed screen-centered, N_OUT back to 9
+    #   "retina"       Phase-1: learned SPR/FSQ latent replaces the pixel blocks
+    mode: str = "foveal"
+    periph_grid: int = 12  # G: periphery/fovea/motion area-resample side (G*G each)
+    fovea_native_px: int = 48  # F: native fovea crop side (resampled F->G)
+    saccade_gain: float = 32.0  # px/step velocity applied to the fovea center
+    saccade_every_k: int = 1  # gaze update cadence in agent-steps
+    proprio: bool = True  # 14-d efference-copy block (gaze + last saccade + last buttons + step)
     # -- legacy foveal knobs (superseded by fovea_size; kept for back-compat) -
     foveal_size: int = 32  # (unused by ObsBuilder) old downscaled foveal res
     foveal_crop: int = 48  # (unused by ObsBuilder) old source-pixel crop side
@@ -92,7 +103,9 @@ class EvoConfig:
     elitism: int = 2
     species_threshold: float = 3.0  # compatibility distance for speciation
     mutate_add_node: float = 0.03
-    mutate_add_conn: float = 0.05
+    # Raised 0.05 -> 0.4 for the efficacy redesign: at 0.05 topology grew ~5 conns
+    # / 100 gens, freezing the net at the random init (diagnosis). See B3.
+    mutate_add_conn: float = 0.4
     mutate_weight: float = 0.8
     mutate_toggle: float = 0.01
     crossover_rate: float = 0.75
@@ -103,6 +116,16 @@ class EvoConfig:
     recurrent: bool = True  # allow evolved recurrent connections
     max_nodes: int = 512  # padding bound for tensorized genome
     max_conns: int = 4096
+    # -- Active-vision spine (docs/specs/active-vision-spine.md) --------------
+    n_out: int = 11  # 9 button logits + 2 saccade (dx, dy); was 9
+    output_act: str = "tanh"  # decisive head: argmax over spread tanh drive (was sigmoid)
+    init_connect: str = "full"  # "full" (fan-in-scaled) | "sparse" | "none"
+    init_k: int = 32  # sparse-fallback fan-in (raised from 12)
+    prefer_unconnected_src: bool = True  # bias add-conn toward unwired input sources
+    prefer_unconnected_weight: float = 4.0
+    protect_ram_taps: bool = True  # connect tap->output at init, exempt from toggle/split
+    protect_proprio: bool = True  # same for proprio->output edges
+    softmax_temp: float = 0.0  # 0 = plain argmax over out[:9]; >0 = temperature-softmax
 
 
 @dataclass
@@ -127,6 +150,21 @@ class RewardConfig:
     # selection-fitness blend: (1-w)*novelty_rank + w*progress_rank, applied
     # only once any player registers counter advancement in a generation
     progress_weight: float = 0.5
+    # -- Efficacy redesign: couple selection to policy (docs/specs/active-vision-spine.md §6)
+    # E2: per-cell leave-one-out baseline-subtracted advantage for restored players
+    restore_baseline: bool = True
+    baseline_ema: float = 0.9  # cross-gen smoothing of the per-cell baseline
+    # E3: blind-ablation gate — crush fitness of screen-invariant policies
+    blind_gate: bool = True
+    blind_gate_beta: float = 8.0
+    blind_gate_dmin: float = 0.05  # min |Δoutput| (real vs optical-zeroed) to pass
+    # R_resp: responsiveness (button-histogram entropy + output variance)
+    w_resp: float = 0.1
+    w_resp_var: float = 0.5
+    # Emp: empowerment via the SPR inverse head (Phase 1+; 0 effect in Phase 0)
+    w_emp: float = 0.1
+    # E1: optional short no-restore policy-eval (0 = off; judge override only)
+    policy_eval_steps: int = 0
 
 
 @dataclass
@@ -152,6 +190,41 @@ class LLMConfig:
 
 
 @dataclass
+class RetinaConfig:
+    """Learned decoder-free retina (Phase 1; docs/specs/active-vision-spine.md §4).
+
+    A frozen sensory organ, never part of the genotype. SPR latent self-prediction
+    + inverse-dynamics, FSQ latent (cannot codebook-collapse). Trained on the swarm's
+    own frames on ``train_card``; population consumes a frozen ``snapshot()`` on
+    ``infer_card``, swapped every ``swap_gens`` generations.
+    """
+
+    enable: bool = False  # Phase-1 gate; Phase-0 ships with pixel obs
+    z_periph: int = 48
+    z_fovea: int = 32
+    spr_k: int = 5  # SPR prediction horizon
+    ema_tau: float = 0.0  # 0.0 = hard target-encoder copy
+    loss: str = "cosine"  # SPR loss (never L2)
+    inverse_dynamics: bool = True  # inverse head q_psi (reused for empowerment)
+    fsq_levels: list[int] = field(default_factory=lambda: [8, 8, 8, 5, 5])  # 10,240 cells
+    warmup_frames: int = 200000  # train before any genome consumes the latent
+    swap_gens: int = 10  # freeze-and-swap cadence
+    train_card: int = 0
+    infer_card: int = 1
+    aug_shift_px: int = 4
+    aug_jitter: float = 0.05
+
+
+@dataclass
+class GoExploreConfig:
+    """Go-Explore cell source (docs/specs/active-vision-spine.md §5)."""
+
+    # "pixel" = existing screen+wram hash (obs-independent, permanent safety net);
+    # "fsq" = Phase-2 latent cell key from retina.fsq_code(periphery).
+    cell_source: str = "pixel"
+
+
+@dataclass
 class RunConfig:
     """Run-level bookkeeping (see TODO Cross-Cutting)."""
 
@@ -174,6 +247,8 @@ class Config:
     vision: VisionConfig = field(default_factory=VisionConfig)
     evo: EvoConfig = field(default_factory=EvoConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
+    retina: RetinaConfig = field(default_factory=RetinaConfig)
+    goexplore: GoExploreConfig = field(default_factory=GoExploreConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     run: RunConfig = field(default_factory=RunConfig)
 
@@ -231,6 +306,8 @@ __all__ = [
     "VisionConfig",
     "EvoConfig",
     "RewardConfig",
+    "RetinaConfig",
+    "GoExploreConfig",
     "LLMConfig",
     "RunConfig",
     "CONFIG_FILENAME",
