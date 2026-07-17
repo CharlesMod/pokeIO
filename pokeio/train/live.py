@@ -452,6 +452,19 @@ class LiveStreamer:
     capture forward with that genome on that agent's current obs (activations
     + output probs), its full-res frame from the shm screens block, and its
     raw genotype.  All focus work runs at emit rate (~3 Hz), never per round.
+
+    The feed NEVER freezes: during waves the loop thread emits between
+    barrier rounds (throttled to ~``hz``) exactly as before; a dedicated
+    *pump thread* watches for gaps and takes over whenever no emit has landed
+    for a full interval — i.e. through generation boundaries (speciation /
+    reproduction / frontier restore), where the champion showcase keeps
+    playing since it owns its own env, independent of the fleet.  The
+    training loop marks where it is via
+    :meth:`set_phase`; the payload carries top-level ``phase`` ("wave" |
+    "evolving") and ``phase_detail`` fields for the dashboard.  ``_emit`` and
+    champion swaps are serialized by an RLock; the wave-loop hooks
+    (:meth:`maybe_write`, :meth:`begin_wave`, :meth:`set_phase`) only do
+    atomic reference swaps and never block on an in-flight emit.
     """
 
     def __init__(
@@ -499,6 +512,16 @@ class LiveStreamer:
         self._wave_idx = 0  # wave counter within the generation
         self._round = 0  # round counter within the episode
         self._focus_cache: dict[int, dict] = {}  # slot -> compiled focus entry
+        # -- pump thread: emits at ~hz THROUGH generation boundaries ----------
+        self._gen = 0
+        self._phase = "wave"
+        self._phase_detail = ""
+        self._lock = threading.RLock()  # serializes _emit / champion swaps
+        self._pump_stop = threading.Event()
+        self._pump = threading.Thread(
+            target=self._pump_loop, name="live-pump", daemon=True
+        )
+        self._pump.start()
 
     def set_champion(
         self, genome, genome_id: str, gen: int = -1, fitness: float = 0.0
@@ -524,11 +547,12 @@ class LiveStreamer:
     def _install_champion(
         self, genome, genome_id: str, gen: int, fitness: float, now: float
     ) -> None:
-        self.showcase.set_champion(genome, genome_id)
-        self._champ_since = now
-        self._champ_gen = int(gen)
-        self._champ_fitness = float(fitness)
-        self._pending_champ = None
+        with self._lock:  # never swap the showcase net mid-emit
+            self.showcase.set_champion(genome, genome_id)
+            self._champ_since = now
+            self._champ_gen = int(gen)
+            self._champ_fitness = float(fitness)
+            self._pending_champ = None
 
     def _maybe_promote_pending(self) -> None:
         """Install the stashed (latest) champion once the dwell has elapsed."""
@@ -557,6 +581,11 @@ class LiveStreamer:
         self._reward_terms = dict(reward_terms)
         self._species = list(species)
 
+    def set_phase(self, phase: str, detail: str = "") -> None:
+        """Mark the loop's current phase ("wave" | "evolving") for the feed."""
+        self._phase = str(phase)
+        self._phase_detail = str(detail)
+
     def maybe_write(
         self,
         gen: int,
@@ -567,21 +596,62 @@ class LiveStreamer:
         actions: np.ndarray | None = None,
         round_t: int = 0,
     ) -> bool:
-        """Throttled write from inside the wave step loop.
+        """Cache the freshest wave sample for the pump thread (non-blocking).
 
         ``obs`` is the (n, obs_dim) batch the wave's actions were computed
         from and ``actions`` the resulting per-slot action ints — both are
-        what the focus capture replays for the selected agent.
+        what the focus capture replays for the selected agent.  During waves
+        the emit happens right here on the loop thread (throttled to ~hz,
+        exactly the pre-pump behaviour); the pump thread only fills the gaps
+        when the loop stops calling (generation boundaries).
         """
         self._cache = (screens, fitness, dead, obs, actions)
         self._round = int(round_t)
+        self._gen = int(gen)
         if not self.writer.due():
             return False
         return self._emit(gen)
 
     def force_write(self, gen: int) -> bool:
-        """Unconditional write (e.g. at a generation boundary)."""
-        return self._emit(gen)
+        """Immediate synchronous write (e.g. at a generation boundary)."""
+        self._gen = int(gen)
+        return self._emit(gen, force=True)
+
+    # -- pump thread --------------------------------------------------------
+    def _pump_loop(self) -> None:
+        """Keep the feed alive through generation boundaries.
+
+        Polls at a fraction of the emit interval; whenever no emit has landed
+        for a full interval (the wave loop normally beats it to the punch),
+        emits one itself.  So during waves this thread is idle and the cadence
+        is the loop thread's ~hz; during boundaries (speciation, reproduction,
+        frontier restore) it takes over and the champion showcase — which owns
+        its env, independent of the fleet — keeps playing.
+        """
+        warned = False
+        tick = self.writer.interval / 3.0
+        while not self._pump_stop.wait(tick):
+            if not self.writer.due():
+                continue
+            try:
+                self._emit(self._gen)
+            except Exception:
+                # The pump must never die mid-boundary; report the first hit.
+                if not warned:
+                    warned = True
+                    import traceback
+
+                    print("[live] pump emit failed (feed continues):", flush=True)
+                    traceback.print_exc()
+
+    def close(self) -> None:
+        """Stop the pump + writer threads (flushes the last payload)."""
+        self._pump_stop.set()
+        try:
+            self._pump.join(timeout=2)
+        except Exception:
+            pass
+        self.writer.close()
 
     # -- select.json polling ----------------------------------------------
     def _poll_select(self) -> None:
@@ -743,38 +813,49 @@ class LiveStreamer:
         return out
 
     # -- emit -----------------------------------------------------------------
-    def _emit(self, gen: int) -> bool:
+    def _emit(self, gen: int, force: bool = False) -> bool:
         _prof = os.environ.get("POKEIO_LIVE_PROF") == "1"
         _t0 = time.perf_counter() if _prof else 0.0
-        self._maybe_promote_pending()
-        self.showcase.step(self.champ_steps)
-        _t1 = time.perf_counter() if _prof else 0.0
-        self._poll_select()
-        screens = fitness = dead = obs = actions = None
-        if self._cache is not None:
-            screens, fitness, dead, obs, actions = self._cache
-            swarm = build_swarm(
-                screens, fitness, dead, self.swarm_cap, self.elite_k
-            )
-        else:
-            swarm = []
-        champ = self.showcase.payload()
-        champ["champ_since"] = self._champ_since  # unix ts of install (UI tenure)
-        champ["champ_gen"] = int(self._champ_gen)
-        champ["fitness"] = float(self._champ_fitness)
-        payload = {
-            "t": time.time(),
-            "gen": int(gen),
-            "run": self.run_id,
-            "champion": champ,
-            "swarm": swarm,
-            "focus": self._build_focus(screens, obs, actions),
-            "reward_terms": self._reward_terms_payload(fitness),
-            "archive": self._archive_payload(),
-            "species": self._species,
-            "wave": int(self._wave_idx),
-            "round": int(self._round),
-        }
+        with self._lock:
+            # Loop thread + pump thread can race to the same due() window; the
+            # loser rechecks under the lock and skips the duplicate emit.
+            if not force and not self.writer.due():
+                return False
+            self._maybe_promote_pending()
+            self.showcase.step(self.champ_steps)
+            _t1 = time.perf_counter() if _prof else 0.0
+            self._poll_select()
+            # snapshot mutable refs once (the loop thread swaps them atomically)
+            cache = self._cache
+            phase = self._phase
+            phase_detail = self._phase_detail
+            screens = fitness = dead = obs = actions = None
+            if cache is not None:
+                screens, fitness, dead, obs, actions = cache
+                swarm = build_swarm(
+                    screens, fitness, dead, self.swarm_cap, self.elite_k
+                )
+            else:
+                swarm = []
+            champ = self.showcase.payload()
+            champ["champ_since"] = self._champ_since  # unix ts of install (UI tenure)
+            champ["champ_gen"] = int(self._champ_gen)
+            champ["fitness"] = float(self._champ_fitness)
+            payload = {
+                "t": time.time(),
+                "gen": int(gen),
+                "run": self.run_id,
+                "phase": phase,
+                "phase_detail": phase_detail,
+                "champion": champ,
+                "swarm": swarm,
+                "focus": self._build_focus(screens, obs, actions),
+                "reward_terms": self._reward_terms_payload(fitness),
+                "archive": self._archive_payload(),
+                "species": self._species,
+                "wave": int(self._wave_idx),
+                "round": int(self._round),
+            }
         self.last_size = self.writer.write(payload)
         if _prof:
             _t2 = time.perf_counter()

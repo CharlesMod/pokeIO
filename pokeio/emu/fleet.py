@@ -688,10 +688,17 @@ class BarrierFleet:
         self._closed = False
 
     # ------------------------------------------------------------------ barrier
-    def _run_round(self, op: int) -> None:
+    def _release_round(self, op: int) -> None:
+        """Release the workers into a new round (returns immediately)."""
         self._round += 1
         self._ctl[1] = op
         self._ctl[0] = self._round  # release workers
+
+    def _run_round(self, op: int) -> None:
+        self._release_round(op)
+        self._await_round()
+
+    def _await_round(self) -> None:
         target = self._round
         ctl = self._ctl
         n = self.n_envs
@@ -720,12 +727,11 @@ class BarrierFleet:
                 time.sleep(5e-5)
 
     # ------------------------------------------------------------------ control
-    def reset_all(self, restore: dict[int, bytes] | None = None) -> np.ndarray:
-        """Reset all envs (optionally restoring per-index Go-Explore states).
+    def reset_all_begin(self, restore: dict[int, bytes] | None = None) -> None:
+        """Ship restore blobs + release the reset round WITHOUT waiting.
 
-        ``restore`` maps env index -> save_state blob; those envs load the blob
-        instead of the canonical reset state.  Returns the encoded obs block
-        (a copy, safe across the next round)."""
+        The caller may do unrelated work (e.g. pack/compile the next wave's
+        genomes) while the workers reset, then call :meth:`reset_all_end`."""
         self.arr["res_flag"][:] = 0
         if restore and self.goexplore:
             for idx, blob in restore.items():
@@ -733,8 +739,21 @@ class BarrierFleet:
                 self.arr["res_state"][idx, : len(b)] = np.frombuffer(b, dtype=np.uint8)
                 self.arr["res_len"][idx] = len(b)
                 self.arr["res_flag"][idx] = 1
-        self._run_round(_OP_RESET)
+        self._release_round(_OP_RESET)
+
+    def reset_all_end(self) -> np.ndarray:
+        """Wait for the reset round released by :meth:`reset_all_begin`."""
+        self._await_round()
         return self.arr["obs"].copy()
+
+    def reset_all(self, restore: dict[int, bytes] | None = None) -> np.ndarray:
+        """Reset all envs (optionally restoring per-index Go-Explore states).
+
+        ``restore`` maps env index -> save_state blob; those envs load the blob
+        instead of the canonical reset state.  Returns the encoded obs block
+        (a copy, safe across the next round)."""
+        self.reset_all_begin(restore)
+        return self.reset_all_end()
 
     def step_all(self, actions: np.ndarray, capture_flags: np.ndarray | None = None):
         """Advance one agent-step; return ``(obs, keys, dones, captured)``.

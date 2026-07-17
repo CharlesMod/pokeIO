@@ -279,6 +279,7 @@
       <div class="panel champion">
         <header>
           <span class="lbl">Champion Cage</span><span class="idx">// illustrative feed — live frames not streamed yet · numbers above are real</span>
+          <span id="phase-banner" style="display:none; color:var(--amber); font-family:var(--mono); font-size:10px; letter-spacing:.08em; white-space:nowrap">⚙ evolving…</span>
           <span class="r" id="champ-stats">reward <b style="color:var(--olive)">7,418</b> &nbsp;·&nbsp; 14,203 steps &nbsp;·&nbsp; <span style="color:var(--amber)">▲ new frontier</span></span>
         </header>
         <div class="bodyp">
@@ -2094,6 +2095,15 @@ async function pollLive(){
     const res=await fetch('/api/live'+(window.POKE_RUNQ||''),{cache:'no-store'});
     const j=await res.json();
     const ch=j&&j.champion;
+    /* phase: "wave" | "evolving" — the boundary status keeps the cage honest */
+    window.POKE_PHASE=(j&&j.phase)||'wave';
+    const pb=$('phase-banner');
+    if(pb){
+      if(window.POKE_PHASE==='evolving'){
+        pb.style.display='';
+        pb.textContent='⚙ evolving — '+((j&&j.phase_detail)||'…')+'…';
+      } else pb.style.display='none';
+    }
     if(ch&&ch.frame_b64){
       window.POKE_FRAMES=true;
       if(j.run)window.POKE_RUN=j.run;
@@ -2270,8 +2280,11 @@ function setFocus(f,j){
     hist.unshift({n:payloadN,a:act,sym:(act>=0&&act<8)?SYM[act]:'·'});
   if(hist.length>20)hist.pop();
   flash=1;
-  const fr=$('fr'); if(fr)fr.textContent=String(payloadN%1000000).padStart(6,'0');
-  const beat=$('beat'); if(beat){beat.classList.remove('on'); void beat.offsetWidth; beat.classList.add('on');}
+  /* pause the SIM FRAME beat while the loop is evolving (no wave steps) */
+  if(window.POKE_PHASE!=='evolving'){
+    const fr=$('fr'); if(fr)fr.textContent=String(payloadN%1000000).padStart(6,'0');
+    const beat=$('beat'); if(beat){beat.classList.remove('on'); void beat.offsetWidth; beat.classList.add('on');}
+  }
   updateHeaders();
   renderPheno();
 }
