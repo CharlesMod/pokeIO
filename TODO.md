@@ -274,6 +274,31 @@ sane manifest, mines real progress bytes, and produces a co-evolved fitness that
 
 ---
 
+## Phase 3.5 — Boot Gauntlet (from-boot competence guard)
+*Goal: measure — then, only if needed, fix — the Go-Explore chain gap: no single genome has ever
+demonstrated newgame→frontier play. Full spec: `docs/specs/boot-gauntlet.md` (Opus-ready).*
+
+- [ ] **D1 — boot gauntlet eval** (`pokeio/train/gauntlet.py`): every N gens, run the champion solo
+      from `yellow_newgame.state` for `~4×episode_steps` at full speed, STRICTLY read-only vs both
+      archives (audit REWARD#5 rule); score = max `CellEntry.depth` among visited cells present in
+      the Go-Explore archive (+ `boot_depth_frac` = /`goexplore_max_depth`, same-snapshot).
+      Cell keys via existing `archive.cell_key` — verified byte-identical to the worker compact path.
+- [ ] **D1 — telemetry**: defaulted `boot_*` fields on `GenerationRecord` (−1 = "didn't run");
+      mirror into `reward_terms` so the wall shows it with zero dashboard work; CLI
+      `--boot-gauntlet-every` (default 10) / `--boot-gauntlet-steps` (0 = auto).
+- [ ] **D1 — tests**: pure-metric unit test (synthetic archive), read-only guarantee (archive
+      counters unchanged), `cell_key`/`cell_key_compact` equality regression guard.
+- [ ] **D1 — stretch**: dedicated wall chart, boot_depth_frac vs frontier depth by generation.
+- [ ] **D2 — backward-shift robustification** (GATED — build only if D1 shows boot_depth_frac
+      stalling ≥5 gauntlets while frontier depth grows ≥20%): bias `_sample_restores` toward
+      shallow cells (bottom-q depth quantile, annealed) — the evolutionary analog of Go-Explore's
+      backward algorithm. Design sketch in the spec; no commitment beyond it.
+
+**✅ Definition of done:** every run plots how deep the champion gets from power-on vs how deep the
+archive's frontier is; the two curves diverging is now a measured signal, not a fear.
+
+---
+
 ## Phase 4 — The Training Wall (real, from the mock)
 *Goal: the dashboard becomes a live instrument — spectator view and debugging view are one view.*
 
@@ -308,6 +333,10 @@ with zero code changes.
 - [ ] Long Yellow run; track the milestone ladder (below); hyperparameter sweeps.
 - [ ] **Generalization acid test:** point the untouched system at **Super Mario Land** (and Kirby,
       Tetris) — confirm manifest/reward/UI regenerate with **zero Pokémon-specific code**.
+- [ ] **D3 — multi-game fitness** (blocked on the acid test working at all): evaluate each genome on
+      ≥2 ROMs, aggregate per-(game × spawn-cohort) ranks — the path to a literal single cross-game
+      genome, vs the default "the *harness* drops in, the population re-evolves per game".
+      Pointer in `docs/specs/boot-gauntlet.md` §D3.
 - [ ] Ablations & write-up: CPPN vs autoencoder lane; novelty-only vs +RAM-mining vs +LLM-judge;
       document what actually drove progress.
 
