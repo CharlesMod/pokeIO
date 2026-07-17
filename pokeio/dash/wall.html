@@ -204,6 +204,17 @@
     font-family:var(--mono); font-size:8.5px; letter-spacing:.14em; text-transform:uppercase; cursor:pointer}
   .dz-head .champbtn:hover{background:rgba(224,168,56,.1)}
 
+  /* ---- pace toggle + breeding countdown (top strip) ---- */
+  .pacewrap{display:flex; align-items:center; gap:6px; padding:8px 14px; border-right:1px solid var(--line)}
+  .pacebtn{font-family:var(--mono); font-size:9.5px; letter-spacing:.12em; text-transform:uppercase;
+    color:var(--ink-mute); background:none; border:1px solid var(--line-2); border-radius:20px;
+    padding:5px 13px; cursor:pointer; display:flex; flex-direction:column; align-items:center; gap:1px}
+  .pacebtn small{font-size:8px; letter-spacing:.18em; opacity:.7}
+  .pacebtn:hover{color:var(--ink-dim)}
+  .pacebtn.on{color:var(--amber); border-color:var(--amber); box-shadow:0 0 8px rgba(224,168,56,.25)}
+  #pace-rt.on{color:var(--aqua); border-color:var(--aqua); box-shadow:0 0 8px rgba(24,162,196,.25)}
+  #cd-v.evolving{color:var(--violet); font-size:11.5px; line-height:1.5; white-space:nowrap}
+
   @media (prefers-reduced-motion:reduce){*{animation-duration:.001ms!important; transition-duration:.001ms!important}}
 </style>
 
@@ -224,6 +235,11 @@
     <div class="stat"><span class="k">Throughput</span><span class="v" id="s-fps">23.2<small> k steps/s</small></span></div>
     <div class="stat"><span class="k">Best Fitness</span><span class="v" id="s-fit">7,418</span></div>
     <div class="stat"><span class="k">Species</span><span class="v" id="s-spec">31</span></div>
+    <div class="stat" style="min-width:150px"><span class="k" id="cd-k">Breeding In</span><span class="v amber" id="cd-v">—</span></div>
+    <div class="pacewrap" title="live-toggle the RUNNING trainer — no restart">
+      <button class="pacebtn" id="pace-rt">▶ SPECTATE<small>real-time</small></button>
+      <button class="pacebtn on" id="pace-max">⚡ TRAIN<small>max</small></button>
+    </div>
     <div class="grow"></div>
     <div class="rom">
       <div class="cart"></div>
@@ -1800,6 +1816,87 @@ poll(); setInterval(poll,1500);
 </script>
 
 <script>
+/* ===== PACE CONTROL — spectate/max toggle + BREEDING countdown ==============
+   Backend contract: GET /api/pace?run=<id>&mode=realtime|max atomically writes
+   runs/<id>/pace.json; the RUNNING trainer stat-polls it and flips live (no
+   restart).  live.json carries top-level pace / eta_s / round_hz / waves.
+   The countdown ticks client-side between polls and is drift-corrected on
+   every payload; in max mode the eta is an estimate (prefixed with ≈).
+   During phase=evolving the countdown area becomes the ceremony banner. */
+(function(){
+"use strict";
+var $=function(id){return document.getElementById(id);};
+var mode='max';            /* last known / optimistic mode */
+var pendingUntil=0;        /* optimistic-flip window: payload sync deferred */
+var etaBase=null, etaAt=0; /* eta_s at last poll + performance.now() stamp */
+var phase='wave', detail='', waveIdx=0, waves=1, live=false;
+
+function runId(){
+  if(window.POKE_RUN)return window.POKE_RUN;
+  try{return new URLSearchParams(location.search).get('run')||'';}catch(e){return '';}
+}
+function paint(){
+  var r=$('pace-rt'), m=$('pace-max');
+  if(r)r.classList.toggle('on',mode==='realtime');
+  if(m)m.classList.toggle('on',mode!=='realtime');
+}
+function send(next){
+  if(next===mode)return;
+  mode=next; pendingUntil=Date.now()+4000; paint(); /* optimistic flip */
+  window.POKE_PACE=mode;
+  var run=runId();
+  if(run){try{fetch('/api/pace?run='+encodeURIComponent(run)+'&mode='+next,{cache:'no-store'}).catch(function(){});}catch(e){}}
+  render();
+}
+var bR=$('pace-rt'), bM=$('pace-max');
+if(bR)bR.addEventListener('click',function(){send('realtime');});
+if(bM)bM.addEventListener('click',function(){send('max');});
+
+function fmtEta(s){
+  s=Math.max(0,s);
+  var m=Math.floor(s/60), ss=Math.floor(s%60);
+  return m+':'+String(ss).padStart(2,'0');
+}
+function render(){
+  var k=$('cd-k'), v=$('cd-v'); if(!v)return;
+  if(!live){
+    v.textContent='—'; v.classList.remove('evolving');
+    if(k)k.textContent='Breeding In';
+    return;
+  }
+  if(phase==='evolving'){
+    if(k)k.textContent='Evolution';
+    v.classList.add('evolving');
+    v.textContent='⚙ evolving — '+(detail||'reproduction')+'…';
+    return;
+  }
+  v.classList.remove('evolving');
+  if(k)k.textContent='Breeding In';
+  var eta=(etaBase==null)?null:etaBase-(performance.now()-etaAt)/1000;
+  var txt=(eta==null)?'—':((mode==='realtime'?'':'≈')+fmtEta(eta));
+  if(waves>1)txt+=' · W'+(waveIdx+1)+'/'+waves;
+  v.textContent=txt;
+}
+/* payload hook — called by the live poller on every /api/live response */
+window.pokePaceUpdate=function(j){
+  live=!!(j&&j.pace);
+  if(!live){render();return;}
+  if(Date.now()>=pendingUntil&&(j.pace==='realtime'||j.pace==='max')){
+    mode=j.pace; paint();          /* sync to the trainer's actual mode */
+  }
+  window.POKE_PACE=mode;
+  phase=j.phase||'wave'; detail=j.phase_detail||'';
+  if(typeof j.eta_s==='number'){etaBase=j.eta_s; etaAt=performance.now();}
+  if(typeof j.wave==='number')waveIdx=j.wave;
+  if(typeof j.waves==='number')waves=j.waves;
+  render();
+};
+setInterval(render,200); /* client-side tick between polls */
+paint();
+})();
+</script>
+
+<script>
 /* ===== LIVE FRAMES layer — real champion gameplay, swarm frames + champion net =====
    Polls /api/live ~3 Hz. When champion.frame_b64 is present it drives the REAL
    visuals and sets window.POKE_FRAMES=true; the demo draw sites early-return on
@@ -2094,6 +2191,7 @@ async function pollLive(){
   try{
     const res=await fetch('/api/live'+(window.POKE_RUNQ||''),{cache:'no-store'});
     const j=await res.json();
+    if(window.pokePaceUpdate)window.pokePaceUpdate(j); /* pace + countdown sync */
     const ch=j&&j.champion;
     /* phase: "wave" | "evolving" — the boundary status keeps the cage honest */
     window.POKE_PHASE=(j&&j.phase)||'wave';
@@ -2142,7 +2240,13 @@ async function pollLive(){
     if(window.__detail)window.__detail.setFocus(null,null);
   }
 }
-pollLive(); setInterval(pollLive,330);
+/* adaptive poll: ~150 ms when the trainer paces realtime (10 Hz emits),
+   ~330 ms in max mode (3 Hz emits) — re-evaluated after every poll */
+function schedLive(){
+  const iv=(window.POKE_PACE==='realtime')?150:330;
+  setTimeout(function(){ pollLive().then(schedLive,schedLive); }, iv);
+}
+pollLive(); schedLive();
 })();
 </script>
 

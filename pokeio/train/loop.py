@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import subprocess
 import time
 from pathlib import Path
@@ -113,6 +114,125 @@ def query_gpu() -> list[dict]:
 
 def _screen_ref(screen: np.ndarray) -> str:
     return "blake2b:" + hashlib.blake2b(screen.tobytes(), digest_size=8).hexdigest()
+
+
+# --------------------------------------------------------------------------
+# live pace switching (spectate mode)
+# --------------------------------------------------------------------------
+class PaceController:
+    """Live-toggleable wave pacing: "max" (flat-out, today's behaviour,
+    bit-for-bit) or "realtime" (authentic Game Boy speed for the whole swarm).
+
+    The dashboard writes ``runs/<id>/pace.json`` via ``/api/pace``; this
+    controller stat-polls it at most every ``poll_s`` seconds (a monotonic
+    clock read per round otherwise — the busy-spin hot path is untouched) and
+    applies flips to a RUNNING trainer with no restart:
+
+    * fleet: shm pace flag -> workers sleep-wait between rounds (realtime)
+      or busy-spin (max).
+    * streamer: emit cadence 10 Hz (realtime) / base ~3 Hz (max) + payload
+      ``pace`` field.
+    * rounds: in realtime, round k's release deadline is ``t0 + k * period``
+      with ``period = frame_skip / 60`` s (one agent-step = frame_skip game
+      frames) — an ABSOLUTE schedule, so sleep truncation never accumulates
+      drift.  If a round overruns its deadline the schedule re-anchors at
+      "now" instead of bursting to catch up.
+    """
+
+    def __init__(self, run_dir, frame_skip: int, fleet=None, streamer=None,
+                 poll_s: float = 0.25) -> None:
+        self.path = Path(run_dir) / "pace.json"
+        self.period = float(frame_skip) / 60.0  # seconds of game time per round
+        self.fleet = fleet
+        self.streamer = streamer
+        self.poll_s = float(poll_s)
+        self.mode = "max"
+        self.round_hz = 0.0  # rolling measured round rate (either mode)
+        self._sig = None  # (mtime_ns, size) of last parsed pace.json
+        self._next_poll = 0.0
+        self._t0: float | None = None  # absolute-schedule anchor
+        self._k = 0  # rounds since anchor
+        self._last_round_ts: float | None = None
+        self.poll()  # honor a pre-existing pace.json at startup
+
+    # -- pace.json polling (cheap: clock read; stat at most every poll_s) ----
+    def poll(self) -> str:
+        now = time.monotonic()
+        if now < self._next_poll:
+            return self.mode
+        self._next_poll = now + self.poll_s
+        try:
+            st = self.path.stat()
+        except OSError:
+            return self.mode  # no pace.json -> stay put
+        sig = (st.st_mtime_ns, st.st_size)
+        if sig == self._sig:
+            return self.mode
+        try:
+            mode = json.loads(self.path.read_bytes()).get("mode")
+        except Exception:
+            return self.mode  # mid-write/corrupt: retry next poll
+        self._sig = sig
+        if mode in ("realtime", "max"):
+            self._apply(mode)
+        return self.mode
+
+    def _apply(self, mode: str) -> None:
+        if mode == self.mode:
+            return
+        self.mode = mode
+        self._t0 = None  # (re-)anchor the schedule on entering realtime
+        self._k = 0
+        if self.fleet is not None:
+            self.fleet.set_pace(mode == "realtime")
+        if self.streamer is not None:
+            self.streamer.set_pace(mode)
+        print(f"[pace] mode -> {mode}", flush=True)
+
+    # -- per-round hooks ------------------------------------------------------
+    def before_round(self) -> None:
+        """Poll for flips, then (realtime only) sleep to the round's deadline."""
+        self.poll()
+        if self.mode != "realtime":
+            return
+        now = time.monotonic()
+        if self._t0 is None:
+            self._t0 = now
+            self._k = 0
+            return
+        self._k += 1
+        deadline = self._t0 + self._k * self.period
+        if deadline <= now:
+            # overrun: re-anchor (never burst-catch-up)
+            self._t0 = now
+            self._k = 0
+            return
+        time.sleep(deadline - now)
+
+    def after_round(self) -> None:
+        """Update the measured round rate (EMA over inter-round gaps)."""
+        now = time.monotonic()
+        if self._last_round_ts is not None:
+            dt = now - self._last_round_ts
+            if dt > 0:
+                inst = 1.0 / dt
+                self.round_hz = (
+                    inst if self.round_hz <= 0
+                    else 0.9 * self.round_hz + 0.1 * inst
+                )
+        self._last_round_ts = now
+
+    def begin_wave(self) -> None:
+        """Reset the inter-round timer so boundary gaps don't poison the EMA."""
+        self._last_round_ts = None
+        self._t0 = None  # fresh absolute anchor per wave
+        self._k = 0
+
+    def per_round_s(self) -> float:
+        """Current per-round budget: exact in realtime, measured in max."""
+        if self.mode == "realtime":
+            return self.period
+        return (1.0 / self.round_hz) if self.round_hz > 0 else 0.0
 
 
 # --------------------------------------------------------------------------
@@ -235,6 +355,8 @@ def evaluate_wave_parallel(
     prof: dict | None = None,
     cp_full=None,
     wave_offset: int = 0,
+    pace: PaceController | None = None,
+    waves_left: int = 0,
 ) -> int:
     """Parallel-barrier equivalent of :func:`evaluate_wave`.
 
@@ -299,6 +421,9 @@ def evaluate_wave_parallel(
     _prof = _os.environ.get("POKEIO_PROF") == "1"
     _t_fwd = _t_step = _t_book = 0.0
 
+    if pace is not None:
+        pace.begin_wave()
+
     for t in range(episode_steps):
         _c0 = time.perf_counter() if _prof else 0.0
         X = np.ascontiguousarray(obs[:n], dtype=np.float32)
@@ -311,9 +436,19 @@ def evaluate_wave_parallel(
             _c1 = time.perf_counter()
             _t_fwd += _c1 - _c0
 
+        # Live pace: poll for flips (throttled stat) and, in realtime, sleep
+        # to this round's absolute wall-clock deadline before releasing it.
+        if pace is not None:
+            pace.before_round()
+
         obs, keys, dones, captured = fleet.step_all(
             actions_full, cap_flags if goexplore is not None else None
         )
+        if pace is not None:
+            pace.after_round()
+            if streamer is not None:
+                rounds_left = (episode_steps - 1 - t) + waves_left * episode_steps
+                streamer.set_eta(rounds_left * pace.per_round_s(), pace.round_hz)
         if _prof:
             _c2 = time.perf_counter()
             _t_step += _c2 - _c1
@@ -992,6 +1127,20 @@ def train(
         streamer.set_champion(genomes[0], "init", gen=0, fitness=0.0)
         print(f"[train] live streaming ON -> {run_dir / 'live.json'} (~3 Hz)")
 
+    # Live spectate toggle: /api/pace writes runs/<id>/pace.json; the controller
+    # applies flips to the running fleet + streamer with no restart.  frame_skip
+    # is derived from the env config (one agent-step = frame_skip game frames).
+    pace: PaceController | None = None
+    if parallel and fleet is not None:
+        pace = PaceController(
+            run_dir, config.emu.frame_skip, fleet=fleet, streamer=streamer
+        )
+        print(
+            f"[train] pace control ON -> {run_dir / 'pace.json'} "
+            f"(realtime budget {pace.period * 1000:.0f} ms/round, "
+            f"mode={pace.mode})"
+        )
+
     proc = psutil.Process()
     proc.cpu_percent(None)  # prime the psutil counter
     run_start = time.perf_counter()
@@ -1026,12 +1175,13 @@ def train(
                     _cache.append(pop_full.compile(device))
                 return _cache[0]
 
+            n_waves = (pop_size + players - 1) // players
             for wi, a in enumerate(range(0, pop_size, players)):
                 wave = genomes[a : a + players]
                 # Give the streamer this wave's slot -> genome mapping so the
                 # focus protocol can capture-forward any selected player slot.
                 if streamer is not None:
-                    streamer.begin_wave(wave, gen, a, wi)
+                    streamer.begin_wave(wave, gen, a, wi, n_waves=n_waves)
                 if parallel:
                     steps_done += evaluate_wave_parallel(
                         wave,
@@ -1050,6 +1200,8 @@ def train(
                         prof=prof,
                         cp_full=_cp_provider,
                         wave_offset=a,
+                        pace=pace,
+                        waves_left=n_waves - 1 - wi,
                     )
                 else:
                     steps_done += evaluate_wave(
@@ -1097,6 +1249,8 @@ def train(
                 max_nodes, max_conns, reset_state,
             )
             _bt = _phase("replay", _bt)
+            if pace is not None:
+                pace.poll()  # pick up mid-boundary flips before the next wave
 
             # Adaptive speciation threshold: without it the gen-0 population
             # shares one innovation baseline and collapses to a single species.

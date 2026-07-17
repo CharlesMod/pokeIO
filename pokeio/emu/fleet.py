@@ -476,6 +476,22 @@ def _spin_wait(pred, spin_budget: int = 3000, nap: float = 5e-5) -> None:
             time.sleep(nap)
 
 
+def _paced_wait(pred, nap: float = 2e-3) -> None:
+    """Sleep-wait used ONLY while the parent's shm pace flag is set (realtime
+    spectate mode).  At the paced ~2.5 rounds/s a busy spin would burn every
+    worker core ~99% idle; sleeping instead lets the box go quiet.  The 1.2 GHz
+    p-state clamp that makes napping catastrophic in max mode (see ``_NAP``) is
+    IRRELEVANT here: a clamped ~5 ms emulator step inside a 400 ms round budget
+    changes nothing.  Keeps the parent-death getppid escape of the spin path.
+    """
+    i = 0
+    while not pred():
+        time.sleep(nap)
+        i += 1
+        if i % 512 == 0 and os.getppid() == 1:
+            raise SystemExit(1)  # orphaned (parent died): exit, don't leak
+
+
 def _barrier_worker_main(
     slice_lo, slice_hi, rom_path, frame_skip, hold_frames, reset_state,
     obs_res, obs_ram, wram_stride, arch_kwargs, goexplore,
@@ -529,7 +545,8 @@ def _barrier_worker_main(
     res_flag = reg("res_flag", (n_envs,), np.uint8)
     res_state = reg("res_state", (n_envs, _MAX_STATE), np.uint8)
     res_len = reg("res_len", (n_envs,), np.int32)
-    ctl = reg("ctl", (2 + n_envs,), np.int64)  # [0]=go_round [1]=op [2+i]=wdone_i
+    # [0]=go_round [1]=op [2]=pace(1=realtime sleep-waits) [3+i]=wdone_i
+    ctl = reg("ctl", (3 + n_envs,), np.int64)
 
     envs = [
         PokeEnv(rom_path, frame_skip=frame_skip, hold_frames=hold_frames)
@@ -545,7 +562,14 @@ def _barrier_worker_main(
     local_round = 1
     try:
         while True:
-            _spin_wait(lambda: ctl[0] >= local_round)
+            # Pace flag checked ONCE per round (not per spin iteration): when
+            # clear the wait below is the exact busy-spin hot path; when set
+            # (realtime spectate) the worker sleep-waits between rounds.  A
+            # mid-wait mode flip takes effect on the next round (<= 1 round).
+            if ctl[2]:
+                _paced_wait(lambda: ctl[0] >= local_round)
+            else:
+                _spin_wait(lambda: ctl[0] >= local_round)
             op = int(ctl[1])
             if op == _OP_SHUTDOWN:
                 break
@@ -580,7 +604,7 @@ def _barrier_worker_main(
                     _emit(li, gi, screen, w64)
             # signal this round complete
             for gi in range(slice_lo, slice_hi):
-                ctl[2 + gi] = local_round
+                ctl[3 + gi] = local_round
             local_round += 1
     finally:
         for env in envs:
@@ -653,11 +677,12 @@ class BarrierFleet:
         alloc("res_flag", (n,), np.uint8)
         alloc("res_state", (n, _MAX_STATE), np.uint8)
         alloc("res_len", (n,), np.int32)
-        alloc("ctl", (2 + n,), np.int64)
+        alloc("ctl", (3 + n,), np.int64)
 
         self._ctl = self.arr["ctl"]
         self._ctl[:] = 0
         self._round = 0
+        self._paced = False  # parent-side mirror of ctl[2] (realtime spectate)
         self._shm_names = {k: v.name for k, v in self._blocks.items()}
 
         # ------------------------------------------------------------ workers
@@ -687,6 +712,15 @@ class BarrierFleet:
         self.n_workers = len(self._procs)
         self._closed = False
 
+    # ------------------------------------------------------------------ pacing
+    def set_pace(self, realtime: bool) -> None:
+        """Flip the shm pace flag: realtime -> workers (and the parent's
+        round-wait) use sleep-waits between rounds; max -> pure busy-spin,
+        bit-for-bit the pre-pace behaviour.  Safe to call any time; workers
+        pick it up at their next round boundary."""
+        self._paced = bool(realtime)
+        self._ctl[2] = 1 if realtime else 0
+
     # ------------------------------------------------------------------ barrier
     def _release_round(self, op: int) -> None:
         """Release the workers into a new round (returns immediately)."""
@@ -702,8 +736,19 @@ class BarrierFleet:
         target = self._round
         ctl = self._ctl
         n = self.n_envs
-        wdone = ctl[2:2 + n]
+        wdone = ctl[3:3 + n]
         i = 0
+        if self._paced:
+            # Realtime spectate: the parent sleeps too (the p-state clamp is
+            # irrelevant inside a 400 ms round budget — see _paced_wait).
+            while not bool((wdone >= target).all()):
+                time.sleep(1e-3)
+                i += 1
+                if i % 1000 == 0 and any(not p.is_alive() for p in self._procs):
+                    raise RuntimeError(
+                        "BarrierFleet worker died mid-round; aborting (see stderr)"
+                    )
+            return
         if not _NAP:
             # Hot wait (see _NAP): never sleep, or this core drops to 1.2 GHz and
             # the next forward/bookkeeping phase runs 2.6x slow. Liveness guard

@@ -13,6 +13,7 @@ Endpoints
 * ``GET /api/telemetry?run=ID``  → {"run", "records":[...], "host":{cpu,gpu}}  (tail of records)
 * ``GET /api/live?run=ID``       → parsed runs/<run-or-newest>/live.json (real frames + champion net) or {}
 * ``GET /api/select?run=ID&idx=N`` → writes runs/<ID>/select.json (focus agent; -1 = champion)
+* ``GET /api/pace?run=ID&mode=realtime|max`` → writes runs/<ID>/pace.json (live spectate toggle)
 * ``GET /api/host``              → {"cpu_pct","cpu_per_core":[...],"gpu":[...]}
 
 Dependency-light: stdlib + psutil (+ orjson via the telemetry reader). Never 500s
@@ -160,6 +161,30 @@ def _live(run: str | None) -> dict:
 
 
 SELECT_FILENAME = "select.json"  # focus-agent selection, read by the trainer
+PACE_FILENAME = "pace.json"  # spectate/max pace toggle, read by the trainer
+_PACE_MODES = ("realtime", "max")
+
+
+def _pace(run: str | None, mode) -> dict:
+    """Atomically write ``runs/<run>/pace.json`` = {"mode": m, "ts": now}.
+
+    ``mode`` is "realtime" (whole swarm at authentic Game Boy speed) or "max"
+    (flat-out training).  Missing run dir / bad mode -> {"ok": false} (always
+    HTTP 200; never raises).  The RUNNING trainer stat-polls this file and
+    switches live — no restart.
+    """
+    if not run or mode not in _PACE_MODES:
+        return {"ok": False}
+    d = RUNS_DIR / run
+    if not d.is_dir():
+        return {"ok": False}
+    tmp = d / (PACE_FILENAME + ".tmp")
+    try:
+        tmp.write_text(json.dumps({"mode": mode, "ts": time.time()}))
+        os.replace(tmp, d / PACE_FILENAME)
+    except Exception:
+        return {"ok": False}
+    return {"ok": True, "mode": mode}
 
 
 def _select(run: str | None, idx) -> dict:
@@ -240,6 +265,11 @@ class Handler(BaseHTTPRequestHandler):
                 run = (q.get("run") or [None])[0]
                 idx = (q.get("idx") or [None])[0]
                 self._json(_select(run, idx))
+            elif path == "/api/pace":
+                q = parse_qs(u.query)
+                run = (q.get("run") or [None])[0]
+                mode = (q.get("mode") or [None])[0]
+                self._json(_pace(run, mode))
             elif path == "/api/host":
                 self._json(_host_stats())
             elif path == "/healthz":

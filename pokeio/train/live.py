@@ -487,6 +487,23 @@ class LiveStreamer:
         self.elite_k = int(elite_k)
         self.champ_steps = int(champ_steps)
         self.last_size = 0
+        # -- pace (spectate mode): emit cadence + payload fields --------------
+        self._hz_max = float(hz)  # base cadence in "max" mode (~3 Hz)
+        self._hz_realtime = 10.0  # cadence in "realtime" spectate mode
+        self._pace = "max"
+        self._eta_s: float | None = None  # loop-fed seconds to next breeding
+        self._round_hz = 0.0  # loop-fed measured round rate
+        self._n_waves = 1
+        # At 10 Hz the heavy focus work (capture forward + genes) runs on a
+        # ~3 Hz subcadence; the cached payload is reused between rebuilds.
+        self._focus_min_dt = 1.0 / 3.0
+        self._focus_last = 0.0
+        self._focus_payload: dict | None = None
+        # Realtime: the champion showcase env is paced to authentic GB speed
+        # (one agent-step per frame_skip/60 s) instead of champ_steps/emit.
+        fs = getattr(getattr(showcase, "env", None), "frame_skip", 24)
+        self._champ_period = float(fs) / 60.0
+        self._champ_step_ts = 0.0
         # -- champion dwell: a freshly-installed champ is displayed >= champ_dwell
         # seconds before a newer one may replace it (latest pending wins).
         self.champ_dwell = float(champ_dwell)
@@ -567,14 +584,33 @@ class LiveStreamer:
             self._install_champion(g, gid, gen, fit, now)
 
     # -- loop-facing context hooks ------------------------------------------
-    def begin_wave(self, genomes, gen: int, offset: int, wave_idx: int) -> None:
+    def begin_wave(
+        self, genomes, gen: int, offset: int, wave_idx: int, n_waves: int = 1
+    ) -> None:
         """New wave: slot -> genome mapping changes, drop compiled focus state."""
         self._wave_genomes = list(genomes)
         self._wave_gen = int(gen)
         self._wave_offset = int(offset)
         self._wave_idx = int(wave_idx)
+        self._n_waves = max(1, int(n_waves))
         self._round = 0
         self._focus_cache.clear()
+        self._focus_payload = None  # stale slot mapping: force a focus rebuild
+
+    def set_pace(self, mode: str) -> None:
+        """Live pace flip from the loop's PaceController (thread-safe: plain
+        attribute/float writes).  realtime -> ~10 Hz emits; max -> base ~3 Hz.
+        The pump thread re-reads the interval every tick, so the cadence
+        adapts without a restart."""
+        self._pace = "realtime" if mode == "realtime" else "max"
+        hz = self._hz_realtime if self._pace == "realtime" else self._hz_max
+        self.writer.interval = 1.0 / max(0.1, hz)
+
+    def set_eta(self, eta_s: float, round_hz: float) -> None:
+        """Per-round countdown feed from the loop (cheap attribute writes):
+        seconds until the next breeding event + measured round rate."""
+        self._eta_s = float(eta_s)
+        self._round_hz = float(round_hz)
 
     def set_side_stats(self, reward_terms: dict, species: list) -> None:
         """Generation-boundary side-panel payloads (already plain python)."""
@@ -629,8 +665,8 @@ class LiveStreamer:
         its env, independent of the fleet — keeps playing.
         """
         warned = False
-        tick = self.writer.interval / 3.0
-        while not self._pump_stop.wait(tick):
+        # tick re-read each cycle: the pace toggle changes writer.interval live
+        while not self._pump_stop.wait(self.writer.interval / 3.0):
             if not self.writer.due():
                 continue
             try:
@@ -822,7 +858,15 @@ class LiveStreamer:
             if not force and not self.writer.due():
                 return False
             self._maybe_promote_pending()
-            self.showcase.step(self.champ_steps)
+            if self._pace == "realtime":
+                # Spectate mode: the champion cage plays at authentic GB speed
+                # too — one agent-step per frame_skip/60 s of wall clock.
+                _now = time.monotonic()
+                if _now - self._champ_step_ts >= self._champ_period:
+                    self.showcase.step(1)
+                    self._champ_step_ts = _now
+            else:
+                self.showcase.step(self.champ_steps)
             _t1 = time.perf_counter() if _prof else 0.0
             self._poll_select()
             # snapshot mutable refs once (the loop thread swaps them atomically)
@@ -841,15 +885,38 @@ class LiveStreamer:
             champ["champ_since"] = self._champ_since  # unix ts of install (UI tenure)
             champ["champ_gen"] = int(self._champ_gen)
             champ["fitness"] = float(self._champ_fitness)
+            # Heavy focus (capture forward + genes) at a ~3 Hz subcadence when
+            # emitting at 10 Hz; swarm/champion stay per-tick.
+            _now = time.monotonic()
+            if (
+                self._pace == "realtime"
+                and self._focus_payload is not None
+                and (_now - self._focus_last) < self._focus_min_dt
+            ):
+                focus = self._focus_payload
+            else:
+                focus = self._build_focus(screens, obs, actions)
+                self._focus_payload = focus
+                self._focus_last = _now
+            # eta to the next breeding event: 0 while the boundary itself runs
+            # (phase="evolving" covers it in the UI).
+            if phase == "evolving" or self._eta_s is None:
+                eta_s = 0.0
+            else:
+                eta_s = max(0.0, float(self._eta_s))
             payload = {
                 "t": time.time(),
                 "gen": int(gen),
                 "run": self.run_id,
                 "phase": phase,
                 "phase_detail": phase_detail,
+                "pace": self._pace,
+                "eta_s": round(eta_s, 2),
+                "round_hz": round(float(self._round_hz), 3),
+                "waves": int(self._n_waves),
                 "champion": champ,
                 "swarm": swarm,
-                "focus": self._build_focus(screens, obs, actions),
+                "focus": focus,
                 "reward_terms": self._reward_terms_payload(fitness),
                 "archive": self._archive_payload(),
                 "species": self._species,
