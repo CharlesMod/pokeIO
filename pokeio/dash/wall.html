@@ -2269,8 +2269,8 @@ const DPR=Math.min(2,window.devicePixelRatio||1);
 /* ---------- state ---------- */
 let F=null, J=null, payloadN=0, lastT=null, oneHot=false;
 const hist=[];                      // last 20 real actions, newest first
-const probS=new Float32Array(8);    // displayed (smoothed) probabilities
-const probT=new Float32Array(8);    // target = payload probs
+const probS=new Float32Array(9);    // displayed (smoothed) probabilities
+const probT=new Float32Array(9);    // target = payload probs (9 = +NOOP)
 let flash=0;                        // chosen-action flash
 let obsOff=null, obsRes=0, frameOff=null;
 let G=null;                         // normalized genes {src,nodes,conns,sum:{nIn,nHid,nOut,dis,en,iMin,iMax,acts}}
@@ -2376,13 +2376,14 @@ function setFocus(f,j){
   NP=prepNet(f);
   /* probabilities: real probs preferred; buttons one-hot as honest fallback */
   oneHot=false;
-  let p=(f.probs&&f.probs.length===8)?f.probs:null;
-  if(!p&&f.buttons&&f.buttons.length===8){p=f.buttons;oneHot=true;}
-  if(p)for(let k=0;k<8;k++)probT[k]=clamp(+p[k]||0,0,1);
-  const act=(typeof f.action==='number'&&f.action>=0&&f.action<8)?f.action
+  const NB=SYM.length;  // action-space width (9: dirs + A B START SELECT NOOP)
+  let p=(f.probs&&f.probs.length===NB)?f.probs:null;
+  if(!p&&f.buttons&&f.buttons.length===NB){p=f.buttons;oneHot=true;}
+  if(p)for(let k=0;k<NB;k++)probT[k]=clamp(+p[k]||0,0,1);
+  const act=(typeof f.action==='number'&&f.action>=0&&f.action<NB)?f.action
             :(f.buttons?f.buttons.indexOf(1):-1);
   if(hist.length===0||hist[0].n!==payloadN)
-    hist.unshift({n:payloadN,a:act,sym:(act>=0&&act<8)?SYM[act]:'·'});
+    hist.unshift({n:payloadN,a:act,sym:(act>=0&&act<NB)?SYM[act]:'·'});
   if(hist.length>20)hist.pop();
   flash=1;
   /* pause the SIM FRAME beat while the loop is evolving (no wave steps) */
@@ -2567,7 +2568,7 @@ function drawFp(dt,time){
   L.actX=L.bX+rem*0.80; L.actW=FW-18-L.actX;
   const binY=b=>top+(b+0.5)*ah/NBINS;
   const hidY=i=>{const nh=NP&&NP.hid.length||1;return top+(i+0.5)*ah/nh;};
-  const barY=k=>top+(k+0.5)*ah/8;
+  const barY=k=>top+(k+0.5)*ah/SYM.length;
   /* stage captions */
   const stops=[['01','SCREEN',L.sX+L.sW/2],['02','OBS',L.oX+obsS/2],['03','NET',(L.bX+L.barLX)/2],
                ['04','P(BUTTON)',L.barLX+L.barW/2+14],['05','ACTION',L.actX+L.actW/2]];
@@ -2654,7 +2655,7 @@ function drawFp(dt,time){
   /* ---- 04 probability bars (real focus.probs, or one-hot buttons) ---- */
   const chosen=hist.length?hist[0].a:-1;
   fpx.textBaseline='middle';
-  for(let k=0;k<8;k++){
+  for(let k=0;k<SYM.length;k++){
     const y=barY(k), p=clamp(probS[k],0,1), on=(k===chosen);
     fpx.font='700 11px '+MONO;fpx.textAlign='left';
     fpx.fillStyle=on?'rgba('+AMB+',1)':'rgba(168,157,136,0.9)';
@@ -2679,7 +2680,7 @@ function drawFp(dt,time){
   }
   fpx.textBaseline='alphabetic';
   fcap(fpx,oneHot?'buttons (one-hot) · probs not in payload':'P(button) · live',L.barLX+L.barW/2+16,bot+14);
-  fcap(fpx,'UP DOWN LEFT RIGHT A B START SELECT',L.barLX+L.barW/2+16,bot+24,'center','rgba(111,102,86,0.6)');
+  fcap(fpx,'UP DOWN LEFT RIGHT A B START SELECT NOOP',L.barLX+L.barW/2+16,bot+24,'center','rgba(111,102,86,0.6)');
   /* ---- 05 chosen action ---- */
   const cxp=L.actX+L.actW/2, cy=top+ah*0.32, size=34;
   if(chosen>=0){
@@ -2756,7 +2757,7 @@ let lastTs=0;
 function loop(ts){
   const dt=Math.min(0.1,(ts-lastTs)/1000||0); lastTs=ts;
   const t=ts/1000;
-  for(let k=0;k<8;k++)probS[k]+=(probT[k]-probS[k])*Math.min(1,dt*7);
+  for(let k=0;k<SYM.length;k++)probS[k]+=(probT[k]-probS[k])*Math.min(1,dt*7);
   flash=Math.max(0,flash-dt*1.6);
   if(!window.POKE_LANEB_ON)drawGenotype(dt,t);
   if(window.POKE_FOCUS)drawFp(dt,t);
