@@ -366,6 +366,10 @@ class VecFleet:
 # pulling torch into 32 spawned processes. loop.py re-imports it from here.
 _SCREEN_H = 144
 _SCREEN_W = 160
+# Retina Nature-CNN input side (== evo.retina.IN_SIDE). Kept as a torch-free
+# literal so the workers can size/detect the retina obs WITHOUT importing torch;
+# only a retina-mode FovealEncoder lazily imports evo.retina (see below).
+_RETINA_SIDE = 84
 
 
 def _area_matrix(in_size: int, out_size: int) -> np.ndarray:
@@ -471,8 +475,21 @@ class FovealEncoder:
         enc.update_gaze(i, dx, dy)               # §3.3 saccade dynamics + store
         vec = enc.encode(i, screen, wram, button=applied_button)
 
-    ``.dim`` is 454 for the committed defaults.  ``.reset(i)`` resets one env;
-    ``.reset()`` resets all.  Gaze resets to screen centre ``(gy, gx)=(72, 80)``.
+    ``.dim`` is 454 for the committed foveal defaults.  ``.reset(i)`` resets one
+    env; ``.reset()`` resets all.  Gaze resets to screen centre ``(gy,gx)=(72,80)``.
+
+    With ``mode="retina"`` (Phase-1; select via ``config.vision.mode=="retina"``
+    or by requesting ``obs_dim==14134``) the encoder keeps the IDENTICAL gaze /
+    saccade / proprio / ram machinery but ships the retina's PIXEL input instead
+    of the 12x12 vectors, a fixed **14134-dim** float32 layout (n_ram=8):
+
+        periph84 [0:7056]      full raw screen -> 84x84 (retina.downscale)   [0,1]
+        fovea84  [7056:14112]  48px native gaze crop -> 84x84 (crop_fovea)   [0,1]
+        proprio  [14112:14126] SAME 14-d efference copy as foveal           [-1,1]
+        ram      [14126:14134] SAME 8 mined tap bytes as foveal              [0,1]
+
+    Retina mode emits SINGLE frames; the 4-frame temporal stack is built
+    parent-side by the loop (per-env rings), so nothing is stacked here.
     """
 
     def __init__(
@@ -488,8 +505,10 @@ class FovealEncoder:
         screen_w: int = _SCREEN_W,
         shades: int = 4,
         episode_steps: int = 1024,
+        mode: str = "foveal",
     ) -> None:
         self.n_envs = int(n_envs)
+        self.mode = str(mode)
         self.G = int(periph_grid)
         self.F = int(fovea_native_px)
         self.n_ram = int(n_ram)
@@ -505,14 +524,42 @@ class FovealEncoder:
         self.n_fovea = g * g
         self.n_motion = g * g
         self.n_proprio = 14
-        self.dim = self.n_periph + self.n_fovea + self.n_motion + self.n_proprio + self.n_ram
 
-        # Block offsets (contiguous).
-        self._o_periph = 0
-        self._o_fovea = self.n_periph
-        self._o_motion = self._o_fovea + self.n_fovea
-        self._o_proprio = self._o_motion + self.n_motion
-        self._o_ram = self._o_proprio + self.n_proprio
+        if self.mode == "retina":
+            # Phase-1 retina obs: ship the retina encoder's PIXEL input, not the
+            # 12x12 foveal vector.  Single 84x84 periphery (full screen area-
+            # downscaled) + single 84x84 fovea (48px native gaze crop upsampled)
+            # + the SAME 14-d proprio efference copy + 8-d mined RAM tail. NO
+            # motion sheet (the 4-frame temporal STACK is built PARENT-SIDE by
+            # the loop's per-env rings — this emits current single frames only).
+            self._side = _RETINA_SIDE                    # 84 (== retina.IN_SIDE)
+            self.n_periph84 = self._side * self._side    # 7056
+            self.n_fovea84 = self._side * self._side     # 7056
+            self.dim = (self.n_periph84 + self.n_fovea84
+                        + self.n_proprio + self.n_ram)   # 14134 @ n_ram=8
+            self._o_periph = 0                           # periph84 [0:7056]
+            self._o_fovea = self.n_periph84              # fovea84  [7056:14112]
+            self._o_proprio = self._o_fovea + self.n_fovea84   # proprio [14112:14126]
+            self._o_ram = self._o_proprio + self.n_proprio     # ram     [14126:14134]
+            # Lazy import: evo.retina pulls torch, which the torch-free foveal
+            # workers must never import. Only a retina-mode encoder touches it,
+            # so the default (foveal 454) path stays torch-free across all 56
+            # spawned workers. Reuse retina.downscale / retina.crop_fovea so the
+            # 84x84 tensors are byte-exactly what the parent-side retina expects.
+            from pokeio.evo import retina as _retina
+            self._retina = _retina
+            assert _retina.IN_SIDE == self._side, (
+                f"retina.IN_SIDE={_retina.IN_SIDE} != fleet _RETINA_SIDE={self._side}"
+            )
+        else:
+            self.dim = (self.n_periph + self.n_fovea + self.n_motion
+                        + self.n_proprio + self.n_ram)
+            # Block offsets (contiguous).
+            self._o_periph = 0
+            self._o_fovea = self.n_periph
+            self._o_motion = self._o_fovea + self.n_fovea
+            self._o_proprio = self._o_motion + self.n_motion
+            self._o_ram = self._o_proprio + self.n_proprio
 
         # Fovea centre clamp: keep the FxF window fully on-screen (spec §3.3).
         self._half = self.F // 2
@@ -635,6 +682,65 @@ class FovealEncoder:
                 ram[: seg.size] = seg
         return ram
 
+    # ------------------------------------------------------------- ram overlay
+    def _ram_block(
+        self, wram: np.ndarray | None, taps: list[tuple[int, float]] | None
+    ) -> np.ndarray:
+        """Blind stride sample + connect-protected tap overlay for the ram tail.
+
+        Byte-identical to the inline overlay the foveal ``encode`` does (parent
+        path overlays mined taps from full ``wram``; worker path leaves
+        ``tap_addrs`` empty and overlays from live emulator memory in ``_emit``).
+        Shared so the retina path produces the IDENTICAL 8-d ram block."""
+        ram = self._ram(wram)
+        if self.tap_addrs and wram is not None:  # parent path: overlay from wram
+            for j, a in enumerate(self.tap_addrs[: self.n_ram]):
+                idx = a - 0xC000
+                if 0 <= idx < wram.size:
+                    ram[j] = wram[idx] / 255.0
+        if taps:  # explicit (slot, value01) overlay
+            for slot, v in taps:
+                if 0 <= slot < self.n_ram:
+                    ram[slot] = np.float32(v)
+        return ram
+
+    # -------------------------------------------------------------- retina encode
+    def _encode_retina(
+        self,
+        i: int,
+        screen: np.ndarray,
+        wram: np.ndarray | None,
+        *,
+        button: int,
+        taps: list[tuple[int, float]] | None,
+    ) -> np.ndarray:
+        """Build the 14134-d retina obs for env ``i`` (mode=="retina").
+
+        ``periph84`` = full raw screen area-downscaled to 84x84 (retina.downscale);
+        ``fovea84``  = 48px native crop at the CURRENT gaze, upsampled to 84x84
+        (retina.crop_fovea). Gaze is rounded to the nearest pixel with the SAME
+        rule the foveal ``_crop`` uses (``int(floor(g+0.5))``), so both modes crop
+        at an identical centre. ``proprio``/``ram`` are the Phase-0 blocks."""
+        r = self._retina
+        side = self._side
+        scr = np.asarray(screen)
+        periph84 = r.downscale(scr, side)                       # (84,84) f32 [0,1]
+        # Round the float gaze to a pixel index the same way _crop does; the
+        # native FxF crop is upsampled to 84x84 (retina resize) and flattened.
+        gy_px = int(np.floor(float(self._gy[i]) + 0.5))
+        gx_px = int(np.floor(float(self._gx[i]) + 0.5))
+        fovea84 = r.crop_fovea(scr, gy_px, gx_px, self.F, side)  # (84,84) f32 [0,1]
+
+        proprio = self._proprio(i, button)
+        ram = self._ram_block(wram, taps)
+
+        vec = np.empty(self.dim, np.float32)
+        vec[self._o_periph : self._o_fovea] = periph84.ravel()
+        vec[self._o_fovea : self._o_proprio] = fovea84.ravel()
+        vec[self._o_proprio : self._o_ram] = proprio
+        vec[self._o_ram : self.dim] = ram
+        return vec
+
     # ------------------------------------------------------------------ encode
     def encode(
         self,
@@ -645,7 +751,10 @@ class FovealEncoder:
         button: int = 8,
         taps: list[tuple[int, float]] | None = None,
     ) -> np.ndarray:
-        """Build the 454-d obs vector for env ``env_idx`` from its current state.
+        """Build the obs vector for env ``env_idx`` from its current state.
+
+        Foveal mode -> 454-d (periphery/fovea/motion/proprio/ram); retina mode
+        -> 14134-d (periph84/fovea84/proprio/ram). Details below cover foveal.
 
         ``screen`` is a raw (H,W) uint8 frame; ``wram`` is the full 8 KB block
         (parent) or the strided slice (worker).  ``button`` is the button id
@@ -655,6 +764,8 @@ class FovealEncoder:
         the freshly-integrated gaze (the workers do exactly this in ``_emit``).
         """
         i = int(env_idx)
+        if self.mode == "retina":
+            return self._encode_retina(i, screen, wram, button=button, taps=taps)
         norm = self._shade.normalize_shades(screen)          # (H,W) float32 [0,1]
         normd = norm.astype(np.float64)
 
@@ -852,17 +963,22 @@ def _barrier_worker_main(
     except Exception:
         pass
 
-    # Active-vision foveal encoder (stateful per env; §2/§3) when the requested
-    # obs_dim matches the foveal layout; else fall back to the legacy flat
-    # ObsEncoder (back-compat for callers that still ask for res^2+ram obs).
+    # Active-vision encoder (stateful per env; §2/§3), auto-selected from obs_dim:
+    #   obs_dim == 3*G^2+14+n_ram  -> foveal 454 obs (Phase-0 pixel vectors)
+    #   obs_dim == 2*84^2+14+n_ram -> retina 14134 obs (Phase-1 pixel input)
+    # else fall back to the legacy flat ObsEncoder (back-compat res^2+ram obs).
     # n_envs-wide so it can be indexed by the GLOBAL env id (= shm obs rows).
     _foveal_dim = 3 * periph_grid * periph_grid + 14 + obs_ram
+    _retina_dim = 2 * _RETINA_SIDE * _RETINA_SIDE + 14 + obs_ram
+    use_retina = int(obs_dim) == int(_retina_dim)
     use_foveal = int(obs_dim) == int(_foveal_dim)
-    if use_foveal:
+    use_active = use_foveal or use_retina  # stateful FovealEncoder (gaze/saccade)
+    if use_active:
         encoder = FovealEncoder(
             n_envs, periph_grid=periph_grid, fovea_native_px=fovea_native_px,
             n_ram=obs_ram, saccade_gain=saccade_gain,
             saccade_every_k=saccade_every_k, episode_steps=episode_steps,
+            mode=("retina" if use_retina else "foveal"),
         )
     else:
         encoder = ObsEncoder(obs_res, obs_ram)
@@ -911,7 +1027,7 @@ def _barrier_worker_main(
     def _emit(local_i, global_i, screen, w64, button):
         env = envs[local_i]
         screens[global_i] = screen
-        if use_foveal:
+        if use_active:
             obs[global_i] = encoder.encode(global_i, screen, w64, button=button)
         else:
             obs[global_i] = encoder.encode_compact(screen, w64)
@@ -949,7 +1065,7 @@ def _barrier_worker_main(
             for li, gi in enumerate(range(slice_lo, slice_hi)):
                 env = envs[li]
                 if op == _OP_RESET:
-                    if use_foveal:
+                    if use_active:
                         encoder.reset(gi)  # gaze -> centre, motion -> 0.5
                     if goexplore and res_flag[gi]:
                         env.load_state(bytes(res_state[gi, : int(res_len[gi])]))
@@ -964,7 +1080,7 @@ def _barrier_worker_main(
                 else:  # _OP_STEP
                     # Integrate this step's saccade command BEFORE _emit builds
                     # the obs, so the fovea crop + proprio see the new gaze (§3.4).
-                    if use_foveal:
+                    if use_active:
                         encoder.update_gaze(gi, float(gaze_dx[gi]), float(gaze_dy[gi]))
                     # Deferred Go-Explore capture: save the state we are STILL in
                     # (from last round) before applying this round's action.
@@ -1440,16 +1556,22 @@ def _async_worker_main(
     except Exception:
         pass
 
-    # Active-vision foveal encoder (stateful per env; §2/§3) when obs_dim matches
-    # the foveal layout; else the legacy flat ObsEncoder (back-compat). Indexed
-    # by GLOBAL env id to match the shm obs rows.
+    # Active-vision encoder (stateful per env; §2/§3), auto-selected from obs_dim:
+    #   obs_dim == 3*G^2+14+n_ram  -> foveal 454 obs (Phase-0 pixel vectors)
+    #   obs_dim == 2*84^2+14+n_ram -> retina 14134 obs (Phase-1 pixel input)
+    # else the legacy flat ObsEncoder (back-compat). Indexed by GLOBAL env id to
+    # match the shm obs rows.
     _foveal_dim = 3 * periph_grid * periph_grid + 14 + obs_ram
+    _retina_dim = 2 * _RETINA_SIDE * _RETINA_SIDE + 14 + obs_ram
+    use_retina = int(obs_dim) == int(_retina_dim)
     use_foveal = int(obs_dim) == int(_foveal_dim)
-    if use_foveal:
+    use_active = use_foveal or use_retina  # stateful FovealEncoder (gaze/saccade)
+    if use_active:
         encoder = FovealEncoder(
             n_envs, periph_grid=periph_grid, fovea_native_px=fovea_native_px,
             n_ram=obs_ram, saccade_gain=saccade_gain,
             saccade_every_k=saccade_every_k, episode_steps=episode_steps,
+            mode=("retina" if use_retina else "foveal"),
         )
     else:
         encoder = ObsEncoder(obs_res, obs_ram)
@@ -1496,7 +1618,7 @@ def _async_worker_main(
 
     def _emit(gi, env, screen, w64, button):
         screens[gi] = screen
-        if use_foveal:
+        if use_active:
             obs[gi] = encoder.encode(gi, screen, w64, button=button)
         else:
             obs[gi] = encoder.encode_compact(screen, w64)
@@ -1534,7 +1656,7 @@ def _async_worker_main(
                     ]
                 for li, gi in enumerate(my):
                     env = envs[li]
-                    if use_foveal:
+                    if use_active:
                         encoder.reset(gi)  # gaze -> centre, motion -> 0.5
                     if goexplore and res_flag[gi]:
                         env.load_state(bytes(res_state[gi, : int(res_len[gi])]))
@@ -1552,7 +1674,7 @@ def _async_worker_main(
                 continue
             # ---- _OP_RUN: free-run until every owned env reaches the target
             target = int(ctl[3])
-            if use_foveal:
+            if use_active:
                 encoder.episode_steps = max(1, target)  # step_frac denominator
             spins = 0
             while True:
@@ -1564,7 +1686,7 @@ def _async_worker_main(
                     env = envs[li]
                     # Integrate obs k's saccade command into the gaze BEFORE the
                     # step + _emit build obs k+1 (§3.4; one-tick efference delay).
-                    if use_foveal:
+                    if use_active:
                         encoder.update_gaze(gi, float(gaze_dx[gi]), float(gaze_dy[gi]))
                     # Deferred Go-Explore capture: save the state we are STILL
                     # in (obs k) before applying obs k's action — same semantics

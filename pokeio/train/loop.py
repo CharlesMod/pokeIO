@@ -143,6 +143,247 @@ def _blind_ablation_gate(cp, probe_obs, device, *, beta, dmin, optical_hi=432):
 
 
 # --------------------------------------------------------------------------
+# Phase-1 retina spine (docs/specs/retina-in-loop.md; active-vision-spine §4/§6)
+# --------------------------------------------------------------------------
+# In retina mode (config.vision.mode == "retina") there are TWO obs dimensions:
+#   * the FLEET/worker obs is encoder.dim == 14134 raw-pixel single frames
+#     (periph84[0:7056] | fovea84[7056:14112] | proprio[14112:14126] | ram[..]),
+#   * the GENOME/controller obs is the 102-d learned latent
+#     [z_periph(48) | z_fovea(32) | proprio(14) | ram(8)].
+# The parent maintains per-env 4-frame rings for periph84+fovea84, batch-encodes
+# them through a FROZEN retina.snapshot(), and concatenates proprio+ram. In
+# foveal mode no pipe is built (the 454-d obs IS the controller input; identity).
+from collections import deque as _deque_rt
+
+
+def _retina_device(card: int, *, fallback: torch.device | None = None) -> torch.device:
+    """``cuda:card`` if it exists, else the last cuda device, else cpu/fallback."""
+    if torch.cuda.is_available():
+        nd = torch.cuda.device_count()
+        c = int(card)
+        if 0 <= c < nd:
+            return torch.device(f"cuda:{c}")
+        return torch.device(f"cuda:{nd - 1}")
+    return fallback if fallback is not None else torch.device("cpu")
+
+
+def _win_stack(frames: np.ndarray, t: int, k: int = 4) -> np.ndarray:
+    """``(L,84,84) -> (k,84,84)`` frame stack ending at ``t``, clamped to the
+    segment start (indices < 0 pinned to frame 0).
+
+    Byte-identical to the per-env ring stack :class:`RetinaObsPipe` builds online
+    (a ring reset at the segment start fills ``k`` copies of frame 0), so a window
+    sampled from a stored single-frame segment matches what ran live."""
+    idx = [max(0, t - k + 1 + j) for j in range(k)]
+    return frames[idx]
+
+
+class RetinaObsPipe:
+    """Transform raw worker obs (14134) -> controller latent obs (102).
+
+    Holds a FROZEN ``retina.snapshot()`` on the inference card + per-env 4-frame
+    rings for the periphery and fovea 84x84 streams. ``reset(i)`` clears env i's
+    rings on an episode/restore boundary (mirrors :meth:`FovealEncoder.reset`);
+    the first ``transform`` after a reset fills the ring with 4 copies of the
+    current frame (== :func:`build_stack`'s clamp-to-frame-0). ``set_snapshot``
+    swaps the frozen encoder at a freeze-and-swap boundary — the population is
+    always fed the frozen snapshot, so the latent obs is stationary between swaps.
+    """
+
+    def __init__(self, snapshot, n_envs: int, offsets, *, side: int = 84,
+                 stack: int = 4):
+        self.snap = snapshot
+        self.n_envs = int(n_envs)
+        (self.o_periph, self.o_fovea, self.o_proprio, self.o_ram, self.dim) = offsets
+        self.side = int(side)
+        self.stack = int(stack)
+        self._rp = [_deque_rt(maxlen=self.stack) for _ in range(self.n_envs)]
+        self._rf = [_deque_rt(maxlen=self.stack) for _ in range(self.n_envs)]
+
+    def reset(self, env_idx: int | None = None) -> None:
+        idxs = range(self.n_envs) if env_idx is None else (int(env_idx),)
+        for i in idxs:
+            self._rp[i].clear()
+            self._rf[i].clear()
+
+    def set_snapshot(self, snapshot) -> None:
+        self.snap = snapshot
+
+    def split(self, raw: np.ndarray):
+        """``(m,dim) -> (periph(m,84,84), fovea(m,84,84), proprio(m,14), ram(m,8))``
+        single frames, without touching the rings (for the warm-up collector)."""
+        m = raw.shape[0]
+        s = self.side
+        periph = np.ascontiguousarray(raw[:, self.o_periph:self.o_fovea]).reshape(m, s, s)
+        fovea = np.ascontiguousarray(raw[:, self.o_fovea:self.o_proprio]).reshape(m, s, s)
+        proprio = np.ascontiguousarray(raw[:, self.o_proprio:self.o_ram])
+        ram = np.ascontiguousarray(raw[:, self.o_ram:self.dim])
+        return periph, fovea, proprio, ram
+
+    def _stacks(self, raw: np.ndarray):
+        """Push one frame per env into the rings; return ``(periph_stack,
+        fovea_stack, proprio, ram)`` = ``(m,K,84,84)x2 + (m,14) + (m,8)``."""
+        periph, fovea, proprio, ram = self.split(raw)
+        m = raw.shape[0]
+        s, k = self.side, self.stack
+        ps = np.empty((m, k, s, s), np.float32)
+        fs = np.empty((m, k, s, s), np.float32)
+        for i in range(m):
+            rp, rf = self._rp[i], self._rf[i]
+            if not rp:  # first frame after a reset: fill k copies (clamp-to-0)
+                for _ in range(k):
+                    rp.append(periph[i].copy())
+                    rf.append(fovea[i].copy())
+            else:
+                rp.append(periph[i].copy())
+                rf.append(fovea[i].copy())
+            ps[i] = np.stack(rp, axis=0)
+            fs[i] = np.stack(rf, axis=0)
+        return ps, fs, proprio, ram
+
+    def transform(self, raw: np.ndarray) -> np.ndarray:
+        """``(m,dim) -> (m,102)`` controller latent obs via the frozen snapshot."""
+        ps, fs, proprio, ram = self._stacks(raw)
+        z = self.snap.encode_np(ps, fs)  # (m, z_dim) fp32, no grad, eval
+        if z.ndim == 1:
+            z = z[None, :]
+        return np.concatenate([z, proprio, ram], axis=1).astype(np.float32)
+
+
+def _retina_collect_fleet(fleet, pipe: RetinaObsPipe, episode_steps: int, rng,
+                          *, n: int | None = None):
+    """Run one random-policy wave on the barrier fleet; return ``(segments,
+    frames)``. Each segment is one env's contiguous single-frame periph/fovea
+    rollout + the button + saccade applied each step (one wave = one episode, so
+    a segment never crosses an episode/restore boundary)."""
+    n = int(n if n is not None else fleet.n_envs)
+    obs = fleet.reset_all()
+    pf = [[] for _ in range(n)]
+    ff = [[] for _ in range(n)]
+    bt = [[] for _ in range(n)]
+    sc = [[] for _ in range(n)]
+    for _t in range(episode_steps):
+        periph, fovea, _pr, _rm = pipe.split(obs[:n])
+        acts = rng.integers(0, 9, n).astype(np.int32)
+        gdx = rng.uniform(-1.0, 1.0, n).astype(np.float32)
+        gdy = rng.uniform(-1.0, 1.0, n).astype(np.float32)
+        for i in range(n):
+            pf[i].append(periph[i].copy())
+            ff[i].append(fovea[i].copy())
+            bt[i].append(int(acts[i]))
+            sc[i].append((float(gdx[i]), float(gdy[i])))
+        obs, _keys, _dones, _cap = fleet.step_all(acts, None, gaze_dx=gdx, gaze_dy=gdy)
+    return _retina_pack_segments(pf, ff, bt, sc), n * episode_steps
+
+
+def _retina_collect_serial(envs, encoder, pipe: RetinaObsPipe, episode_steps: int,
+                           reset_state: str, rng, *, n: int | None = None):
+    """Serial (no-fleet) equivalent of :func:`_retina_collect_fleet`."""
+    n = int(n if n is not None else len(envs))
+    for i in range(n):
+        encoder.reset(i)
+    screens = [envs[i].reset(reset_state) for i in range(n)]
+    wrams = [envs[i].raw_wram() for i in range(n)]
+    last_btn = np.full(n, 8, dtype=np.int32)
+    pf = [[] for _ in range(n)]
+    ff = [[] for _ in range(n)]
+    bt = [[] for _ in range(n)]
+    sc = [[] for _ in range(n)]
+    for _t in range(episode_steps):
+        raw = np.stack([
+            encoder.encode(i, screens[i], wrams[i], button=int(last_btn[i]))
+            for i in range(n)
+        ]).astype(np.float32)
+        periph, fovea, _pr, _rm = pipe.split(raw)
+        acts = rng.integers(0, 9, n).astype(np.int32)
+        gdx = rng.uniform(-1.0, 1.0, n).astype(np.float32)
+        gdy = rng.uniform(-1.0, 1.0, n).astype(np.float32)
+        for i in range(n):
+            pf[i].append(periph[i].copy())
+            ff[i].append(fovea[i].copy())
+            bt[i].append(int(acts[i]))
+            sc[i].append((float(gdx[i]), float(gdy[i])))
+            encoder.update_gaze(i, float(gdx[i]), float(gdy[i]))
+            scr, wr, _done, _info = envs[i].step(int(acts[i]))
+            screens[i] = scr
+            wrams[i] = wr
+            last_btn[i] = acts[i]
+    return _retina_pack_segments(pf, ff, bt, sc), n * episode_steps
+
+
+def _retina_pack_segments(pf, ff, bt, sc):
+    segs = []
+    for i in range(len(pf)):
+        if not pf[i]:
+            continue
+        segs.append({
+            "periph": np.stack(pf[i]).astype(np.float32),
+            "fovea": np.stack(ff[i]).astype(np.float32),
+            "buttons": np.asarray(bt[i], np.int64),
+            "sacc": np.asarray(sc[i], np.float32),
+        })
+    return segs
+
+
+def _retina_buffer_trim(buffer: list, max_frames: int) -> None:
+    """Evict oldest segments so the replay buffer holds <= ``max_frames`` frames."""
+    total = sum(int(s["periph"].shape[0]) for s in buffer)
+    while len(buffer) > 1 and total > max_frames:
+        seg = buffer.pop(0)
+        total -= int(seg["periph"].shape[0])
+
+
+def _retina_sample_batch(buffer: list, batch_size: int, spr_k: int, rng,
+                         *, stack: int = 4):
+    """Sample ``batch_size`` length-(spr_k+1) windows -> a ``retina.train_step``
+    batch dict (``periph/fovea (B,T,K,84,84)``, ``actions (B,spr_k)``,
+    ``saccade (B,spr_k,2)``). Windows never cross a segment boundary."""
+    t_len = spr_k + 1
+    valid = [s for s in buffer if int(s["periph"].shape[0]) >= t_len]
+    if not valid:
+        return None
+    per, fov, act, sac = [], [], [], []
+    for _ in range(int(batch_size)):
+        seg = valid[int(rng.integers(len(valid)))]
+        length = int(seg["periph"].shape[0])
+        st = int(rng.integers(0, length - spr_k))  # window [st .. st+spr_k]
+        per.append(np.stack([_win_stack(seg["periph"], st + j, stack) for j in range(t_len)]))
+        fov.append(np.stack([_win_stack(seg["fovea"], st + j, stack) for j in range(t_len)]))
+        act.append(seg["buttons"][st:st + spr_k])
+        sac.append(seg["sacc"][st:st + spr_k])
+    return {
+        "periph": np.stack(per).astype(np.float32),
+        "fovea": np.stack(fov).astype(np.float32),
+        "actions": np.stack(act).astype(np.int64),
+        "saccade": np.stack(sac).astype(np.float32),
+    }
+
+
+def _retina_train(retina, opt, buffer: list, steps: int, spr_k: int, rng,
+                  *, batch_size: int = 32, log_every: int = 25,
+                  label: str = "retina") -> list:
+    """Run ``steps`` SPR + inverse-dynamics grad steps on sampled windows.
+
+    Returns the per-step loss dicts so the caller can log SPR loss dropping."""
+    hist: list = []
+    steps = max(0, int(steps))
+    for s in range(steps):
+        batch = _retina_sample_batch(buffer, batch_size, spr_k, rng)
+        if batch is None:
+            break
+        out = retina.train_step(batch, opt)
+        hist.append(out)
+        if log_every and (s % log_every == 0 or s == steps - 1):
+            print(
+                f"[{label}] step {s:4d}/{steps}  loss={out['loss']:.4f} "
+                f"spr={out['spr']:.4f} inv={out['inv']:.4f} "
+                f"inv_acc={out['inv_acc']:.3f}",
+                flush=True,
+            )
+    return hist
+
+
+# --------------------------------------------------------------------------
 # reproducibility (A4) + topology-budget growth (A2) + resume hygiene (A3)
 # --------------------------------------------------------------------------
 def _git_sha(repo_dir: str | Path | None = None) -> str:
@@ -536,6 +777,7 @@ def evaluate_wave(
     w_resp_var: float = 0.5,
     probe_sink: list | None = None,
     probe_quota: int = 0,
+    retina_pipe: "RetinaObsPipe | None" = None,
 ) -> int:
     """Evaluate one wave of genomes in lockstep; sets genome.fitness in place.
 
@@ -555,6 +797,8 @@ def evaluate_wave(
     base_depth = np.zeros(n, dtype=np.int64)  # cumulative chain depth per player
     for i in range(n):
         encoder.reset(i)  # gaze -> centre, motion -> 0.5 (per episode/restore)
+        if retina_pipe is not None:  # clear the env's 4-frame periph/fovea rings
+            retina_pipe.reset(i)
         entry = None
         if (
             goexplore is not None
@@ -599,6 +843,8 @@ def evaluate_wave(
         X = np.empty((n, encoder.dim), dtype=np.float32)
         for i in range(n):
             X[i] = encoder.encode(i, screens[i], wrams[i], button=int(last_button[i]))
+        if retina_pipe is not None:  # raw 14134 pixel obs -> 102-d learned latent
+            X = retina_pipe.transform(X)
         xt = torch.from_numpy(X).to(device).unsqueeze(1)  # (n, 1, dim)
         if recurrent_memory:
             out, state_t = population_forward_sparse(
@@ -675,6 +921,7 @@ def evaluate_wave_parallel(
     w_resp_var: float = 0.5,
     probe_sink: list | None = None,
     probe_quota: int = 0,
+    retina_pipe: "RetinaObsPipe | None" = None,
 ) -> int:
     """Parallel-barrier equivalent of :func:`evaluate_wave`.
 
@@ -721,6 +968,8 @@ def evaluate_wave_parallel(
     _t = _mark("pack_compile", _t)
     obs = fleet.reset_all_end()  # (n_envs, obs_dim)
     _t = _mark("reset_all", _t)
+    if retina_pipe is not None:  # fresh episode -> clear the periph/fovea rings
+        retina_pipe.reset()
     if streamer is not None:
         streamer.set_phase("wave")
 
@@ -751,7 +1000,10 @@ def evaluate_wave_parallel(
 
     for t in range(episode_steps):
         _c0 = time.perf_counter() if _prof else 0.0
-        X = np.ascontiguousarray(obs[:n], dtype=np.float32)
+        if retina_pipe is not None:  # raw 14134 pixel obs -> 102-d learned latent
+            X = retina_pipe.transform(np.ascontiguousarray(obs[:n], dtype=np.float32))
+        else:
+            X = np.ascontiguousarray(obs[:n], dtype=np.float32)
         xt = torch.from_numpy(X).to(device).unsqueeze(1)  # (n,1,dim)
         if recurrent_memory:
             out, state_t = population_forward_sparse(
@@ -920,6 +1172,7 @@ def evaluate_wave_async(
     w_resp_var: float = 0.5,
     probe_sink: list | None = None,
     probe_quota: int = 0,
+    retina_pipe: "RetinaObsPipe | None" = None,
 ) -> int:
     """Free-running ("furnace") equivalent of :func:`evaluate_wave_parallel`.
 
@@ -944,6 +1197,16 @@ def evaluate_wave_async(
     """
     n = len(genomes)  # sub-wave size (<= fleet.n_envs)
     R = int(episode_steps)
+    if retina_pipe is not None:
+        # The furnace engine batches whichever envs happen to be ready each
+        # round, so a single per-env 4-frame ring + one batched snapshot encode
+        # (the barrier/serial invariant "all envs report together") does not hold.
+        # Retina mode is gated to the barrier/serial engines in train(); this is a
+        # defensive guard so a stray call fails loudly instead of desyncing rings.
+        raise NotImplementedError(
+            "retina obs transform is not wired into the furnace/async engine; "
+            "use --engine barrier (or --no-parallel). See docs/specs/retina-in-loop.md."
+        )
     wave = WaveNovelty(archive, n, mode=novelty_mode, floor=novelty_floor)
 
     def _mark(key: str, t0: float) -> float:
@@ -1512,6 +1775,7 @@ def replay_champion(
     record_wram: bool = False,
     recurrent_memory: bool = True,
     softmax_temp: float = 0.0,
+    retina_pipe: "RetinaObsPipe | None" = None,
 ) -> np.ndarray | None:
     """Replay the generation champion solo and log a few ChampionSteps.
 
@@ -1527,6 +1791,8 @@ def replay_champion(
     pop = Population.from_genomes([genome], max_nodes=max_nodes, max_conns=max_conns)
     cp = pop.compile(device)
     encoder.reset(0)  # gaze -> centre, motion -> 0.5 (solo replay uses env slot 0)
+    if retina_pipe is not None:  # clear env slot 0's periph/fovea rings
+        retina_pipe.reset(0)
     if spawn_state is not None:
         env.load_state(spawn_state)
         screen = env.reset(None)  # clear held input + settle a frame
@@ -1538,6 +1804,8 @@ def replay_champion(
     last_button = 8  # NOOP until the first action lands
     for t in range(steps):
         x = encoder.encode(0, screen, wram, button=int(last_button))
+        if retina_pipe is not None:  # raw 14134 pixel obs -> 102-d learned latent
+            x = retina_pipe.transform(x[None, :])[0]
         xt = torch.from_numpy(x[None, :]).to(device).unsqueeze(1)  # (1,1,dim)
         if recurrent_memory:
             out, state = population_forward_sparse(
@@ -2116,6 +2384,7 @@ def train(
     resume: bool = False,  # append to existing telemetry (checkpoint-resume)
     recurrent_memory: bool = True,  # persist node state across agent-steps
     checkpoint_every: int = -1,  # -1 = config default; 0 = off
+    retina_train_steps: int = 32,  # retina SGD steps/gen (retina mode, Phase 1)
 ) -> Path:
     device = pick_device(device_str)
     rng = np.random.default_rng(config.run.seed)
@@ -2135,6 +2404,16 @@ def train(
     # (non-parallel) wave path; fleet workers auto-select their own FovealEncoder
     # when obs_dim == 3*periph_grid^2 + 14 + n_ram. Sized to `players` so the
     # serial path can encode a whole sub-wave.
+    # Phase-1 selector: retina mode ships raw pixel obs (14134-d) from the fleet
+    # and feeds the controller a learned 102-d latent (built parent-side below).
+    retina_mode = str(config.vision.mode) == "retina"
+    if retina_mode and engine == "furnace":
+        raise NotImplementedError(
+            "vision.mode='retina' is not wired into the furnace/async engine yet: "
+            "the per-env 4-frame rings + one batched snapshot encode need the "
+            "lockstep obs the barrier/serial engines provide. Re-run with "
+            "--engine barrier (or --no-parallel). Foveal mode is unaffected."
+        )
     encoder = FovealEncoder(
         max(1, players),
         periph_grid=config.vision.periph_grid,
@@ -2143,8 +2422,32 @@ def train(
         saccade_gain=config.vision.saccade_gain,
         saccade_every_k=config.vision.saccade_every_k,
         episode_steps=episode_steps,
+        mode=config.vision.mode,  # foveal (454) | retina (14134 raw pixels)
     )
-    n_in = encoder.dim  # 454 for the committed defaults
+    # TWO DIMENSIONS in retina mode (docs/specs/retina-in-loop.md): the FLEET obs
+    # is encoder.dim==14134, but the GENOME/controller n_in is 102
+    # (z_periph 48 + z_fovea 32 + proprio 14 + ram 8). Foveal mode keeps
+    # n_in=encoder.dim (454). The fleet is always sized to encoder.dim so workers
+    # auto-select the right mode.
+    z_dim_ctrl = int(config.retina.z_periph) + int(config.retina.z_fovea)  # 80
+    if retina_mode:
+        n_in = z_dim_ctrl + 14 + int(config.vision.obs_ram_bytes)  # 102
+        assert int(N_OUT) == 11, (
+            f"retina mode requires n_out=11 (9 buttons + 2 saccade); got {N_OUT}"
+        )
+        # E3 blind gate zeroes the learned latent [0:80], keeps proprio+ram.
+        optical_hi = z_dim_ctrl
+        if live:
+            print(
+                "[train] retina mode: live streaming disabled (the champion "
+                "showcase feeds raw 14134 obs, incompatible with the 102-d "
+                "controller; a retina-aware showcase is a follow-up).",
+                flush=True,
+            )
+            live = False
+    else:
+        n_in = encoder.dim  # 454 for the committed foveal defaults
+        optical_hi = encoder._o_proprio  # zero periphery+fovea+motion [0:432]
     softmax_temp = float(getattr(config.evo, "softmax_temp", 0.0))
     w_resp = float(getattr(config.reward, "w_resp", 0.0))
     w_emp = float(getattr(config.reward, "w_emp", 0.0))
@@ -2184,17 +2487,27 @@ def train(
             boot_gauntlet_every=boot_gauntlet_every,
             boot_gauntlet_steps=boot_gauntlet_steps, resume=resume,
             recurrent_memory=recurrent_memory, checkpoint_every=checkpoint_every,
+            retina_train_steps=retina_train_steps,
         ),
         config=config,
     )
 
     _G = config.vision.periph_grid
-    print(
-        f"[train] device={device} n_in={n_in} N_OUT={N_OUT} "
-        f"(foveal: 3x{_G}^2 periph/fovea/motion + 14 proprio + "
-        f"{config.vision.obs_ram_bytes} ram) "
-        f"pop={pop_size} players={players} episode_steps={episode_steps} gens={gens}"
-    )
+    if retina_mode:
+        print(
+            f"[train] device={device} n_in={n_in} N_OUT={N_OUT} "
+            f"(retina latent: z_periph {config.retina.z_periph} + z_fovea "
+            f"{config.retina.z_fovea} + 14 proprio + {config.vision.obs_ram_bytes} "
+            f"ram; fleet obs {encoder.dim}) "
+            f"pop={pop_size} players={players} episode_steps={episode_steps} gens={gens}"
+        )
+    else:
+        print(
+            f"[train] device={device} n_in={n_in} N_OUT={N_OUT} "
+            f"(foveal: 3x{_G}^2 periph/fovea/motion + 14 proprio + "
+            f"{config.vision.obs_ram_bytes} ram) "
+            f"pop={pop_size} players={players} episode_steps={episode_steps} gens={gens}"
+        )
     print(f"[train] run_dir={run_dir}  reset_state={config.emu.reset_state}")
 
     tracker = InnovationTracker(n_in=n_in, n_out=N_OUT)
@@ -2483,6 +2796,85 @@ def train(
             print("[checkpoint] --resume set but no checkpoint yet; fresh start",
                   flush=True)
 
+    # ---- Phase-1 retina spine: learner (train_card) + frozen snapshot --------
+    # In retina mode the population MUST NOT consume a random-init encoder, so we
+    # warm-up the learner on the swarm's own frames and only snapshot afterward.
+    retina = None
+    retina_opt = None
+    retina_pipe = None
+    retina_buffer: list = []
+    retina_swap_gens = int(getattr(config.retina, "swap_gens", 10))
+    retina_batch = 32
+    retina_buf_cap = 0
+    if retina_mode:
+        from pokeio.evo.retina import Retina
+
+        train_dev = _retina_device(config.retina.train_card, fallback=device)
+        infer_dev = _retina_device(config.retina.infer_card, fallback=device)
+        spr_k = int(config.retina.spr_k)
+        retina = Retina(
+            z_periph=int(config.retina.z_periph),
+            z_fovea=int(config.retina.z_fovea),
+            spr_k=spr_k,
+            ema_tau=float(config.retina.ema_tau),
+            inverse_dynamics=bool(config.retina.inverse_dynamics),
+            fsq_levels=tuple(config.retina.fsq_levels),
+            n_act=9,
+            aug_shift_px=int(config.retina.aug_shift_px),
+            aug_jitter=float(config.retina.aug_jitter),
+        ).to(train_dev)
+        retina_opt = torch.optim.Adam(retina.parameters(), lr=1e-3)
+        offsets = (encoder._o_periph, encoder._o_fovea, encoder._o_proprio,
+                   encoder._o_ram, encoder.dim)
+        # snapshot filled after warm-up; the collector only needs .split() now.
+        retina_pipe = RetinaObsPipe(
+            None, max(1, players), offsets,
+            side=int(getattr(encoder, "_side", 84)), stack=4,
+        )
+        warmup_frames = int(config.retina.warmup_frames)
+        retina_buf_cap = max(warmup_frames * 2, 20000)
+        print(
+            f"[retina] Phase-1 spine: {retina.num_params()/1e3:.0f}k params, "
+            f"train_card={train_dev} infer_card={infer_dev} spr_k={spr_k} "
+            f"swap_gens={retina_swap_gens} warmup_frames={warmup_frames}",
+            flush=True,
+        )
+        if resume and start_gen > 0:
+            print(
+                "[retina] NOTE: the retina learner is not checkpointed; a resumed "
+                "run re-warms a fresh encoder before evolution (Phase-1 limitation).",
+                flush=True,
+            )
+        # --- warm-up: collect swarm frames, train SPR+inv-dyn, then snapshot ---
+        frames = 0
+        while frames < warmup_frames:
+            if fleet is not None:
+                segs, got = _retina_collect_fleet(
+                    fleet, retina_pipe, episode_steps, rng)
+            else:
+                segs, got = _retina_collect_serial(
+                    envs, encoder, retina_pipe, episode_steps, reset_state, rng)
+            retina_buffer.extend(segs)
+            _retina_buffer_trim(retina_buffer, retina_buf_cap)
+            frames += got
+        warm_steps = max(16, warmup_frames // retina_batch)
+        hist = _retina_train(
+            retina, retina_opt, retina_buffer, warm_steps, spr_k, rng,
+            batch_size=retina_batch, log_every=max(1, warm_steps // 8),
+            label="retina/warmup",
+        )
+        if hist:
+            print(
+                f"[retina] warm-up done: {frames} frames, {len(hist)} steps, "
+                f"SPR {hist[0]['spr']:.4f} -> {hist[-1]['spr']:.4f}, "
+                f"inv_acc {hist[0]['inv_acc']:.3f} -> {hist[-1]['inv_acc']:.3f}",
+                flush=True,
+            )
+        # Snapshot AFTER warm-up: genomes never consume a random-init encoder.
+        retina_pipe.set_snapshot(retina.snapshot(device=infer_dev))
+        print("[retina] snapshot #0 frozen (evolution starts on the 102-d latent)",
+              flush=True)
+
     with TelemetryWriter(run_dir, resume=resume) as writer:
         gen_wall_prev = time.perf_counter()
         for gen in range(start_gen, gens):
@@ -2589,6 +2981,7 @@ def train(
                         w_resp_var=w_resp_var,
                         probe_sink=probe_sink,
                         probe_quota=probe_quota,
+                        retina_pipe=retina_pipe,
                     )
                 else:
                     steps_done += evaluate_wave(
@@ -2615,6 +3008,7 @@ def train(
                         w_resp_var=w_resp_var,
                         probe_sink=probe_sink,
                         probe_quota=probe_quota,
+                        retina_pipe=retina_pipe,
                     )
 
             _bt = time.perf_counter()
@@ -2633,7 +3027,7 @@ def train(
                 gate, gate_median_delta = _blind_ablation_gate(
                     _cp_gate, probe_sink, device,
                     beta=blind_gate_beta, dmin=blind_gate_dmin,
-                    optical_hi=encoder._o_proprio,  # zero periphery+fovea+motion
+                    optical_hi=optical_hi,  # retina: zero z[0:80]; foveal: [0:432]
                 )
             _bt = _phase("blind_gate", _bt)
 
@@ -2673,6 +3067,7 @@ def train(
                 record_wram=True,
                 recurrent_memory=recurrent_memory,
                 softmax_temp=softmax_temp,
+                retina_pipe=retina_pipe,
             )
             if trace is not None and trace.shape[0] >= 2:
                 # Dedup at the source (A9): the champion replay is a single
@@ -2749,6 +3144,10 @@ def train(
                 and boot_gauntlet_every > 0
                 and gen > 0
                 and gen % boot_gauntlet_every == 0
+                # retina mode: the gauntlet drives the encoder+champion solo but
+                # has no retina transform hook yet (Phase-1 follow-up); skip it so
+                # it never feeds raw 14134 obs into the 102-d controller.
+                and not retina_mode
             ):
                 if streamer is not None:
                     streamer.set_phase("evolving", "boot gauntlet")
@@ -2769,6 +3168,42 @@ def train(
                     f"{boot_metrics['boot_steps']:.0f} steps"
                 )
             _bt = _phase("gauntlet", _bt)
+
+            # ---- Phase-1 retina: collect fresh swarm frames, train, swap ------
+            # Between-gen SSL step (docs/specs/retina-in-loop.md §"Learner"). The
+            # population always consumes the FROZEN snapshot (stationary between
+            # swaps); we re-snapshot only every swap_gens so the latent obs is a
+            # stationary target for evolution (anti-drift discipline §4.5).
+            if retina_mode and retina is not None:
+                if fleet is not None:
+                    _segs, _ = _retina_collect_fleet(
+                        fleet, retina_pipe, episode_steps, rng)
+                else:
+                    _segs, _ = _retina_collect_serial(
+                        envs, encoder, retina_pipe, episode_steps, reset_state, rng)
+                retina_buffer.extend(_segs)
+                _retina_buffer_trim(retina_buffer, retina_buf_cap)
+                _rh = _retina_train(
+                    retina, retina_opt, retina_buffer, retina_train_steps,
+                    int(config.retina.spr_k), rng, batch_size=retina_batch,
+                    log_every=0, label="retina",
+                )
+                if _rh:
+                    print(
+                        f"[retina gen {gen}] train {len(_rh)} steps "
+                        f"spr={_rh[-1]['spr']:.4f} inv_acc={_rh[-1]['inv_acc']:.3f}",
+                        flush=True,
+                    )
+                if retina_swap_gens > 0 and (gen + 1) % retina_swap_gens == 0:
+                    retina_pipe.set_snapshot(
+                        retina.snapshot(device=_retina_device(
+                            config.retina.infer_card, fallback=device)))
+                    print(
+                        f"[retina gen {gen}] snapshot swapped "
+                        f"(#{(gen + 1) // retina_swap_gens}; population re-frozen)",
+                        flush=True,
+                    )
+            _bt = _phase("retina", _bt)
             if pace is not None:
                 pace.poll()  # pick up mid-boundary flips before the next wave
 
@@ -2985,6 +3420,16 @@ def train(
         replay_env.close()
     if showcase_env is not None:
         showcase_env.close()
+    # Persist the frozen retina the final population evolved against, so a champion
+    # measured/replayed later sees the exact latent it was selected under (the
+    # learner itself is not in the pickle checkpoint — Phase-1 limitation).
+    if retina_mode and retina_pipe is not None and getattr(retina_pipe, "snap", None) is not None:
+        try:
+            import torch as _torch
+            _torch.save(retina_pipe.snap.state_dict(), run_dir / "retina.pt")
+            print(f"[retina] frozen snapshot -> {run_dir / 'retina.pt'}", flush=True)
+        except Exception as _e:  # never fail a run over telemetry
+            print(f"[retina] snapshot save failed: {_e}", flush=True)
     print(f"[train] done. telemetry -> {run_dir / 'telemetry.jsonl'}")
     return run_dir
 
@@ -3001,6 +3446,16 @@ def build_config(args) -> Config:
     # so buttons actually take effect and the agent can move / advance dialog.
     cfg.emu.frame_skip = args.frame_skip
     cfg.emu.button_hold_frames = args.hold_frames
+    # -- Phase-1 retina spine (docs/specs/retina-in-loop.md) ------------------
+    # CLI overrides keep foveal (Phase-0) defaults untouched when unset.
+    if getattr(args, "vision_mode", None):
+        cfg.vision.mode = args.vision_mode
+    if getattr(args, "retina_warmup_frames", None) is not None:
+        cfg.retina.warmup_frames = int(args.retina_warmup_frames)
+    if getattr(args, "retina_swap_gens", None) is not None:
+        cfg.retina.swap_gens = int(args.retina_swap_gens)
+    if cfg.vision.mode == "retina":
+        cfg.retina.enable = True
     return cfg
 
 
@@ -3083,6 +3538,23 @@ def main() -> None:
                          "wired; sparse gives each output --init-k random inputs")
     ap.add_argument("--init-k", type=int, default=32,
                     help="inputs per output for --init-connect sparse (§8)")
+    # -- Phase-1 learned retina spine (docs/specs/retina-in-loop.md) ----------
+    ap.add_argument("--vision-mode", choices=("foveal", "fovea_static", "retina"),
+                    default=None,
+                    help="obs mode (default: config, 'foveal'). 'retina' wires the "
+                         "learned SPR/FSQ latent spine as the perceptual spine "
+                         "(Phase 1; requires --engine barrier or --no-parallel).")
+    ap.add_argument("--retina-warmup-frames", type=int, default=None,
+                    help="retina SSL warm-up budget in env-frames before gen 0 "
+                         "(retina mode; default config 200000; use a small value "
+                         "for a smoke).")
+    ap.add_argument("--retina-swap-gens", type=int, default=None,
+                    help="re-freeze the inference retina every N gens so the "
+                         "population's latent obs stays stationary between swaps "
+                         "(retina mode; default config 10).")
+    ap.add_argument("--retina-train-steps", type=int, default=32,
+                    help="retina SGD steps per generation during evolution "
+                         "(retina mode).")
     args = ap.parse_args()
 
     cfg = build_config(args)
@@ -3113,6 +3585,7 @@ def main() -> None:
         resume=args.resume,
         recurrent_memory=args.recurrent_memory,
         checkpoint_every=args.checkpoint_every,
+        retina_train_steps=args.retina_train_steps,
     )
 
 
