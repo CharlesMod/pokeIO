@@ -37,12 +37,38 @@ _ADDR = {
     "in_battle": 0xD057,
 }
 
-# Map id → human name. Populated from the pokeyellow map-constant table.
-# Numeric ids are what byte $D35E holds (decimal). Unknown ids render as
-# "map $NN" so the report is always usable even before the table is complete.
+# Map id → human name (decimal id = byte $D35E). From pret/pokeyellow
+# constants/map_constants.asm.
+# CALIBRATION CAVEAT: this project's ROM/state reads the starting bedroom as
+# map 18 and walks 18→17 going downstairs, whereas pokeyellow master documents
+# 38→37 — a consistent offset, so this ROM is a different revision and the
+# NAMES below may be misaligned. Trust the numeric ids and the RAM invariants
+# (party/money/badges) over the names until the table is empirically calibrated
+# by navigating this ROM to known landmarks. Unknown ids render as "map $NN".
 MAP_NAMES: dict[int, str] = {
-    18: "Player's bedroom (2F)",  # verified: newgame state reads map 18 here
+    0: "Pallet Town", 1: "Viridian City", 2: "Pewter City",
+    3: "Cerulean City", 4: "Lavender Town", 5: "Vermilion City",
+    6: "Celadon City", 7: "Fuchsia City", 8: "Cinnabar Island",
+    9: "Indigo Plateau", 10: "Saffron City",
+    12: "Route 1", 13: "Route 2", 18: "Route 7",
+    37: "Player's house (1F)", 38: "Player's bedroom (2F)",
+    39: "Rival's house", 40: "Oak's Lab",
+    41: "Viridian PokéCenter", 42: "Viridian Mart", 45: "Viridian Gym",
+    51: "Viridian Forest", 54: "Pewter Gym", 65: "Cerulean Gym",
+    92: "Vermilion Gym", 134: "Celadon Gym", 157: "Fuchsia Gym",
+    178: "Saffron Gym", 166: "Cinnabar Gym",
+    108: "Victory Road 1F", 194: "Victory Road 2F", 198: "Victory Road 3F",
+    174: "Indigo Plateau Lobby",
+    245: "Elite Four — Lorelei", 246: "Elite Four — Bruno",
+    247: "Elite Four — Agatha", 113: "Elite Four — Lance",
+    120: "Champion's Room",
 }
+
+# Badge bit (in $D356) → badge name (constants/ram_constants.asm order).
+BADGE_NAMES = (
+    "Boulder", "Cascade", "Thunder", "Rainbow",
+    "Soul", "Marsh", "Volcano", "Earth",
+)
 
 # Ordered milestone ladder (map-id or badge-bit keyed). Filled from research;
 # each entry: (label, predicate over GameState). Kept data-driven so the
