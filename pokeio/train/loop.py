@@ -55,7 +55,7 @@ from pokeio.telemetry.schema import (
 
 _SCREEN_H = 144
 _SCREEN_W = 160
-N_OUT = 8  # Discrete(8): up down left right A B START SELECT
+N_OUT = 9  # Discrete(9): up down left right A B START SELECT NOOP
 FORWARD_STEPS = 4  # propagation hops per inference (covers evolved depth)
 
 

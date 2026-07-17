@@ -40,7 +40,7 @@ from pokeio.evo.genome import Population
 
 _SCREEN_H = 144
 _SCREEN_W = 160
-N_OUT = 8
+N_OUT = 9  # up down left right A B START SELECT NOOP
 WRAM_BASE = 0xC000
 
 # Swarm downscale target (must divide the native screen evenly: 160/40, 144/36 = 4).
@@ -487,7 +487,14 @@ class ChampionShowcase:
         while n_frames > 0:
             if self._fis == 0:
                 act_state, out = self._forward_choose()
-                self.env.hold(self.last_action)
+                # hold() may consume frames re-tapping an edge-read button;
+                # count them into the step so dynamics match training.
+                used = int(self.env.hold(self.last_action) or 0)
+                if used:
+                    self._fis = min(used, fs - 1)
+                    n_frames -= min(used, n_frames)
+                    if n_frames <= 0:
+                        break
             run = min(n_frames, fs - self._fis)
             self.screen = self.env.tick_frames(run)
             self.wram = self.env.raw_wram()

@@ -38,7 +38,7 @@ class EmuConfig:
     # player, ~390x aggregate). Pure-throughput peak is ~28 players @ 26.6k, but
     # 128 buys 4.5x the in-flight behavioral diversity for ~13% less throughput.
     n_players: int = 128
-    action_space: int = 8  # Discrete(8): up down left right A B START SELECT
+    action_space: int = 9  # Discrete(9): up down left right A B START SELECT NOOP
     action_names: list[str] = field(
         default_factory=lambda: [
             "UP",
@@ -49,6 +49,7 @@ class EmuConfig:
             "B",
             "START",
             "SELECT",
+            "NOOP",
         ]
     )
 

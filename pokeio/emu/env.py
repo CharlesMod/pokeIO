@@ -31,8 +31,19 @@ import io
 import numpy as np
 from pyboy import PyBoy
 
-# Discrete(8) action space -> PyBoy button names.
-ACTIONS = ("up", "down", "left", "right", "a", "b", "start", "select")
+# Discrete(9) action space -> PyBoy button names (+ "noop" = all released).
+# Without noop some button is ALWAYS held from step 2 onward — the agent
+# literally cannot stand still with clean hands (wait out an NPC, idle in a
+# battle menu, release a held direction before a precise turn).
+ACTIONS = ("up", "down", "left", "right", "a", "b", "start", "select", "noop")
+# Level-read buttons: the game polls these continuously (movement), so a
+# repeat means "keep holding". Face buttons (a/b/start/select) are EDGE-read
+# in Gen-1 software — text advance, menu confirm, pause toggle all fire on a
+# fresh press — so a repeat must release + re-press or it registers ONCE ever.
+_DPAD = frozenset(("up", "down", "left", "right"))
+# frames the button is lifted during a re-tap (>= 1 full frame boundary so
+# the joypad register reliably reads the release before the fresh press).
+_TAP_GAP = 2
 
 # WRAM working block exposed for the (future) RAM miner: 0xC000-0xDFFF inclusive.
 WRAM_START = 0xC000
@@ -130,14 +141,16 @@ class PokeEnv:
             self._advance_pulsed(name)
         return self._obs(), self.wram_strided(wram_stride), False
 
-    def hold(self, action_idx: int) -> None:
-        """Sticky-press an action's button without advancing a frame."""
-        name = ACTIONS[action_idx]
-        if name != self._held:
-            if self._held is not None:
-                self.pyboy.button_release(self._held)
-            self.pyboy.button_press(name)
-            self._held = name
+    def hold(self, action_idx: int) -> int:
+        """Open an agent-step's input without running its held frames.
+
+        Same edge semantics as :meth:`_advance_sticky` (change = swap press,
+        d-pad repeat = keep held, face-button repeat = re-tap). Returns the
+        frames consumed by a re-tap (0 or ``_TAP_GAP``) so frame-accurate
+        callers (the champion showcase) can deduct them from the step budget
+        and stay dynamics-identical to training.
+        """
+        return self._apply_input(ACTIONS[action_idx])
 
     def tick_frames(self, n: int) -> np.ndarray:
         """Advance ``n`` game frames with the held input; render only the last.
@@ -153,24 +166,47 @@ class PokeEnv:
             self.pyboy.tick(1, True)
         return self._obs()
 
-    def _advance_sticky(self, name: str) -> None:
-        """Hold `name` down across frame_skip ticks; only re-press on a change.
+    def _apply_input(self, name: str) -> int:
+        """Press/release bookkeeping opening one agent-step.
 
-        On an action change we release the previously-held button and press the
-        new one *before* ticking, so the newly-pressed button is down for the
-        whole span (>= 1 full frame boundary) and the game actually reads it.
-        A repeat of the same action leaves the button held — no release/press —
-        which is exactly the continuous-hold movement the overworld needs.
+        Returns the number of frames already consumed (0 normally; ``_TAP_GAP``
+        when an edge-read face button is re-tapped).  On an action CHANGE the
+        old button is released and the new one pressed before any tick, so the
+        new press spans the whole step.  A REPEAT of a d-pad direction keeps
+        the button held (continuous overworld movement); a repeat of an
+        edge-read face button lifts it for ``_TAP_GAP`` frames and re-presses,
+        because Gen-1 reads a/b/start/select as new-press edges — without the
+        re-tap, argmax choosing A on consecutive steps delivers exactly one
+        press ever, and dialogue/menus/battles become untraversable.
         """
+        if name == "noop":
+            if self._held is not None:
+                self.pyboy.button_release(self._held)
+                self._held = None
+            return 0
         if name != self._held:
             if self._held is not None:
                 self.pyboy.button_release(self._held)
             self.pyboy.button_press(name)
             self._held = name
-        # Advance the frame(s) with the button still held; render only the last.
-        if self.frame_skip > 1:
-            self.pyboy.tick(self.frame_skip - 1, False)
-        self.pyboy.tick(1, True)
+            return 0
+        if name in _DPAD:
+            return 0
+        # re-tap an edge-read button: release, coast the gap, press again
+        self.pyboy.button_release(name)
+        self.pyboy.tick(_TAP_GAP, False)
+        self.pyboy.button_press(name)
+        return _TAP_GAP
+
+    def _advance_sticky(self, name: str) -> None:
+        """One agent-step of sticky input over exactly ``frame_skip`` frames."""
+        used = self._apply_input(name)
+        remaining = self.frame_skip - used
+        # Advance the frame(s) with the button held; render only the last.
+        if remaining > 1:
+            self.pyboy.tick(remaining - 1, False)
+        if remaining >= 1:
+            self.pyboy.tick(1, True)
 
     def _advance_pulsed(self, name: str) -> None:
         """Legacy press/hold/release model (broken at frame_skip=1, hold=0)."""

@@ -574,8 +574,8 @@ function drawGB(time){
 
 /* ======================= 2 · THE NETWORK (real forward pass) ======================= */
 const RW=16, RH=14, NIN=RW*RH, NH1=8, NH2=6;
-const SYM=['↑','↓','←','→','A','B','ST','SE'];
-const NAME=['UP','DOWN','LEFT','RIGHT','A','B','START','SELECT'];
+const SYM=['↑','↓','←','→','A','B','ST','SE','·'];
+const NAME=['UP','DOWN','LEFT','RIGHT','A','B','START','SELECT','NOOP'];
 
 /* W1: 8 structured receptive fields (gabor + center-surround) — real weights */
 const W1=[], tileCv=[], topWires=[];
@@ -623,9 +623,9 @@ const contrib=new Float32Array(NH2*9);    // per-unit signed ledger: 8 inputs + 
 const preAct=new Float32Array(NH2);       // raw sum Σ, before tanh
 const HN=72, h2hist=[]; for(let k=0;k<NH2;k++)h2hist.push(new Float32Array(HN));
 let hIdx=0, histAcc=0;
-const prob=new Float32Array(8);           // dirs: softmax(incl. coast) · buttons: sigmoid
+const prob=new Float32Array(9);           // dirs: softmax(incl. coast) · buttons: sigmoid
 const normM=new Float32Array(NH1).fill(1);
-const latched=new Array(8).fill(false);
+const latched=new Array(9).fill(false);
 const barFlash=new Float32Array(8);
 
 function sampleRetina(){
@@ -1547,8 +1547,8 @@ let PW=600,PH=280;
 function fitP(){const r=pn.parentElement.getBoundingClientRect();
   PW=Math.max(2,r.width);PH=Math.max(2,r.height);
   pn.width=PW*DPR;pn.height=PH*DPR;px2.setTransform(DPR,0,0,DPR,0,0);}
-const PIN_W=14,PIN_H=12,PIN=PIN_W*PIN_H,NCAND=14,NOUT=8;
-const BSYM=['↑','↓','←','→','A','B','St','Se'];
+const PIN_W=14,PIN_H=12,PIN=PIN_W*PIN_H,NCAND=14,NOUT=9;
+const BSYM=['↑','↓','←','→','A','B','St','Se','·'];
 const Wp=new Float32Array(NCAND*PIN);
 const tileCv=[];
 const W2=[];(function(){let seed=7;const R=()=>{seed=(seed*16807)%2147483647;return seed/2147483647*2-1;};
@@ -1990,7 +1990,7 @@ function drawSwarm(swarm){
 
 /* --- champion topology (real NEAT graph) ----------------------------------- */
 const netSvg=$('net'), nodesEl=$('nodes'), connsEl=$('conns');
-const OUT_SYM=['↑','↓','←','→','A','B','St','Se'];
+const OUT_SYM=['↑','↓','←','→','A','B','St','Se','·'];
 const COL={in:'#18a2c4', hidden:'#9d78dd', out:'#e0a838'};
 function idRng(id){ let a=((id|0)*2654435761)>>>0;
   return function(){a=(a+0x6D2B79F5)>>>0; let t=Math.imul(a^a>>>15,1|a);
@@ -2262,8 +2262,8 @@ const $=id=>document.getElementById(id);
 const clamp=(v,a,b)=>v<a?a:v>b?b:v;
 const MONO='ui-monospace,Menlo,monospace';
 const EXC='139,171,62', INH='198,90,62', AMB='224,168,56', AQA='63,181,207', VIO='169,139,224';
-const SYM=['↑','↓','←','→','A','B','ST','SE'];
-const NAME=['UP','DOWN','LEFT','RIGHT','A','B','START','SELECT'];
+const SYM=['↑','↓','←','→','A','B','ST','SE','·'];
+const NAME=['UP','DOWN','LEFT','RIGHT','A','B','START','SELECT','NOOP'];
 const DPR=Math.min(2,window.devicePixelRatio||1);
 
 /* ---------- state ---------- */
