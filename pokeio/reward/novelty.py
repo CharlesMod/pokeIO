@@ -49,7 +49,7 @@ class WaveNovelty:
         archive: NoveltyArchive,
         n_players: int,
         mode: str = "rarity",
-        floor: float = 0.1,
+        floor: float = 0.01,
     ) -> None:
         if mode not in _MODES:
             raise ValueError(f"unknown novelty mode: {mode!r} (expected {_MODES})")

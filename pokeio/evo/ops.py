@@ -42,17 +42,32 @@ class MutationRates:
     toggle: float = 0.01
     mutate_act: float = 0.0
     feedforward: bool = True  # forbid cycles on add-connection
+    # |w| ceiling applied after perturb/reset (0 = unbounded).  IMPORTANT at
+    # wide input: the perturb/reset random walk has stationary weight std
+    # ~sqrt(((1-p)*sigma^2 + p*reset^2)/p); with the legacy defaults that is
+    # ~1.8 — pre-activations re-saturate the sigmoids within ~10 generations
+    # and argmax degenerates to a constant action, silently undoing a
+    # fan-in-scaled sparse init.  Callers seeding sparse should set sigma ~
+    # 0.1*init_std, reset_scale = init_std, and clamp ~4*init_std so the
+    # stationary distribution stays at init scale.
+    weight_clamp: float = 0.0
 
 
 # --------------------------------------------------------------------------
 # mutation
 # --------------------------------------------------------------------------
 def perturb_weights(g: Genome, rng: np.random.Generator, rates: MutationRates) -> None:
+    clamp = rates.weight_clamp
     for c in g.conns.values():
         if rng.random() < rates.weight_reset_prob:
             c.weight = float(rng.normal(0.0, rates.weight_reset_scale))
         else:
             c.weight += float(rng.normal(0.0, rates.weight_perturb_sigma))
+        if clamp > 0.0:
+            if c.weight > clamp:
+                c.weight = clamp
+            elif c.weight < -clamp:
+                c.weight = -clamp
 
 
 def _reachable(g: Genome, src: int, dst: int) -> bool:

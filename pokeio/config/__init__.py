@@ -105,7 +105,13 @@ class EvoConfig:
 class RewardConfig:
     """Reward stack / Go-Explore / manifest knobs (see TODO Phase 3)."""
 
-    novelty_floor: float = 0.1  # novelty backbone reward always > 0
+    # Per-distinct-cell backbone credit. Keep SMALL relative to the fresh-cell
+    # unit (1.0): with ~90k observations/gen every trodden cell's rarity term
+    # decays to the floor within a generation or two, so fitness degenerates
+    # to `floor * distinct_cells` — a churn counter that rewards re-walking
+    # known ground over opening frontier. At 0.01 a fresh cell outbids ~100
+    # trodden ones (was 11 at the old 0.1).
+    novelty_floor: float = 0.01
     archive_cell_downscale: int = 8  # screen downscale before hashing a cell
     use_ram_hash: bool = True  # prefer RAM-hash over pixel-hash (noisy-TV guard)
     rarity_weighted: bool = True

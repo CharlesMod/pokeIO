@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import subprocess
 import time
@@ -268,7 +269,7 @@ def evaluate_wave(
     streamer: LiveStreamer | None = None,
     gen: int = 0,
     novelty_mode: str = "rarity",
-    novelty_floor: float = 0.1,
+    novelty_floor: float = 0.01,
     goexplore: GoExplore | None = None,
     restore_prob: float = 0.5,
     spawn_out: dict[int, bytes] | None = None,
@@ -312,6 +313,8 @@ def evaluate_wave(
     cp = pop.compile(device)
 
     for t in range(episode_steps):
+        if goexplore is not None:
+            goexplore.feed_capture_budget(1.0)  # note() admits against this
         X = np.empty((n, encoder.dim), dtype=np.float32)
         for i in range(n):
             X[i] = encoder.encode(screens[i], wrams[i])
@@ -355,7 +358,7 @@ def evaluate_wave_parallel(
     streamer: LiveStreamer | None = None,
     gen: int = 0,
     novelty_mode: str = "rarity",
-    novelty_floor: float = 0.1,
+    novelty_floor: float = 0.01,
     goexplore: GoExplore | None = None,
     restore_prob: float = 0.5,
     prof: dict | None = None,
@@ -473,6 +476,7 @@ def evaluate_wave_parallel(
             pending = {}
 
         cap_flags[:] = 0
+        cap_cand: list[tuple[int, bytes]] = []
         for i in range(n):
             key = keys[i].tobytes()
             globally_new = archive.add(key)
@@ -481,8 +485,19 @@ def evaluate_wave_parallel(
             dead[i] = dead[i] or bool(dones[i])
             if goexplore is not None:
                 if not goexplore.revisit(key) and globally_new:
-                    cap_flags[i] = 1
-                    pending[i] = (key, t)
+                    cap_cand.append((i, key))
+        if goexplore is not None:
+            # Meter the 47 ms worker-side save_states to the capture budget.
+            # Rotating start index so no env slot monopolises the tokens.
+            goexplore.feed_capture_budget(1.0)
+            off = t % len(cap_cand) if cap_cand else 0
+            for j in range(len(cap_cand)):
+                if not goexplore.admit_capture():
+                    goexplore.n_throttled += len(cap_cand) - 1 - j
+                    break
+                i, key = cap_cand[(off + j) % len(cap_cand)]
+                cap_flags[i] = 1
+                pending[i] = (key, t)
 
         if streamer is not None:
             # X is the obs batch this round's actions came from (a stable copy),
@@ -518,7 +533,7 @@ def evaluate_wave_async(
     streamer: LiveStreamer | None = None,
     gen: int = 0,
     novelty_mode: str = "rarity",
-    novelty_floor: float = 0.1,
+    novelty_floor: float = 0.01,
     goexplore: GoExplore | None = None,
     restore_prob: float = 0.5,
     prof: dict | None = None,
@@ -660,10 +675,14 @@ def evaluate_wave_async(
                 prior = archive.visit(key)
                 wave.observe_key(ii, key, globally_new, prior)
                 dead[ii] = dead[ii] or bool(dones_shm[ii])
+                if goexplore is not None:
+                    # n booked obs ~= one swarm round of capture budget.
+                    goexplore.feed_capture_budget(1.0 / n)
                 if (
                     goexplore is not None and k < R
                     and not cap_flag[ii] and not cap_done[ii]
                     and not goexplore.revisit(key) and globally_new
+                    and goexplore.admit_capture()
                 ):
                     # Worker captures obs k's state before applying its action.
                     # (While a capture is outstanding, further discoveries by
@@ -748,6 +767,57 @@ def evaluate_wave_async(
     for i, g in enumerate(genomes):
         g.fitness = float(wave.fitness[i])
     return n * R
+
+
+def calibrate_wram_mask(
+    rom_path: str,
+    reset_state: str,
+    frame_skip: int = 24,
+    wram_stride: int = 64,
+    wram_levels: int = 16,
+    steps: int = 400,
+    runs: int = 2,
+    threshold: float = 0.02,
+    seed: int = 0,
+) -> tuple[int, ...]:
+    """Learn which strided WRAM bytes to keep in the novelty cell key.
+
+    Runs a seeded random policy from the reset state and measures each strided
+    byte's QUANTIZED change rate (matching the digest's quantization).  Bytes
+    that flip more than ``threshold`` of steps are dropped: on Gen-1 those are
+    the tile-map buffer (a copy of the on-screen tiles — redundant with the
+    screen digest and churning at every camera scroll) and audio scratch.
+    Game-agnostic: nothing here names an address; any game's per-frame buffers
+    get masked the same way.  Deterministic given (rom, state, seed).
+    """
+    env = PokeEnv(rom_path=rom_path, frame_skip=frame_skip)
+    try:
+        rng = np.random.default_rng(seed)
+        step_q = max(1, 256 // wram_levels)
+        changes: np.ndarray | None = None
+        total = 0
+        for _ in range(runs):
+            env.reset(reset_state)
+            prev = None
+            for _t in range(steps):
+                env.step(int(rng.integers(0, N_OUT)))
+                q = env.raw_wram()[::wram_stride] // step_q
+                if prev is not None:
+                    if changes is None:
+                        changes = np.zeros(q.shape[0], dtype=np.int64)
+                    changes += q != prev
+                    total += 1
+                prev = q
+        assert changes is not None
+        keep = np.nonzero(changes <= total * threshold)[0]
+        dropped = changes.shape[0] - keep.shape[0]
+        print(
+            f"[train] wram churn-mask: keeping {keep.shape[0]}/{changes.shape[0]} "
+            f"strided bytes ({dropped} churners masked, probe {total} steps)"
+        )
+        return tuple(int(i) for i in keep)
+    finally:
+        env.close()
 
 
 def replay_champion(
@@ -1113,11 +1183,18 @@ def _fast_perturb(g, rng, rates) -> None:
     p_reset = rates.weight_reset_prob
     s_reset = rates.weight_reset_scale
     s_pert = rates.weight_perturb_sigma
+    clamp = rates.weight_clamp
     for c in g.conns.values():
         if rr() < p_reset:
             c.weight = float(s_reset * sn())
         else:
             c.weight += float(s_pert * sn())
+        if clamp > 0.0:
+            # clamp consumes no rng draws — stream stays identical to ops.py
+            if c.weight > clamp:
+                c.weight = clamp
+            elif c.weight < -clamp:
+                c.weight = -clamp
 
 
 def _fast_mutate(g, tracker, rng, rates, weight_scale: float = 1.0):
@@ -1249,6 +1326,7 @@ def train(
     goexplore: bool = False,
     restore_prob: float = 0.5,
     goexplore_capacity: int = 2048,
+    goexplore_caps_per_round: float = 4.0,
     auto_species: bool = True,
     species_target: int = 6,
     parallel: bool = True,
@@ -1292,18 +1370,39 @@ def train(
     n_c0 = sum(len(g.conns) for g in genomes) // max(1, len(genomes))
     print(f"[train] seed genomes: connect={init_connect} (~{n_c0} conns/genome)")
 
+    # Weight-mutation scales anchored to the seed's fan-in-scaled init std:
+    # perturb sigma 0.1*init_std, reset scale = init_std, clamp 4*init_std.
+    # This pins the perturb/reset random walk's stationary weight std at
+    # ~init_std; the legacy defaults (0.5/1.0, unclamped) drift to std ~1.8
+    # and re-saturate the outputs within ~10 gens (constant-action collapse).
+    init_std = 1.0 / math.sqrt(init_k + 1) if init_connect == "sparse" else 1.0
     rates = MutationRates(
         add_node=config.evo.mutate_add_node,
         add_conn=config.evo.mutate_add_conn,
         weight=config.evo.mutate_weight,
         toggle=config.evo.mutate_toggle,
         feedforward=not config.evo.recurrent,
+        weight_perturb_sigma=0.1 * init_std,
+        weight_reset_scale=init_std,
+        weight_clamp=4.0 * init_std,
     )
     spec = Speciation(threshold=config.evo.species_threshold, c1=1.0, c2=1.0, c3=0.4)
-    archive = NoveltyArchive()
+    # Calibrate the WRAM churn-mask before the archive exists: strided WRAM
+    # bytes that flip constantly under a random policy are the tile-map buffer
+    # (redundant with the screen digest, churns at every camera scroll) and
+    # audio scratch — pure key noise. Measured on this box: drops ~14/128
+    # bytes and ~15% of minted cells with zero loss of state separability.
+    wram_mask = calibrate_wram_mask(
+        config.emu.rom_path,
+        config.emu.reset_state,
+        frame_skip=config.emu.frame_skip,
+        seed=config.run.seed,
+    )
+    archive = NoveltyArchive(wram_mask=wram_mask)
     go = (
         GoExplore(
             capacity=goexplore_capacity,
+            caps_per_round=goexplore_caps_per_round,
             rng=np.random.default_rng(config.run.seed + 1),
         )
         if goexplore
@@ -1311,7 +1410,8 @@ def train(
     )
     print(
         f"[train] novelty_mode={novelty_mode} goexplore={'on' if go else 'off'} "
-        f"(restore_prob={restore_prob}, cap={goexplore_capacity}) "
+        f"(restore_prob={restore_prob}, cap={goexplore_capacity}, "
+        f"caps/round={goexplore_caps_per_round}) "
         f"auto_species={'on' if auto_species else 'off'} (target={species_target})"
     )
 
@@ -1323,6 +1423,7 @@ def train(
         screen_levels=archive.screen_levels,
         wram_stride=archive.wram_stride,
         wram_levels=archive.wram_levels,
+        wram_mask=archive.wram_mask,  # workers must hash identical keys
     )
 
     fleet: BarrierFleet | AsyncFleet | None = None
@@ -1621,7 +1722,7 @@ def train(
                     elitism=config.evo.elitism,
                     crossover_rate=config.evo.crossover_rate,
                     fitness_sharing=config.evo.fitness_sharing,
-                    weight_scale=1.0,
+                    weight_scale=init_std,  # add_conn weights at init scale
                     survival_threshold=0.4,
                     c3=0.4,
                 )
@@ -1707,6 +1808,13 @@ def main() -> None:
                     help="per-player prob of restoring from a frontier cell")
     ap.add_argument("--goexplore-capacity", type=int, default=2048,
                     help="max stored emulator states (memory bound)")
+    ap.add_argument("--goexplore-caps-per-round", type=float, default=4.0,
+                    help="max state captures per swarm round (0 = unlimited). "
+                         "Each capture is a ~47ms worker-side save_state; the "
+                         "archive only holds --goexplore-capacity states, so "
+                         "capturing every new cell (~20/round once agents "
+                         "explore) is pure churn — measured ~4 cores of "
+                         "save_state burn and the gen-over-gen steps/s decay")
     ap.add_argument("--novelty-mode", choices=("rarity", "per_gen", "global"),
                     default="rarity",
                     help="rarity: rarity-weighted distinct-cell coverage (default); "
@@ -1754,6 +1862,7 @@ def main() -> None:
         goexplore=args.goexplore,
         restore_prob=args.restore_prob,
         goexplore_capacity=args.goexplore_capacity,
+        goexplore_caps_per_round=args.goexplore_caps_per_round,
         auto_species=args.auto_species,
         species_target=args.species_target,
         parallel=args.parallel,

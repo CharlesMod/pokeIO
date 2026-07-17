@@ -66,12 +66,21 @@ class NoveltyArchive:
         take every ``wram_stride``-th WRAM byte for the memory digest.
     wram_levels:
         quantization levels for the WRAM digest bytes.
+    wram_mask:
+        optional tuple of STRIDED indices to keep in the WRAM digest.  The
+        stride-64 sample of Gen-1 WRAM lands mostly in the tile-map buffer
+        (a copy of the on-screen tiles — redundant with the screen digest and
+        churning at every camera scroll) and audio scratch; a startup probe
+        (see ``calibrate_wram_mask`` in the training loop) measures per-byte
+        change rates under a random policy and keeps only the slow, stateful
+        bytes.  ``None`` keeps every strided byte (legacy behaviour).
     """
 
     screen_cells: tuple[int, int] = (16, 14)
     screen_levels: int = 4
     wram_stride: int = 64
     wram_levels: int = 16
+    wram_mask: tuple[int, ...] | None = None
 
     seen: set[bytes] = field(default_factory=set)
 
@@ -80,6 +89,12 @@ class NoveltyArchive:
         # Precompute area-resample matrices: (rows, H) and (W, cols).
         self._row_mat = _area_matrix(_SCREEN_H, rows)
         self._col_mat = _area_matrix(_SCREEN_W, cols).T
+        # int index array for fancy-select of kept strided bytes (None = all)
+        self._wram_keep = (
+            np.asarray(self.wram_mask, dtype=np.intp)
+            if self.wram_mask is not None
+            else None
+        )
         self._gen_start_size = 0
         # Cells first discovered *during the current generation* — the moving
         # per-generation frontier used for per-generation novelty credit.
@@ -98,8 +113,10 @@ class NoveltyArchive:
         return q.astype(np.uint8)
 
     def _wram_digest(self, wram: np.ndarray) -> np.ndarray:
-        """Strided + quantized slice of the 8 KB WRAM block."""
+        """Strided + quantized (+ masked) slice of the 8 KB WRAM block."""
         sl = wram[:: self.wram_stride]
+        if self._wram_keep is not None:
+            sl = sl[self._wram_keep]
         step = max(1, 256 // self.wram_levels)
         return (sl // step).astype(np.uint8)
 
@@ -116,8 +133,11 @@ class NoveltyArchive:
         (``env.wram_strided()``), so the input is the digest's stride slice with
         no further subsampling — quantize it in place.
         """
+        sl = wram_strided
+        if self._wram_keep is not None:
+            sl = sl[self._wram_keep]
         step = max(1, 256 // self.wram_levels)
-        return (wram_strided // step).astype(np.uint8)
+        return (sl // step).astype(np.uint8)
 
     def cell_key_compact(self, screen: np.ndarray, wram_strided: np.ndarray) -> bytes:
         """Cell key from a screen + a pre-strided WRAM slice.
