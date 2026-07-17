@@ -623,27 +623,45 @@ def evaluate_wave_async(
     # until it has a quiet-box A/B (POKEIO_CUDAGRAPH=1).
     graph_fwd = None
     if os.environ.get("POKEIO_CUDAGRAPH") == "1" and device.type == "cuda":
-        torch.cuda.set_device(device)
-        x_static = torch.zeros((n, 1, fleet.obs_dim), dtype=torch.float32,
-                               device=device)
-        warm = torch.cuda.Stream(device)
-        warm.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(warm):
-            for _ in range(3):
+        # The streamer's pump thread runs the champion-showcase forward on
+        # this SAME device; a kernel launched mid-capture aborts the capture
+        # ("operation failed due to a previous error during capture", races
+        # per launch). Hold the streamer lock for the ~50ms capture so the
+        # showcase sits out, and fall back to eager on any capture failure —
+        # a lost 2ms/round optimization must never kill a training run.
+        _cap_lock = streamer._lock if streamer is not None else None
+        try:
+            if _cap_lock is not None:
+                _cap_lock.acquire()
+            torch.cuda.set_device(device)
+            x_static = torch.zeros((n, 1, fleet.obs_dim), dtype=torch.float32,
+                                   device=device)
+            warm = torch.cuda.Stream(device)
+            warm.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(warm):
+                for _ in range(3):
+                    _o = population_forward_sparse(cp, x_static, steps=FORWARD_STEPS)
+                    _ = _o[:, 0, :].argmax(dim=1)
+            torch.cuda.current_stream(device).wait_stream(warm)
+            torch.cuda.synchronize(device)
+            _graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(_graph):
                 _o = population_forward_sparse(cp, x_static, steps=FORWARD_STEPS)
-                _ = _o[:, 0, :].argmax(dim=1)
-        torch.cuda.current_stream(device).wait_stream(warm)
-        torch.cuda.synchronize(device)
-        _graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(_graph):
-            _o = population_forward_sparse(cp, x_static, steps=FORWARD_STEPS)
-            _acts_static = _o[:, 0, :].argmax(dim=1).to(torch.int32)
-        torch.cuda.synchronize(device)
+                _acts_static = _o[:, 0, :].argmax(dim=1).to(torch.int32)
+            torch.cuda.synchronize(device)
 
-        def graph_fwd(X_np):
-            x_static.copy_(torch.from_numpy(X_np).unsqueeze(1))
-            _graph.replay()
-            return _acts_static.cpu().numpy()
+            def graph_fwd(X_np):
+                x_static.copy_(torch.from_numpy(X_np).unsqueeze(1))
+                _graph.replay()
+                return _acts_static.cpu().numpy()
+        except RuntimeError as e:
+            print(f"[train] CUDA-graph capture failed ({e}); eager fallback",
+                  flush=True)
+            graph_fwd = None
+            torch.cuda.synchronize(device)
+        finally:
+            if _cap_lock is not None:
+                _cap_lock.release()
 
     obs_seq = fleet.arr["obs_seq"]
     obs_shm = fleet.arr["obs"]
