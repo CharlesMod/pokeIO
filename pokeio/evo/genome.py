@@ -26,6 +26,7 @@ adjacency matrix — no per-genome I/O slot bookkeeping needed.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from operator import attrgetter
@@ -158,11 +159,21 @@ def make_genome(
     weight_scale: float = 1.0,
     hidden_act: int = TANH,
     output_act: int = SIGMOID,
+    sparse_k: int = 12,
 ) -> Genome:
     """Create a minimal genome (inputs + bias + outputs).
 
     ``connect='full'`` wires every input and the bias to every output with
     random weights; ``connect='none'`` leaves it unconnected.
+
+    ``connect='sparse'`` (FS-NEAT style) wires each output to ``sparse_k``
+    random inputs + the bias, with fan-in-scaled weights.  At wide input
+    (n_in in the hundreds) 'full' is pathological: pre-activations have std
+    ~sqrt(n_in), every sigmoid output saturates to an exact 0.0/1.0, argmax
+    ties break by index, and the policy degenerates to a constant action
+    regardless of the screen.  Sparse seeds also give each genome a distinct
+    input subset — real behavioral diversity and meaningful disjoint-gene
+    distances for speciation — and honor NEAT's start-minimal principle.
     """
     g = Genome(n_in=n_in, n_out=n_out)
     for i in g.input_ids():
@@ -178,6 +189,20 @@ def make_genome(
                 innov = tracker.conn_innov(s, o)
                 w = float(rng.normal(0.0, weight_scale))
                 g.conns[innov] = ConnGene(s, o, w, True, innov)
+    elif connect == "sparse":
+        inputs = list(g.input_ids())
+        k = max(1, min(int(sparse_k), len(inputs)))
+        std = weight_scale / math.sqrt(k + 1)  # fan-in scaled: unsaturated outputs
+        for o in g.output_ids():
+            picks = rng.choice(len(inputs), size=k, replace=False)
+            for pi in picks:
+                s = inputs[int(pi)]
+                innov = tracker.conn_innov(s, o)
+                g.conns[innov] = ConnGene(s, o, float(rng.normal(0.0, std)), True, innov)
+            innov = tracker.conn_innov(g.bias_id, o)
+            g.conns[innov] = ConnGene(
+                g.bias_id, o, float(rng.normal(0.0, std)), True, innov
+            )
     return g
 
 

@@ -1009,14 +1009,20 @@ def train(
     species_target: int = 6,
     parallel: bool = True,
     envs_per_worker: int = 1,
+    init_connect: str = "sparse",
+    init_k: int = 12,
 ) -> Path:
     device = pick_device(device_str)
     rng = np.random.default_rng(config.run.seed)
 
     encoder = ObsEncoder(obs_res, config.vision.obs_ram_bytes)
     n_in = encoder.dim
-    # Budgets: fully-connected init is (n_in+1)*N_OUT conns; leave slack to grow.
-    init_conns = (n_in + 1) * N_OUT
+    # Budgets: sized to the seed density + slack to grow. Sparse seeds are
+    # ~(init_k+1)*N_OUT conns, so the pack/compile tensors shrink ~10x vs full.
+    if init_connect == "full":
+        init_conns = (n_in + 1) * N_OUT
+    else:
+        init_conns = (init_k + 1) * N_OUT
     max_conns = init_conns + 2048
     max_nodes = n_in + 1 + N_OUT + 256
 
@@ -1032,9 +1038,14 @@ def train(
 
     tracker = InnovationTracker(n_in=n_in, n_out=N_OUT)
     genomes = [
-        make_genome(n_in, N_OUT, tracker, rng, connect="full", weight_scale=1.0)
+        make_genome(
+            n_in, N_OUT, tracker, rng,
+            connect=init_connect, weight_scale=1.0, sparse_k=init_k,
+        )
         for _ in range(pop_size)
     ]
+    n_c0 = sum(len(g.conns) for g in genomes) // max(1, len(genomes))
+    print(f"[train] seed genomes: connect={init_connect} (~{n_c0} conns/genome)")
 
     rates = MutationRates(
         add_node=config.evo.mutate_add_node,
@@ -1464,6 +1475,14 @@ def main() -> None:
                     help="single-process serial evaluation (legacy fallback)")
     ap.add_argument("--envs-per-worker", type=int, default=1,
                     help="emulators owned by each worker process (1 = max parallelism)")
+    # -- gen-0 seeding ------------------------------------------------------
+    ap.add_argument("--init-connect", choices=("sparse", "full", "none"),
+                    default="sparse",
+                    help="gen-0 wiring: sparse (FS-NEAT style, default) gives each "
+                         "output --init-k random inputs + bias with fan-in-scaled "
+                         "weights; full saturates every output at wide input")
+    ap.add_argument("--init-k", type=int, default=12,
+                    help="inputs per output for --init-connect sparse")
     args = ap.parse_args()
 
     cfg = build_config(args)
@@ -1485,6 +1504,8 @@ def main() -> None:
         species_target=args.species_target,
         parallel=args.parallel,
         envs_per_worker=args.envs_per_worker,
+        init_connect=args.init_connect,
+        init_k=args.init_k,
     )
 
 
