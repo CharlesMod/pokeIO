@@ -1915,6 +1915,12 @@ def train(
             total_agent_steps = int(
                 ckpt.get("total_agent_steps", start_gen * pop_size * episode_steps)
             )
+            # The streamer captured the ORIGINAL (empty) archive/goexplore refs
+            # at construction; re-point them at the checkpoint's objects or the
+            # dashboard's archive panel reads the empty ones (shows 0 cells).
+            if streamer is not None:
+                streamer.archive = archive
+                streamer.goexplore = go
             # re-arm the obs taps the checkpoint was training with
             if taps:
                 addrs = [0] * int(config.vision.obs_ram_bytes)
