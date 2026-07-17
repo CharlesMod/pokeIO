@@ -168,6 +168,16 @@ class NoveltyArchive:
         """Convenience: build the key and add it. True iff globally new."""
         return self.add(self.cell_key(screen, wram))
 
+    def contains(self, screen: np.ndarray, wram: np.ndarray) -> bool:
+        """READ-ONLY membership probe — no insert, no visit-count side effect.
+
+        For display/telemetry paths (e.g. the champion replay): inserting from
+        those would burn genuinely-new keys into ``seen`` without a Go-Explore
+        state capture, making the cells permanently un-restorable, and would
+        inflate the per-generation frontier delta.
+        """
+        return self.cell_key(screen, wram) in self.seen
+
     def visit(self, key: bytes) -> int:
         """Record a visit to ``key``; return the visit count *before* this one.
 

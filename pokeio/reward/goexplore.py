@@ -91,6 +91,7 @@ class GoExplore:
     capacity: int = 2048
     recency_halflife: float = 4.0
     depth_weight: float = 0.25
+    caps_per_round: float = 0.0  # max captures per swarm round (0 = unlimited)
     rng: np.random.Generator = field(default_factory=lambda: np.random.default_rng(0))
 
     cells: dict[bytes, CellEntry] = field(default_factory=dict)
@@ -99,6 +100,38 @@ class GoExplore:
     n_captured: int = 0
     n_evicted: int = 0
     n_restores: int = 0
+    n_throttled: int = 0
+    _cap_tokens: float = field(default=0.0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._cap_tokens = self._cap_burst()
+
+    # ------------------------------------------------------- capture budget
+    # A save_state blob costs ~47 ms inside the worker that produces it, and
+    # the archive keeps only ``capacity`` states — so capturing every new cell
+    # (tens of thousands per generation once agents explore) buys nothing but
+    # archive churn and stalls.  The budget meters captures to roughly
+    # ``caps_per_round`` per swarm round, which still refreshes a 2048-entry
+    # archive faster than the recency halflife decays it.
+    def _cap_burst(self) -> float:
+        return max(2.0 * self.caps_per_round, 1.0)
+
+    def feed_capture_budget(self, rounds: float) -> None:
+        """Accrue capture tokens for ``rounds`` swarm-rounds of progress."""
+        if self.caps_per_round > 0:
+            self._cap_tokens = min(
+                self._cap_burst(), self._cap_tokens + self.caps_per_round * rounds
+            )
+
+    def admit_capture(self) -> bool:
+        """True if a state capture is within budget (consumes one token)."""
+        if self.caps_per_round <= 0:
+            return True
+        if self._cap_tokens >= 1.0:
+            self._cap_tokens -= 1.0
+            return True
+        self.n_throttled += 1
+        return False
 
     # ------------------------------------------------------------------ gen
     def begin_generation(self, gen: int) -> None:
@@ -127,6 +160,8 @@ class GoExplore:
         if not globally_new:
             # Cell exists in the novelty archive but we never stored a state for
             # it (e.g. it was evicted, or discovered before go-explore was on).
+            return
+        if not self.admit_capture():
             return
         state = capture_state(env)
         self.n_captured += 1
@@ -230,5 +265,6 @@ class GoExplore:
             "goexplore_captured": float(self.n_captured),
             "goexplore_evicted": float(self.n_evicted),
             "goexplore_restores": float(self.n_restores),
+            "goexplore_throttled": float(self.n_throttled),
             "goexplore_max_depth": float(max(depths)),
         }

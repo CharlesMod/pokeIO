@@ -769,6 +769,37 @@ def evaluate_wave_async(
     return n * R
 
 
+def cohort_rank_normalize(genomes, restored: set[int]) -> None:
+    """Replace ``g.fitness`` with within-spawn-cohort quantile ranks.
+
+    Players restored into Go-Explore frontier cells earn systematically more
+    novelty than newgame spawns regardless of policy quality; ranking within
+    each cohort and mapping to (rank+0.5)/n quantiles makes the two comparable
+    before selection. With Go-Explore off (``restored`` empty) this reduces to
+    a plain global rank-normalization, which still tames the heavy-tailed
+    novelty skew that lets one champion's species swallow the population.
+    """
+    cohorts = (
+        [i for i in range(len(genomes)) if i in restored],
+        [i for i in range(len(genomes)) if i not in restored],
+    )
+    for idxs in cohorts:
+        if not idxs:
+            continue
+        f = np.array([genomes[i].fitness for i in idxs], dtype=np.float64)
+        # average ranks for exact ties so equal fitness -> equal quantile
+        order = f.argsort(kind="stable")
+        ranks = np.empty(len(idxs), dtype=np.float64)
+        ranks[order] = np.arange(len(idxs), dtype=np.float64)
+        _, inv, cnt = np.unique(f, return_inverse=True, return_counts=True)
+        sums = np.zeros(cnt.shape[0], dtype=np.float64)
+        np.add.at(sums, inv, ranks)
+        ranks = sums[inv] / cnt[inv]
+        q = (ranks + 0.5) / len(idxs)
+        for j, i in enumerate(idxs):
+            genomes[i].fitness = float(q[j])
+
+
 def calibrate_wram_mask(
     rom_path: str,
     reset_state: str,
@@ -844,7 +875,10 @@ def replay_champion(
         action = int(out[0, 0, :].argmax().item())
         screen, wram, _done, info = env.step(action)
         time.sleep(0)  # cooperative GIL handoff for the live pump thread
-        is_new = archive.observe(screen, wram)
+        # READ-ONLY: the replay is telemetry, not evaluation — writing here
+        # would burn fresh keys into the archive with no state capture,
+        # making those cells permanently un-restorable (audit REWARD#5).
+        is_new = not archive.contains(screen, wram)
         writer.write_champion_step(
             ChampionStep(
                 step=t,
@@ -1715,6 +1749,15 @@ def train(
             if gen < gens - 1:
                 if streamer is not None:
                     streamer.set_phase("evolving", "reproduction")
+                # SELECTION-ONLY fitness transform (raw fitness already went
+                # to champion pick + telemetry above): rank-normalize within
+                # spawn cohort, then merge. Restored players spawn beside
+                # low-visit territory and systematically outscore newgame
+                # players for the same policy quality, so raw cross-cohort
+                # comparison ranks spawn luck (audit REWARD#3). Quantile
+                # ranks also cap the champion's fitness at 1.0, defusing the
+                # species-mean allocation blowup under extreme skew.
+                cohort_rank_normalize(genomes, set(spawn_states))
                 genomes = fast_reproduce(
                     genomes, species, tracker, rng, rates,
                     pop_size=pop_size,
