@@ -18,6 +18,7 @@ Dependency-light: stdlib + orjson only.
 
 from __future__ import annotations
 
+import time
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -107,19 +108,43 @@ def _envelope(type_tag: str, record: Any) -> bytes:
 
 
 class TelemetryWriter:
-    """Append-only writer for the two telemetry streams.
+    """Writer for the two telemetry streams.
 
-    Opens both JSONL files in binary append mode and flushes each line so a
-    tailing dashboard sees records promptly. Usable as a context manager.
+    Flushes each line so a tailing dashboard sees records promptly. Usable as
+    a context manager.
+
+    ``resume=False`` (default, a FRESH run): any existing non-empty stream is
+    rotated to ``<name>.<mtime>.bak`` and a clean file is started — otherwise
+    relaunching ``--run-id X`` would glue the new run's records onto the old
+    run's history in one file, and the dashboard (which reads the whole file)
+    would plot the stale curve. ``resume=True`` appends, for checkpoint-resume
+    where continuing the same JSONL is exactly what we want.
     """
 
-    def __init__(self, run_dir: str | Path) -> None:
+    def __init__(self, run_dir: str | Path, resume: bool = False) -> None:
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.telemetry_path = self.run_dir / TELEMETRY_FILENAME
         self.champion_path = self.run_dir / CHAMPION_FILENAME
-        self._gen_fh = open(self.telemetry_path, "ab")
-        self._champ_fh = open(self.champion_path, "ab")
+        mode = "ab"
+        if not resume:
+            for p in (self.telemetry_path, self.champion_path):
+                self._rotate_if_present(p)
+            mode = "wb"
+        self._gen_fh = open(self.telemetry_path, mode)
+        self._champ_fh = open(self.champion_path, mode)
+
+    @staticmethod
+    def _rotate_if_present(path: Path) -> None:
+        """Rename a non-empty existing stream aside, keyed by its mtime."""
+        try:
+            if path.exists() and path.stat().st_size > 0:
+                stamp = time.strftime(
+                    "%Y%m%d-%H%M%S", time.localtime(path.stat().st_mtime)
+                )
+                path.rename(path.with_suffix(path.suffix + f".{stamp}.bak"))
+        except OSError:
+            pass  # best-effort; a clean overwrite still beats appending
 
     def write_generation(self, record: GenerationRecord) -> None:
         self._gen_fh.write(_envelope(TYPE_GENERATION, record))

@@ -1593,6 +1593,7 @@ def train(
     engine: str = "furnace",
     boot_gauntlet_every: int = 10,
     boot_gauntlet_steps: int = 0,  # 0 = auto (4 * episode_steps)
+    resume: bool = False,  # append to existing telemetry (checkpoint-resume)
 ) -> Path:
     device = pick_device(device_str)
     rng = np.random.default_rng(config.run.seed)
@@ -1800,7 +1801,7 @@ def train(
         frame_skip=config.emu.frame_skip,
     )
 
-    with TelemetryWriter(run_dir) as writer:
+    with TelemetryWriter(run_dir, resume=resume) as writer:
         gen_wall_prev = time.perf_counter()
         for gen in range(gens):
             gen_t0 = time.perf_counter()
@@ -2239,6 +2240,9 @@ def main() -> None:
                          "(0 = off; see docs/specs/boot-gauntlet.md)")
     ap.add_argument("--boot-gauntlet-steps", type=int, default=0,
                     help="gauntlet episode length (0 = auto: 4*episode-steps)")
+    ap.add_argument("--resume", action="store_true", default=False,
+                    help="append to existing telemetry instead of rotating it "
+                         "aside (for checkpoint-resume; default starts fresh)")
     ap.add_argument("--goexplore-capacity", type=int, default=16384,
                     help="max stored emulator states (memory bound)")
     ap.add_argument("--goexplore-caps-per-round", type=float, default=4.0,
@@ -2305,6 +2309,7 @@ def main() -> None:
         engine=args.engine,
         boot_gauntlet_every=args.boot_gauntlet_every,
         boot_gauntlet_steps=args.boot_gauntlet_steps,
+        resume=args.resume,
     )
 
 
