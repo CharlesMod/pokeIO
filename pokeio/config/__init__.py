@@ -122,6 +122,11 @@ class RewardConfig:
     manifest_path: str = ""  # runs/<id>/manifest.json (LLM-generated)
     reward_pop_size: int = 32  # co-evolving reward candidate population
     miner_entropy_mask: float = 0.95  # mask addresses above this entropy fraction
+    # -- mined progress counters (loop wiring) -------------------------------
+    miner_every: int = 10  # re-mine counters from champion traces every N gens
+    # selection-fitness blend: (1-w)*novelty_rank + w*progress_rank, applied
+    # only once any player registers counter advancement in a generation
+    progress_weight: float = 0.5
 
 
 @dataclass

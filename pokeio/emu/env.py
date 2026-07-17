@@ -226,7 +226,8 @@ class PokeEnv:
     def release_all(self) -> None:
         """Release every button (sticky no-op) and forget the held action."""
         for name in ACTIONS:
-            self.pyboy.button_release(name)
+            if name != "noop":  # synthetic action, not a PyBoy button
+                self.pyboy.button_release(name)
         self._held = None
 
     def _flush_input(self) -> None:

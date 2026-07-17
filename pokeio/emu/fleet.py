@@ -394,6 +394,7 @@ class ObsEncoder:
         self._row = _area_matrix(_SCREEN_H, self.res)  # (res, H)
         self._col = _area_matrix(_SCREEN_W, self.res).T  # (W, res)
         self.dim = self.res * self.res + self.n_ram
+        self.tap_addrs: list[int] = []  # mined counter taps (see set_taps)
 
     def encode(self, screen: np.ndarray, wram: np.ndarray) -> np.ndarray:
         small = self._row @ screen.astype(np.float64) @ self._col  # (res,res) 0..255
@@ -403,8 +404,20 @@ class ObsEncoder:
             ram = (wram[::stride][: self.n_ram].astype(np.float32)) / 255.0
             if ram.size < self.n_ram:  # pad if short
                 ram = np.concatenate([ram, np.zeros(self.n_ram - ram.size, np.float32)])
+            # mined progress-counter taps override the blind stride sample
+            # (set via set_taps; workers apply the same override in _emit so
+            # parent-side showcase/replay obs stay identical to training obs).
+            if self.tap_addrs:
+                for j, a in enumerate(self.tap_addrs[: self.n_ram]):
+                    idx = a - 0xC000
+                    if 0 <= idx < wram.size:
+                        ram[j] = wram[idx] / 255.0
             return np.concatenate([vis, ram])
         return vis
+
+    def set_taps(self, addrs: list[int] | None) -> None:
+        """Point the RAM tail at mined counter addresses (None = legacy stride)."""
+        self.tap_addrs = list(addrs) if addrs else []
 
     def encode_compact(self, screen: np.ndarray, wram_strided: np.ndarray) -> np.ndarray:
         """Encode from a pre-strided WRAM slice (the worker hot path).
@@ -957,6 +970,8 @@ def _async_worker_main(
     res_len = reg("res_len", (n_envs,), np.int32)
     # [0]=round [1]=op [2]=pace [3]=target_steps [4+i]=ack_i
     ctl = reg("ctl", (4 + n_envs,), np.int64)
+    # mined progress-counter taps: [0]=version, [1:]=GB addresses (0=unset)
+    tapcfg = reg("tapcfg", (1 + obs_ram,), np.int64)
 
     envs = [
         PokeEnv(rom_path, frame_skip=frame_skip, hold_frames=hold_frames)
@@ -964,9 +979,19 @@ def _async_worker_main(
     ]
     my = list(range(slice_lo, slice_hi))
 
-    def _emit(gi, screen, w64):
+    tap_ver = 0
+    taps: list[tuple[int, int]] = []  # (obs column, GB address)
+
+    def _emit(gi, env, screen, w64):
         screens[gi] = screen
         obs[gi] = encoder.encode_compact(screen, w64)
+        # Mined counter taps replace the blind stride sample in the RAM tail:
+        # the agent SEES its progress counters, and the parent reads them from
+        # the obs rows it already books to score progress fitness.
+        if taps:
+            mem = env.pyboy.memory
+            for col, a in taps:
+                obs[gi, col] = mem[a] / 255.0
         k = archive.cell_key_compact(screen, w64)
         keys[gi] = np.frombuffer(k, dtype=np.uint8)
 
@@ -984,6 +1009,14 @@ def _async_worker_main(
             if op == _OP_SHUTDOWN:
                 break
             if op == _OP_RESET:
+                if int(tapcfg[0]) != tap_ver:  # new mined taps this gen
+                    tap_ver = int(tapcfg[0])
+                    base = obs_dim - obs_ram
+                    taps = [
+                        (base + j, int(tapcfg[1 + j]))
+                        for j in range(obs_ram)
+                        if int(tapcfg[1 + j]) > 0
+                    ]
                 for li, gi in enumerate(my):
                     env = envs[li]
                     if goexplore and res_flag[gi]:
@@ -995,7 +1028,7 @@ def _async_worker_main(
                         screen = env.reset(reset_state)
                         w64 = env.wram_strided(wram_stride)
                     dones[gi] = 0
-                    _emit(gi, screen, w64)
+                    _emit(gi, env, screen, w64)
                     obs_seq[gi] = 0
                     ctl[4 + gi] = local_round
                 local_round += 1
@@ -1028,7 +1061,7 @@ def _async_worker_main(
                         int(actions[gi]), wram_stride
                     )
                     dones[gi] = 1 if done else 0
-                    _emit(gi, screen, w64)
+                    _emit(gi, env, screen, w64)
                     obs_seq[gi] = k + 1  # publish AFTER the payload rows
                     progressed = True
                 if progressed:
@@ -1086,6 +1119,7 @@ class AsyncFleet:
     ):
         self.n_envs = int(n_envs)
         self.obs_dim = int(obs_dim)
+        self.obs_ram = int(obs_ram)
         self.goexplore = bool(goexplore)
         self.wram_stride = int(wram_stride)
         self.key_len = _archive_key_len(archive_kwargs, wram_stride)
@@ -1115,6 +1149,10 @@ class AsyncFleet:
         alloc("res_state", (n, _MAX_STATE), np.uint8)
         alloc("res_len", (n,), np.int32)
         alloc("ctl", (4 + n,), np.int64)
+        # mined progress-counter taps: [0]=version, [1:]=GB addresses (0=unset).
+        # When set, workers overwrite the obs RAM tail with these bytes instead
+        # of the blind stride sample (see _async_worker_main / set_tap_addrs).
+        alloc("tapcfg", (1 + self.obs_ram,), np.int64)
 
         self._ctl = self.arr["ctl"]
         self._ctl[:] = 0
@@ -1151,6 +1189,20 @@ class AsyncFleet:
         """Realtime -> workers sleep-wait between polls; max -> nap-spin."""
         self._paced = bool(realtime)
         self._ctl[2] = 1 if realtime else 0
+
+    # ------------------------------------------------------------------ taps
+    def set_tap_addrs(self, addrs: list[int]) -> None:
+        """Point the obs RAM tail at mined progress-counter addresses.
+
+        Workers re-read the tap config at the next reset round (generation
+        boundary), so call this BEFORE ``reset_all_begin``. Up to ``obs_ram``
+        GB addresses; unset slots keep the legacy blind stride sample.
+        """
+        cfg = self.arr["tapcfg"]
+        k = min(len(addrs), self.obs_ram)
+        cfg[1 : 1 + k] = np.asarray(addrs[:k], dtype=np.int64)
+        cfg[1 + k :] = 0
+        cfg[0] += 1  # version bump LAST (x86 TSO: workers see addrs first)
 
     # ------------------------------------------------------------------ rounds
     def _release(self, op: int, target: int = 0) -> None:

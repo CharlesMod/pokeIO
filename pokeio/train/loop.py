@@ -369,6 +369,7 @@ def evaluate_wave_parallel(
     pace: PaceController | None = None,
     waves_left: int = 0,
     spawn_out: dict[int, bytes] | None = None,
+    taps: list[dict] | None = None,  # accepted for API parity; furnace-only v1
 ) -> int:
     """Parallel-barrier equivalent of :func:`evaluate_wave`.
 
@@ -566,8 +567,14 @@ def evaluate_wave_async(
     pace: PaceController | None = None,
     waves_left: int = 0,
     spawn_out: dict[int, bytes] | None = None,
+    taps: list[dict] | None = None,
 ) -> int:
     """Free-running ("furnace") equivalent of :func:`evaluate_wave_parallel`.
+
+    ``taps`` (optional): mined progress counters riding in the obs RAM tail —
+    each ``{"slots": (j,) | (j, j+1), "dir": +1|-1}`` with slot indices into
+    the tail. Direction-aligned positive deltas accumulate into ``g.progress``
+    (reverts, e.g. blackout money-halving, count at half weight against it).
 
     No per-step barrier: each env advances the moment its next action arrives,
     and the parent continuously batches whichever envs are ready into one GPU
@@ -694,14 +701,50 @@ def evaluate_wave_async(
     rate_prev_ts = time.perf_counter()
     alive_check = 0
 
+    # mined progress-counter scoring state (vectorized once per parent cycle)
+    progress = np.zeros(n, dtype=np.float64)
+    if taps:
+        tail0 = fleet.obs_dim - fleet.obs_ram
+        tap_cols = np.array(
+            [tail0 + j for tp in taps for j in tp["slots"]], dtype=np.intp
+        )
+        # (S slots -> T taps) little-endian byte combiner
+        _S, _T = len(tap_cols), len(taps)
+        tap_comb = np.zeros((_S, _T), dtype=np.float64)
+        s = 0
+        for ti, tp in enumerate(taps):
+            for b in range(len(tp["slots"])):
+                tap_comb[s, ti] = 256.0 ** b
+                s += 1
+        tap_dirs = np.array([float(tp["dir"]) for tp in taps])
+        tap_scale = np.array(
+            [1.0 / (256.0 ** len(tp["slots"]) - 1.0) for tp in taps]
+        )
+        tap_prev = np.full((n, _T), np.nan)
+
     fleet.begin_wave(n, R)
 
     while True:
         snap = obs_seq[:n].copy()
 
+        # ---- mined-counter progress: one vectorized pass over the envs that
+        # published new obs this cycle (dir-aligned gains count full, reverts
+        # — blackouts, spent money — count half against).
+        changed = np.nonzero(snap > booked)[0]
+        if taps and changed.size:
+            tail = np.rint(obs_shm[np.ix_(changed, tap_cols)] * 255.0)
+            vals = tail @ tap_comb  # (m, T) counter values
+            prev = tap_prev[changed]
+            d = (vals - prev) * tap_dirs * tap_scale
+            d[np.isnan(d)] = 0.0
+            progress[changed] += (
+                np.clip(d, 0.0, None) + 0.5 * np.clip(d, None, 0.0)
+            ).sum(axis=1)
+            tap_prev[changed] = vals
+
         # ---- bookkeeping: every obs published since the last cycle.
         # (An env advances at most one step per parent cycle, so nothing skips.)
-        for i in np.nonzero(snap > booked)[0]:
+        for i in changed:
             ii = int(i)
             for k in range(int(booked[ii]) + 1, int(snap[ii]) + 1):
                 key = keys_shm[ii].tobytes()
@@ -809,10 +852,24 @@ def evaluate_wave_async(
 
     for i, g in enumerate(genomes):
         g.fitness = float(wave.fitness[i])
+        g.progress = float(progress[i])  # mined-counter advancement (0 w/o taps)
     return n * R
 
 
-def cohort_rank_normalize(genomes, restored: set[int]) -> None:
+def _quantile_ranks(vals: np.ndarray) -> np.ndarray:
+    """(rank+0.5)/n quantiles with exact ties sharing their average rank."""
+    order = vals.argsort(kind="stable")
+    ranks = np.empty(len(vals), dtype=np.float64)
+    ranks[order] = np.arange(len(vals), dtype=np.float64)
+    _, inv, cnt = np.unique(vals, return_inverse=True, return_counts=True)
+    sums = np.zeros(cnt.shape[0], dtype=np.float64)
+    np.add.at(sums, inv, ranks)
+    return (sums[inv] / cnt[inv] + 0.5) / len(vals)
+
+
+def cohort_rank_normalize(
+    genomes, restored: set[int], progress_weight: float = 0.0
+) -> None:
     """Replace ``g.fitness`` with within-spawn-cohort quantile ranks.
 
     Players restored into Go-Explore frontier cells earn systematically more
@@ -821,26 +878,68 @@ def cohort_rank_normalize(genomes, restored: set[int]) -> None:
     before selection. With Go-Explore off (``restored`` empty) this reduces to
     a plain global rank-normalization, which still tames the heavy-tailed
     novelty skew that lets one champion's species swallow the population.
+
+    When mined progress counters are live (``g.progress`` set by the wave and
+    ``progress_weight`` > 0), the selection fitness is a blend of the novelty
+    quantile and the progress quantile — novelty explores the state space,
+    progress creates the gradient novelty cannot (winning battles, XP, story
+    flags) — but only once ANY player registered progress signal this gen, so
+    a dead counter set never dilutes selection with rank noise.
     """
     cohorts = (
         [i for i in range(len(genomes)) if i in restored],
         [i for i in range(len(genomes)) if i not in restored],
     )
+    w = float(progress_weight)
+    blend = w > 0.0 and any(
+        float(getattr(g, "progress", 0.0)) != 0.0 for g in genomes
+    )
     for idxs in cohorts:
         if not idxs:
             continue
         f = np.array([genomes[i].fitness for i in idxs], dtype=np.float64)
-        # average ranks for exact ties so equal fitness -> equal quantile
-        order = f.argsort(kind="stable")
-        ranks = np.empty(len(idxs), dtype=np.float64)
-        ranks[order] = np.arange(len(idxs), dtype=np.float64)
-        _, inv, cnt = np.unique(f, return_inverse=True, return_counts=True)
-        sums = np.zeros(cnt.shape[0], dtype=np.float64)
-        np.add.at(sums, inv, ranks)
-        ranks = sums[inv] / cnt[inv]
-        q = (ranks + 0.5) / len(idxs)
+        q = _quantile_ranks(f)
+        if blend:
+            p = np.array(
+                [float(getattr(genomes[i], "progress", 0.0)) for i in idxs],
+                dtype=np.float64,
+            )
+            q = (1.0 - w) * q + w * _quantile_ranks(p)
         for j, i in enumerate(idxs):
             genomes[i].fitness = float(q[j])
+
+
+def idle_autonomous_bytes(
+    rom_path: str,
+    reset_state: str,
+    frame_skip: int = 24,
+    steps: int = 300,
+) -> set[int]:
+    """Full-resolution WRAM addresses that change with ZERO input.
+
+    Music pointers, timers, and other free-running engine state advance
+    monotonically and consistently across rollouts — to the progress-counter
+    miner they look exactly like progress (the smoke run promoted three audio
+    channel pointers to fitness taps). Anything that moves while the agent
+    does nothing cannot be a progress counter; drop it from candidacy.
+    Game-agnostic and deterministic.
+    """
+    env = PokeEnv(rom_path=rom_path, frame_skip=frame_skip)
+    try:
+        env.reset(reset_state)
+        prev = env.raw_wram().copy()
+        auto = np.zeros(prev.size, dtype=bool)
+        for _ in range(steps):
+            env.release_all()
+            env.tick_frames(frame_skip)
+            cur = env.raw_wram()
+            auto |= cur != prev
+            prev = cur.copy()
+        addrs = {0xC000 + int(i) for i in np.nonzero(auto)[0]}
+        print(f"[miner] idle-autonomous bytes excluded: {len(addrs)}")
+        return addrs
+    finally:
+        env.close()
 
 
 def calibrate_wram_mask(
@@ -905,12 +1004,26 @@ def replay_champion(
     max_nodes: int,
     max_conns: int,
     reset_state: str,
-) -> None:
-    """Replay the generation champion solo and log a few ChampionSteps."""
+    spawn_state: bytes | None = None,
+    record_wram: bool = False,
+) -> np.ndarray | None:
+    """Replay the generation champion solo and log a few ChampionSteps.
+
+    ``spawn_state``: replay from the champion's actual eval spawn (frontier
+    restore) instead of newgame — the trajectory then exercises the game
+    context the champion actually earned its fitness in, which is exactly the
+    data the progress-counter miner needs (battles, dialogue, shops).
+    ``record_wram``: return the (steps, 8192) WRAM trace for the miner.
+    """
     pop = Population.from_genomes([genome], max_nodes=max_nodes, max_conns=max_conns)
     cp = pop.compile(device)
-    screen = env.reset(reset_state)
+    if spawn_state is not None:
+        env.load_state(spawn_state)
+        screen = env.reset(None)  # clear held input + settle a frame
+    else:
+        screen = env.reset(reset_state)
     wram = env.raw_wram()
+    trace = np.empty((steps, wram.size), dtype=np.uint8) if record_wram else None
     for t in range(steps):
         x = encoder.encode(screen, wram)
         xt = torch.from_numpy(x[None, :]).to(device).unsqueeze(1)  # (1,1,dim)
@@ -931,6 +1044,9 @@ def replay_champion(
                 reward_components={"novelty": 1.0 if is_new else 0.0},
             )
         )
+        if trace is not None:
+            trace[t] = wram
+    return trace
 
 
 # --------------------------------------------------------------------------
@@ -1660,6 +1776,27 @@ def train(
     species_best: dict[int, tuple[float, int]] = {}
     species_stagnation = int(getattr(config.evo, "species_stagnation", 15))
 
+    # Progress-counter mining state (audit MATH#1 — the endgame gradient):
+    # champion-replay WRAM traces feed the game-agnostic miner every
+    # `miner_every` gens; the top counters become obs RAM taps (the agent SEES
+    # them) and a progress fitness term (dir-aligned advancement, reverts
+    # penalized) blended with novelty at reproduction time. Novelty explores;
+    # progress rewards what novelty cannot: winning, XP, story flags.
+    from collections import deque as _deque
+
+    from pokeio.reward.miner import MinerConfig, mine
+
+    miner_rollouts: _deque = _deque(maxlen=8)
+    miner_cfg = MinerConfig.from_reward_config(config.reward)
+    miner_every = int(getattr(config.reward, "miner_every", 10))
+    progress_weight = float(getattr(config.reward, "progress_weight", 0.5))
+    taps: list[dict] = []  # {"slots": (j,)|(j,j+1), "dir": +/-1, "addr": int}
+    # free-running engine bytes (music pointers, timers) are counter mimics
+    miner_exclude = idle_autonomous_bytes(
+        config.emu.rom_path, config.emu.reset_state,
+        frame_skip=config.emu.frame_skip,
+    )
+
     with TelemetryWriter(run_dir) as writer:
         gen_wall_prev = time.perf_counter()
         for gen in range(gens):
@@ -1726,6 +1863,7 @@ def train(
                         pace=pace,
                         waves_left=n_waves - 1 - wi,
                         spawn_out=spawn_states,
+                        taps=taps if (taps and engine == "furnace") else None,
                     )
                 else:
                     steps_done += evaluate_wave(
@@ -1769,13 +1907,71 @@ def train(
             cpu_pct = psutil.cpu_percent(None)
             sps = steps_done / gen_dt if gen_dt > 0 else 0.0
 
-            # short champion replay for the live feed (parent-side env)
-            replay_champion(
+            # Champion replay: live-feed telemetry AND the miner's data source.
+            # Replaying from the champion's true eval spawn (not newgame)
+            # exercises the contexts it earned fitness in — battles, dialogue —
+            # which is exactly where progress counters move. Full episode
+            # length so slow counters (XP, flags) get room to tick.
+            trace = replay_champion(
                 champion, replay_env, encoder, archive, device,
-                min(champion_steps, episode_steps), writer,
+                episode_steps, writer,
                 max_nodes, max_conns, reset_state,
+                spawn_state=spawn_states.get(champ_idx),
+                record_wram=True,
             )
+            if trace is not None and trace.shape[0] >= 2:
+                miner_rollouts.append(trace)
             _bt = _phase("replay", _bt)
+
+            # Re-mine progress counters on schedule; install as obs taps.
+            if (
+                gen % miner_every == miner_every - 1
+                and len(miner_rollouts) >= 4
+            ):
+                cands = mine(list(miner_rollouts), cfg=miner_cfg, top_k=16)
+                new_taps: list[dict] = []
+                used_addrs: set[int] = set()
+                slot = 0
+                n_slots = int(config.vision.obs_ram_bytes)
+                for c in cands:
+                    span = range(c.address, c.address + c.width)
+                    if slot + c.width > n_slots or any(
+                        a in used_addrs or a in miner_exclude for a in span
+                    ):
+                        continue
+                    new_taps.append({
+                        "slots": tuple(range(slot, slot + c.width)),
+                        "dir": 1 if c.direction == "increasing" else -1,
+                        "addr": c.address,
+                    })
+                    used_addrs.update(span)
+                    slot += c.width
+                    if slot >= n_slots:
+                        break
+                same = [
+                    (tp["addr"], tp["dir"], len(tp["slots"])) for tp in new_taps
+                ] == [
+                    (tp["addr"], tp["dir"], len(tp["slots"])) for tp in taps
+                ]
+                if new_taps and not same:  # skip no-op reinstalls: each install
+                    # shifts obs semantics under evolved nets (one-time cost)
+                    taps = new_taps
+                    addrs = [0] * n_slots
+                    for tp in taps:
+                        for b, j in enumerate(tp["slots"]):
+                            addrs[j] = tp["addr"] + b
+                    encoder.set_taps(addrs)  # parent showcase/replay obs
+                    if fleet is not None and hasattr(fleet, "set_tap_addrs"):
+                        fleet.set_tap_addrs(addrs)  # workers pick up at reset
+                    print(
+                        "[miner] taps installed: "
+                        + ", ".join(
+                            f"0x{tp['addr']:04X}"
+                            f"{'x2' if len(tp['slots']) == 2 else ''}"
+                            f"({'+' if tp['dir'] > 0 else '-'})"
+                            for tp in taps
+                        )
+                    )
             if pace is not None:
                 pace.poll()  # pick up mid-boundary flips before the next wave
 
@@ -1845,6 +2041,11 @@ def train(
             if auto_species:
                 reward_terms["species_threshold"] = float(spec.threshold)
                 reward_terms["species_stagnant_killed"] = float(n_stagnant_killed)
+            if taps:
+                reward_terms["progress_best"] = float(
+                    max(getattr(g, "progress", 0.0) for g in genomes)
+                )
+                reward_terms["progress_taps"] = float(len(taps))
             if go is not None:
                 reward_terms.update(go.stats())
 
@@ -1902,7 +2103,9 @@ def train(
                 # comparison ranks spawn luck (audit REWARD#3). Quantile
                 # ranks also cap the champion's fitness at 1.0, defusing the
                 # species-mean allocation blowup under extreme skew.
-                cohort_rank_normalize(genomes, set(spawn_states))
+                cohort_rank_normalize(
+                    genomes, set(spawn_states), progress_weight=progress_weight
+                )
                 genomes = fast_reproduce(
                     genomes, species, tracker, rng, rates,
                     pop_size=pop_size,
