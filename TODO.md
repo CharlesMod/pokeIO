@@ -19,6 +19,22 @@ throughput + determinism proven, data contracts tested, GLM confined to one card
 - **GLM-4.7-Flash on ONE card:** `UD-Q3_K_XL` (13.78 GB) fits card 0 alone (~13.8 GB, card 1 FREE for training); 350 tok/s prefill / 39.5 tok/s decode @ 4k ctx. Standalone server :8080 (needs systemd for persistence).
 - **STRATEGIC IMPLICATION:** we are firmly **CPU-bound at ~10k agent-steps/s**; the P100s can infer far more tiny-nets/s than that. So the levers are **sample efficiency, episode-length/frame-skip budgeting, and (later) more machines** — NOT GPU optimization. Rough budget: pop 256 × ~4k steps ≈ 1M steps ≈ 100s/generation ≈ ~36 gen/hr.
 
+### Audit3 — FURNACE engine (async free-running fleet, 2026-07-16)
+- **Barrier round decomposition** (112 players / 28 workers, goexplore, quiet box; `scripts/bench_audit2_fleet.py`): round=40ms → **2,797 steps/s real-workload**. Barrier wait = 34ms of which mean worker work is only ~19ms — the rest is straggler tax (emulation cost is game-state dependent: 3.7ms typical, 9–12ms in scroll/dialog states) plus a ~5ms GPU forward all workers idle through. Go-Explore `save_state` = **47ms** and stalls the whole fleet when it lands on the barrier.
+- **FURNACE (`AsyncFleet` + `evaluate_wave_async`, `--engine furnace`, now default): 8,129–8,470 steps/s at the same config — 2.9x.** No per-step barrier: per-env `obs_seq`/`act_seq` counters in shm; workers step the moment their action lands; the parent batches whatever is ready into each forward. Straggler tax → 0 (a slow env only slows itself), forward overlaps stepping, captures stall one worker slice not the fleet. Per-env trajectories are bit-identical to barrier (verified: identical gen-0 champion); within-gen rarity-credit/capture ORDER is timing-dependent, so runs are not round-reproducible.
+- **Traps discovered:** (1) pure busy-spin in the async workers measured ~2x WORSE than 200-spin+50µs naps — the barrier's busy-spin lore does not transfer to multi-ms waits; (2) in-fleet step cost is ~2x the solo micro-bench (memory-system contention of 28 concurrent PyBoys, not frequency — verified ~3.1GHz under load); (3) a CUDA-graph forward (0.86ms vs 2.9ms) plus min-batch/fixed-cadence pacing knobs exist in `scripts/bench_audit3_async.py` (`POKEIO_CUDAGRAPH=1` opt-in is wired in `evaluate_wave_async`).
+- **Production A/B (2026-07-16, ~6 cores lost to a realtime-paced live1 in the background; 2 gens each, pop 224, 400 steps, goexplore, live on):**
+  | config | gen0 / gen1 steps/s |
+  |---|---|
+  | barrier, 112 players | 3,339 / 3,995 |
+  | furnace, 112 players | 4,873 / 6,020 |
+  | furnace + CUDA graph, 112 players | 5,919 / 6,147 |
+  | furnace, 224 players (single wave, epw 8) | 7,126 / 5,248 |
+  | **furnace + CUDA graph, 224 players single-wave** | **7,500 / 6,839 (eff 6,530–6,832 incl. boundaries)** |
+  Best config ≈ **1.8x barrier contemporaneous**; boundary time collapses to ~1-2s in single-wave mode. CUDA-graph capture worked cleanly in production at both 112 and 224 (validated identical eager-vs-replay argmax at capture time). Expect ~8-9k+ on a truly idle box.
+- **Anomaly to investigate:** the restarted live1 burns ~6.2 cores at REALTIME pace (old build idled at load <1). Something in the current realtime path isn't sleeping.
+- **Realtime spectate** still works under furnace: per-env absolute schedule (env i's action k at t0+k·period) instead of the barrier's per-round deadline.
+
 ---
 
 ## Guiding Invariants (never violate without an explicit decision)

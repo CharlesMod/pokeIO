@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -37,7 +38,7 @@ import torch
 
 from pokeio.config import Config
 from pokeio.emu.env import PokeEnv
-from pokeio.emu.fleet import BarrierFleet, ObsEncoder
+from pokeio.emu.fleet import AsyncFleet, BarrierFleet, ObsEncoder
 from pokeio.evo.forward import population_forward_sparse
 from pokeio.evo.genome import InnovationTracker, Population, make_genome
 from pokeio.evo.ops import MutationRates, Speciation, compatibility_distance
@@ -504,6 +505,249 @@ def evaluate_wave_parallel(
     for i, g in enumerate(genomes):
         g.fitness = float(wave.fitness[i])
     return n * episode_steps
+
+
+def evaluate_wave_async(
+    genomes,
+    fleet: AsyncFleet,
+    archive: NoveltyArchive,
+    device: torch.device,
+    episode_steps: int,
+    max_nodes: int,
+    max_conns: int,
+    streamer: LiveStreamer | None = None,
+    gen: int = 0,
+    novelty_mode: str = "rarity",
+    novelty_floor: float = 0.1,
+    goexplore: GoExplore | None = None,
+    restore_prob: float = 0.5,
+    prof: dict | None = None,
+    cp_full=None,
+    wave_offset: int = 0,
+    pace: PaceController | None = None,
+    waves_left: int = 0,
+    spawn_out: dict[int, bytes] | None = None,
+) -> int:
+    """Free-running ("furnace") equivalent of :func:`evaluate_wave_parallel`.
+
+    No per-step barrier: each env advances the moment its next action arrives,
+    and the parent continuously batches whichever envs are ready into one GPU
+    forward. Per-env trajectories are bit-identical to the barrier engine (an
+    env's action k is a function of its own obs k only); what differs is the
+    ORDER envs hit the novelty archive within the wave, so rarity credit and
+    Go-Explore capture ownership are timing-dependent rather than reproducible
+    round-by-round. Measured 2.9x the barrier engine at the live config
+    (2,797 -> 8,129 steps/s, quiet box, 2026-07 audit3).
+
+    Realtime pace: the parent releases env i's k-th action on the absolute
+    schedule ``t0 + k * period`` (period = frame_skip/60), so every emulator
+    individually runs at authentic Game Boy speed; overruns re-anchor per env
+    instead of burst-catching-up.
+    """
+    n = len(genomes)  # sub-wave size (<= fleet.n_envs)
+    R = int(episode_steps)
+    wave = WaveNovelty(archive, n, mode=novelty_mode, floor=novelty_floor)
+
+    def _mark(key: str, t0: float) -> float:
+        t1 = time.perf_counter()
+        if prof is not None:
+            prof[key] = prof.get(key, 0.0) + (t1 - t0)
+        return t1
+
+    # Reset the fleet; a fraction of players restore from a sampled frontier
+    # cell (identical sampling path to the barrier engine).
+    _t = time.perf_counter()
+    if streamer is not None:
+        streamer.set_phase("evolving", "restoring frontier")
+    restore: dict[int, bytes] = {}
+    if goexplore is not None and goexplore.size > 0:
+        for i in range(n):
+            if goexplore.rng.random() < restore_prob:
+                entry = goexplore.sample()
+                if entry is not None:
+                    restore[i] = entry.state
+        goexplore.n_restores += len(restore)
+        if spawn_out is not None:
+            for i, blob in restore.items():
+                spawn_out[wave_offset + i] = blob
+    _t = _mark("go_sample", _t)
+    fleet.reset_all_begin(restore if restore else None)
+    if callable(cp_full):
+        cp_full = cp_full()  # memoized full-population pack+compile
+    if cp_full is not None:
+        cp = _slice_compiled(cp_full, wave_offset, wave_offset + n)
+    else:
+        pop = Population.from_genomes(
+            genomes, max_nodes=max_nodes, max_conns=max_conns
+        )
+        cp = pop.compile(device)
+    _t = _mark("pack_compile", _t)
+    fleet.reset_all_end()
+    _t = _mark("reset_all", _t)
+    if streamer is not None:
+        streamer.set_phase("wave")
+
+    # Optional CUDA-graph forward: collapses the ~60 kernel launches of the
+    # 4-hop sparse forward + argmax into one replay (~3ms -> <1ms). Opt-in
+    # until it has a quiet-box A/B (POKEIO_CUDAGRAPH=1).
+    graph_fwd = None
+    if os.environ.get("POKEIO_CUDAGRAPH") == "1" and device.type == "cuda":
+        torch.cuda.set_device(device)
+        x_static = torch.zeros((n, 1, fleet.obs_dim), dtype=torch.float32,
+                               device=device)
+        warm = torch.cuda.Stream(device)
+        warm.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(warm):
+            for _ in range(3):
+                _o = population_forward_sparse(cp, x_static, steps=FORWARD_STEPS)
+                _ = _o[:, 0, :].argmax(dim=1)
+        torch.cuda.current_stream(device).wait_stream(warm)
+        torch.cuda.synchronize(device)
+        _graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(_graph):
+            _o = population_forward_sparse(cp, x_static, steps=FORWARD_STEPS)
+            _acts_static = _o[:, 0, :].argmax(dim=1).to(torch.int32)
+        torch.cuda.synchronize(device)
+
+        def graph_fwd(X_np):
+            x_static.copy_(torch.from_numpy(X_np).unsqueeze(1))
+            _graph.replay()
+            return _acts_static.cpu().numpy()
+
+    obs_seq = fleet.arr["obs_seq"]
+    obs_shm = fleet.arr["obs"]
+    keys_shm = fleet.arr["keys"]
+    dones_shm = fleet.arr["dones"]
+    actions_shm = fleet.arr["actions"]
+    act_seq = fleet.arr["act_seq"]
+    cap_flag = fleet.arr["cap_flag"]
+    cap_done = fleet.arr["cap_done"]
+    cap_state = fleet.arr["cap_state"]
+    cap_len = fleet.arr["cap_len"]
+
+    dead = [False] * n
+    acted = np.full(n, -1, dtype=np.int64)   # newest obs index acted on
+    booked = np.zeros(n, dtype=np.int64)     # obs index bookkept through
+    pending: dict[int, tuple[bytes, int]] = {}
+    last_X = None
+    last_actions = np.zeros(n, dtype=np.int32)
+
+    # realtime pacing state (absolute per-wave schedule, per-env re-anchor)
+    if pace is not None:
+        pace.begin_wave()
+    period = pace.period if pace is not None else 0.0
+    next_due = np.zeros(n, dtype=np.float64)  # env i's next action due time
+    t_anchor: float | None = None
+
+    # aggregate step-rate EMA for the dashboard ETA
+    rate = 0.0
+    rate_prev_total = 0
+    rate_prev_ts = time.perf_counter()
+    alive_check = 0
+
+    fleet.begin_wave(n, R)
+
+    while True:
+        snap = obs_seq[:n].copy()
+
+        # ---- bookkeeping: every obs published since the last cycle.
+        # (An env advances at most one step per parent cycle, so nothing skips.)
+        for i in np.nonzero(snap > booked)[0]:
+            ii = int(i)
+            for k in range(int(booked[ii]) + 1, int(snap[ii]) + 1):
+                key = keys_shm[ii].tobytes()
+                globally_new = archive.add(key)
+                prior = archive.visit(key)
+                wave.observe_key(ii, key, globally_new, prior)
+                dead[ii] = dead[ii] or bool(dones_shm[ii])
+                if (
+                    goexplore is not None and k < R
+                    and not cap_flag[ii] and not cap_done[ii]
+                    and not goexplore.revisit(key) and globally_new
+                ):
+                    # Worker captures obs k's state before applying its action.
+                    # (While a capture is outstanding, further discoveries by
+                    # the same env are not re-flagged — a rare, harmless drop.)
+                    cap_flag[ii] = 1
+                    pending[ii] = (key, k)
+            booked[ii] = snap[ii]
+        if goexplore is not None and pending:
+            for i in np.nonzero(cap_done[:n])[0]:
+                ii = int(i)
+                got = pending.pop(ii, None)
+                if got is not None:
+                    key, depth = got
+                    goexplore.store_captured(
+                        key, bytes(cap_state[ii, : int(cap_len[ii])]), depth
+                    )
+                cap_done[ii] = 0
+
+        # ---- issue actions for every env whose newest obs is unanswered
+        ready = (snap > acted) & (snap < R)
+        realtime = pace is not None and pace.mode == "realtime"
+        now = time.perf_counter()
+        if realtime:
+            if t_anchor is None:
+                t_anchor = now
+                next_due[:] = now
+            ready &= next_due <= now
+        else:
+            t_anchor = None
+        if ready.any():
+            X = np.ascontiguousarray(obs_shm[:n], dtype=np.float32)
+            if graph_fwd is not None:
+                acts = graph_fwd(X)
+            else:
+                xt = torch.from_numpy(X).to(device).unsqueeze(1)
+                out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
+                acts = out[:, 0, :].argmax(dim=1).cpu().numpy().astype(np.int32)
+            idx = np.nonzero(ready)[0]
+            actions_shm[idx] = acts[idx]
+            act_seq[idx] = snap[idx]  # publish AFTER the action rows (x86 TSO)
+            acted[idx] = snap[idx]
+            last_X, last_actions = X, acts
+            if realtime:
+                nd = next_due[idx] + period
+                overrun = nd < now  # stalled past a full period: re-anchor
+                nd[overrun] = now + period
+                next_due[idx] = nd
+        elif bool((snap >= R).all()) and not pending:
+            break
+        else:
+            # idle: nothing ready (all envs mid-step, or paced). The 20us nap
+            # keeps this core polite; the GPU sync above busy-waits anyway.
+            time.sleep(1e-3 if realtime else 2e-5)
+
+        # ---- periodic upkeep (pace flips, liveness, live feed, ETA)
+        alive_check += 1
+        if alive_check % 512 == 0:
+            fleet.check_alive()
+        if pace is not None:
+            pace.poll()
+        now = time.perf_counter()
+        if now - rate_prev_ts >= 0.25:
+            total = int(snap.sum())
+            inst = (total - rate_prev_total) / (now - rate_prev_ts)
+            rate = inst if rate <= 0 else 0.9 * rate + 0.1 * inst
+            rate_prev_total, rate_prev_ts = total, now
+            if pace is not None and n > 0:
+                # per-env step cadence == the barrier engine's "round rate"
+                pace.round_hz = rate / n
+        if streamer is not None and last_X is not None:
+            steps_left = int((R - snap).clip(min=0).sum()) + waves_left * R * n
+            if rate > 0:
+                streamer.set_eta(steps_left / rate, rate / max(1, n))
+            streamer.maybe_write(
+                gen, fleet.screens[:n], wave.fitness, dead,
+                obs=last_X, actions=last_actions, round_t=int(snap.min()),
+            )
+
+    fleet.end_wave()
+    _mark("rounds", _t)
+
+    for i, g in enumerate(genomes):
+        g.fitness = float(wave.fitness[i])
+    return n * R
 
 
 def replay_champion(
@@ -1011,6 +1255,7 @@ def train(
     envs_per_worker: int = 1,
     init_connect: str = "sparse",
     init_k: int = 12,
+    engine: str = "furnace",
 ) -> Path:
     device = pick_device(device_str)
     rng = np.random.default_rng(config.run.seed)
@@ -1080,15 +1325,16 @@ def train(
         wram_levels=archive.wram_levels,
     )
 
-    fleet: BarrierFleet | None = None
+    fleet: BarrierFleet | AsyncFleet | None = None
     envs: list[PokeEnv] = []
     replay_env: PokeEnv | None = None
     if parallel:
+        fleet_cls = AsyncFleet if engine == "furnace" else BarrierFleet
         print(
-            f"[train] PARALLEL fleet: {players} PokeEnv workers "
+            f"[train] PARALLEL fleet [{engine}]: {players} PokeEnv workers "
             f"(envs_per_worker={envs_per_worker}, rom={rom}) ..."
         )
-        fleet = BarrierFleet(
+        fleet = fleet_cls(
             n_envs=players,
             obs_dim=encoder.dim,
             obs_res=obs_res,
@@ -1208,7 +1454,11 @@ def train(
                 if streamer is not None:
                     streamer.begin_wave(wave, gen, a, wi, n_waves=n_waves)
                 if parallel:
-                    steps_done += evaluate_wave_parallel(
+                    eval_fn = (
+                        evaluate_wave_async if engine == "furnace"
+                        else evaluate_wave_parallel
+                    )
+                    steps_done += eval_fn(
                         wave,
                         fleet,
                         archive,
@@ -1475,6 +1725,10 @@ def main() -> None:
                     help="single-process serial evaluation (legacy fallback)")
     ap.add_argument("--envs-per-worker", type=int, default=1,
                     help="emulators owned by each worker process (1 = max parallelism)")
+    ap.add_argument("--engine", choices=("furnace", "barrier"), default="furnace",
+                    help="wave engine: furnace = free-running async fleet "
+                         "(no per-step barrier, ~3x measured); barrier = "
+                         "lockstep spin-barrier fleet (legacy)")
     # -- gen-0 seeding ------------------------------------------------------
     ap.add_argument("--init-connect", choices=("sparse", "full", "none"),
                     default="sparse",
@@ -1506,6 +1760,7 @@ def main() -> None:
         envs_per_worker=args.envs_per_worker,
         init_connect=args.init_connect,
         init_k=args.init_k,
+        engine=args.engine,
     )
 
 

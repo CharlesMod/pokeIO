@@ -871,6 +871,392 @@ class BarrierFleet:
             pass
 
 
+# ==========================================================================
+# AsyncFleet — free-running workers, no per-step barrier ("furnace" engine)
+# ==========================================================================
+# Measured motivation (2026-07 audit2/audit3, quiet box, 112 players / 28
+# workers, goexplore on): the barrier round spends ~34 ms waiting for the
+# SLOWEST worker (mean worker does ~19 ms of work — emulation cost is game-
+# state dependent, 3.7 ms typical vs 9-12 ms in scroll/dialog scenes) plus
+# ~5 ms of GPU forward all workers sit through. Removing the lockstep turns
+# max-of-workers into mean-of-workers and overlaps the forward with stepping:
+# 2,797 -> 8,129 steps/s (2.9x) with identical novelty/Go-Explore semantics.
+#
+# Protocol: two per-env sequence counters in shared memory.
+#
+#   obs_seq[i] = k   worker published the obs after step k   (k=0: reset obs)
+#   act_seq[i] = k   parent published the action to apply to obs k
+#
+# A worker steps env i exactly when ``act_seq[i] == obs_seq[i]`` (the action
+# for its newest obs has arrived) and ``obs_seq[i] < target``. The parent
+# loops: snapshot obs_seq, bookkeep every newly published obs, forward the
+# population once, write actions for the envs that were ready, bump their
+# act_seq. Ordinary x86 store order (payload row first, sequence counter
+# second) makes the handshake safe without locks; each env advances at most
+# one step per parent cycle, so the parent never misses an obs.
+#
+# Consequences:
+#   * a slow env only slows itself (no straggler tax),
+#   * a ~47 ms Go-Explore save_state stalls one worker's slice, not the fleet,
+#   * per-env trajectories are BIT-IDENTICAL to the barrier engine (an env's
+#     action k depends only on its own obs k), but the ORDER envs hit the
+#     novelty archive within a generation is timing-dependent, so rarity
+#     credit and capture ownership can differ run-to-run.
+
+_OP_RUN = 3  # barrier ops: 0=step 1=reset 2=shutdown (shared numbering)
+
+
+def _async_worker_main(
+    slice_lo, slice_hi, rom_path, frame_skip, hold_frames, reset_state,
+    obs_res, obs_ram, wram_stride, arch_kwargs, goexplore,
+    shm_names, n_envs, obs_dim, key_len, core,
+):
+    """Free-running worker: owns envs ``[slice_lo:slice_hi]``.
+
+    Round-robins its envs, stepping any env whose next action has arrived;
+    hashes + encodes locally (same as the barrier worker). Between actions it
+    nap-spins (200 hot polls then 50 us sleeps) — the p-state clamp that makes
+    napping catastrophic for the barrier's sub-ms hand-offs is a non-issue at
+    the multi-ms cadence of a free-running env slice, and the validated 8.1k
+    steps/s configuration ran exactly this wait.
+    """
+    import io as _io
+
+    from pokeio.emu.env import PokeEnv
+    from pokeio.reward.archive import NoveltyArchive
+
+    try:
+        if core is not None:
+            psutil.Process().cpu_affinity([core])
+    except Exception:
+        pass
+
+    encoder = ObsEncoder(obs_res, obs_ram)
+    archive = NoveltyArchive(**arch_kwargs)  # stateless key hasher
+
+    shms = []
+
+    def reg(name, shape, dtype):
+        shm = shared_memory.SharedMemory(name=shm_names[name])
+        shms.append(shm)
+        return np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+
+    obs = reg("obs", (n_envs, obs_dim), np.float32)
+    screens = reg("screens", (n_envs, _SCREEN_H, _SCREEN_W), np.uint8)
+    keys = reg("keys", (n_envs, key_len), np.uint8)
+    actions = reg("actions", (n_envs,), np.int32)
+    dones = reg("dones", (n_envs,), np.uint8)
+    obs_seq = reg("obs_seq", (n_envs,), np.int64)
+    act_seq = reg("act_seq", (n_envs,), np.int64)
+    cap_flag = reg("cap_flag", (n_envs,), np.uint8)
+    cap_done = reg("cap_done", (n_envs,), np.uint8)
+    cap_state = reg("cap_state", (n_envs, _MAX_STATE), np.uint8)
+    cap_len = reg("cap_len", (n_envs,), np.int32)
+    res_flag = reg("res_flag", (n_envs,), np.uint8)
+    res_state = reg("res_state", (n_envs, _MAX_STATE), np.uint8)
+    res_len = reg("res_len", (n_envs,), np.int32)
+    # [0]=round [1]=op [2]=pace [3]=target_steps [4+i]=ack_i
+    ctl = reg("ctl", (4 + n_envs,), np.int64)
+
+    envs = [
+        PokeEnv(rom_path, frame_skip=frame_skip, hold_frames=hold_frames)
+        for _ in range(slice_lo, slice_hi)
+    ]
+    my = list(range(slice_lo, slice_hi))
+
+    def _emit(gi, screen, w64):
+        screens[gi] = screen
+        obs[gi] = encoder.encode_compact(screen, w64)
+        k = archive.cell_key_compact(screen, w64)
+        keys[gi] = np.frombuffer(k, dtype=np.uint8)
+
+    local_round = 1
+    try:
+        while True:
+            # ---- wait for the next round release (reset / run / shutdown)
+            i = 0
+            while ctl[0] < local_round:
+                time.sleep(2e-3 if ctl[2] else 5e-5)
+                i += 1
+                if i % 512 == 0 and os.getppid() == 1:
+                    raise SystemExit(1)  # orphaned: exit, don't leak
+            op = int(ctl[1])
+            if op == _OP_SHUTDOWN:
+                break
+            if op == _OP_RESET:
+                for li, gi in enumerate(my):
+                    env = envs[li]
+                    if goexplore and res_flag[gi]:
+                        env.load_state(bytes(res_state[gi, : int(res_len[gi])]))
+                        env.pyboy.tick(1, True)
+                        screen = env._obs()
+                        w64 = env.wram_strided(wram_stride)
+                    else:
+                        screen = env.reset(reset_state)
+                        w64 = env.wram_strided(wram_stride)
+                    dones[gi] = 0
+                    _emit(gi, screen, w64)
+                    obs_seq[gi] = 0
+                    ctl[4 + gi] = local_round
+                local_round += 1
+                continue
+            # ---- _OP_RUN: free-run until every owned env reaches the target
+            target = int(ctl[3])
+            spins = 0
+            while True:
+                progressed = False
+                for li, gi in enumerate(my):
+                    k = int(obs_seq[gi])
+                    if k >= target or act_seq[gi] != k:
+                        continue
+                    env = envs[li]
+                    # Deferred Go-Explore capture: save the state we are STILL
+                    # in (obs k) before applying obs k's action — same semantics
+                    # as the barrier engine, minus the fleet-wide stall.
+                    if goexplore and cap_flag[gi]:
+                        buf = _io.BytesIO()
+                        env.pyboy.save_state(buf)
+                        blob = buf.getvalue()
+                        nb = min(len(blob), _MAX_STATE)
+                        cap_state[gi, :nb] = np.frombuffer(
+                            blob[:nb], dtype=np.uint8
+                        )
+                        cap_len[gi] = nb
+                        cap_flag[gi] = 0
+                        cap_done[gi] = 1
+                    screen, w64, done = env.step_fast(
+                        int(actions[gi]), wram_stride
+                    )
+                    dones[gi] = 1 if done else 0
+                    _emit(gi, screen, w64)
+                    obs_seq[gi] = k + 1  # publish AFTER the payload rows
+                    progressed = True
+                if progressed:
+                    spins = 0
+                    continue
+                if all(obs_seq[gi] >= target for gi in my):
+                    break
+                spins += 1
+                if ctl[2]:
+                    time.sleep(2e-3)  # realtime spectate: box goes quiet
+                elif spins >= 200:
+                    time.sleep(5e-5)
+                    if spins % 4096 == 0 and os.getppid() == 1:
+                        raise SystemExit(1)
+            for gi in my:
+                ctl[4 + gi] = local_round
+            local_round += 1
+    finally:
+        for env in envs:
+            try:
+                env.close()
+            except Exception:
+                pass
+        for s in shms:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+class AsyncFleet:
+    """Free-running shared-memory fleet (the "furnace" engine).
+
+    Construction args match :class:`BarrierFleet` so the trainer can swap
+    engines with a flag. Per-wave driving differs: the parent calls
+    ``reset_all_begin/_end`` (identical), then ``begin_wave(n, steps)`` and
+    runs its own act/observe loop against the ``obs_seq``/``act_seq`` counters
+    (see ``evaluate_wave_async``), then ``end_wave()``.
+    """
+
+    def __init__(
+        self,
+        n_envs: int,
+        obs_dim: int,
+        obs_res: int,
+        obs_ram: int,
+        rom_path: str,
+        frame_skip: int,
+        hold_frames: int,
+        reset_state: str,
+        archive_kwargs: dict,
+        wram_stride: int = 64,
+        goexplore: bool = False,
+        envs_per_worker: int = 1,
+    ):
+        self.n_envs = int(n_envs)
+        self.obs_dim = int(obs_dim)
+        self.goexplore = bool(goexplore)
+        self.wram_stride = int(wram_stride)
+        self.key_len = _archive_key_len(archive_kwargs, wram_stride)
+
+        self._blocks: dict[str, shared_memory.SharedMemory] = {}
+        self.arr: dict[str, np.ndarray] = {}
+
+        def alloc(name, shape, dtype):
+            nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+            shm = shared_memory.SharedMemory(create=True, size=max(1, nbytes))
+            self._blocks[name] = shm
+            self.arr[name] = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+
+        n = self.n_envs
+        alloc("obs", (n, self.obs_dim), np.float32)
+        alloc("screens", (n, _SCREEN_H, _SCREEN_W), np.uint8)
+        alloc("keys", (n, self.key_len), np.uint8)
+        alloc("actions", (n,), np.int32)
+        alloc("dones", (n,), np.uint8)
+        alloc("obs_seq", (n,), np.int64)
+        alloc("act_seq", (n,), np.int64)
+        alloc("cap_flag", (n,), np.uint8)
+        alloc("cap_done", (n,), np.uint8)
+        alloc("cap_state", (n, _MAX_STATE), np.uint8)
+        alloc("cap_len", (n,), np.int32)
+        alloc("res_flag", (n,), np.uint8)
+        alloc("res_state", (n, _MAX_STATE), np.uint8)
+        alloc("res_len", (n,), np.int32)
+        alloc("ctl", (4 + n,), np.int64)
+
+        self._ctl = self.arr["ctl"]
+        self._ctl[:] = 0
+        self._round = 0
+        self._paced = False
+        self._shm_names = {k: v.name for k, v in self._blocks.items()}
+
+        self._ctx = mp.get_context("spawn")
+        core_order = _numa_core_order()
+        epw = max(1, int(envs_per_worker))
+        self._procs: list = []
+        wi = 0
+        for lo in range(0, n, epw):
+            hi = min(lo + epw, n)
+            core = core_order[wi % len(core_order)] if core_order else None
+            p = self._ctx.Process(
+                target=_async_worker_main,
+                args=(
+                    lo, hi, rom_path, frame_skip, hold_frames, reset_state,
+                    obs_res, obs_ram, self.wram_stride, dict(archive_kwargs),
+                    self.goexplore, self._shm_names, n, self.obs_dim,
+                    self.key_len, core,
+                ),
+                daemon=True,
+            )
+            p.start()
+            self._procs.append(p)
+            wi += 1
+        self.n_workers = len(self._procs)
+        self._closed = False
+
+    # ------------------------------------------------------------------ pacing
+    def set_pace(self, realtime: bool) -> None:
+        """Realtime -> workers sleep-wait between polls; max -> nap-spin."""
+        self._paced = bool(realtime)
+        self._ctl[2] = 1 if realtime else 0
+
+    # ------------------------------------------------------------------ rounds
+    def _release(self, op: int, target: int = 0) -> None:
+        self._round += 1
+        self._ctl[1] = op
+        self._ctl[3] = target
+        self._ctl[0] = self._round  # release LAST
+
+    def _await_acks(self) -> None:
+        acks = self._ctl[4:4 + self.n_envs]
+        target = self._round
+        i = 0
+        while not bool((acks >= target).all()):
+            time.sleep(1e-3 if self._paced else 5e-5)
+            i += 1
+            if i % 2000 == 0:
+                self.check_alive()
+
+    def check_alive(self) -> None:
+        if any(not p.is_alive() for p in self._procs):
+            raise RuntimeError(
+                "AsyncFleet worker died mid-wave; aborting (see stderr)"
+            )
+
+    # ------------------------------------------------------------------ control
+    def reset_all_begin(self, restore: dict[int, bytes] | None = None) -> None:
+        """Ship restore blobs + release the reset round WITHOUT waiting."""
+        self.arr["res_flag"][:] = 0
+        if restore and self.goexplore:
+            for idx, blob in restore.items():
+                b = blob[:_MAX_STATE]
+                self.arr["res_state"][idx, : len(b)] = np.frombuffer(
+                    b, dtype=np.uint8
+                )
+                self.arr["res_len"][idx] = len(b)
+                self.arr["res_flag"][idx] = 1
+        # No worker reads act_seq during a reset round; park every env before
+        # the wave so nothing steps until the parent issues its first action.
+        self.arr["act_seq"][:] = -1
+        self.arr["cap_flag"][:] = 0
+        self.arr["cap_done"][:] = 0
+        self._release(_OP_RESET)
+
+    def reset_all_end(self) -> np.ndarray:
+        self._await_acks()
+        return self.arr["obs"].copy()
+
+    def reset_all(self, restore: dict[int, bytes] | None = None) -> np.ndarray:
+        self.reset_all_begin(restore)
+        return self.reset_all_end()
+
+    def begin_wave(self, n_active: int, target_steps: int) -> None:
+        """Release the free-run round: envs ``[0:n_active]`` will each run
+        ``target_steps`` steps; any tail envs are parked as already-done."""
+        if n_active < self.n_envs:
+            # Workers are idle between rounds, so parking the unused tail by
+            # advancing their obs_seq to the target is race-free here.
+            self.arr["obs_seq"][n_active:] = target_steps
+        self._release(_OP_RUN, target=target_steps)
+
+    def end_wave(self) -> None:
+        """Wait for every worker to ack wave completion."""
+        self._await_acks()
+
+    @property
+    def screens(self) -> np.ndarray:
+        """Live view of the current per-env raw screens (for the live swarm)."""
+        return self.arr["screens"]
+
+    def key_bytes(self, i: int) -> bytes:
+        return self.arr["keys"][i].tobytes()
+
+    # ------------------------------------------------------------------ shutdown
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._release(_OP_SHUTDOWN)
+        except Exception:
+            pass
+        for p in self._procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=5)
+        for shm in self._blocks.values():
+            try:
+                shm.close()
+                shm.unlink()
+            except Exception:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 def _archive_key_len(archive_kwargs: dict, wram_stride: int) -> int:
     """Exact byte length of a compact cell key for the given archive geometry."""
     from pokeio.reward.archive import NoveltyArchive
@@ -881,4 +1267,4 @@ def _archive_key_len(archive_kwargs: dict, wram_stride: int) -> int:
     return len(a.cell_key_compact(dummy_screen, dummy_w))
 
 
-__all__ = ["VecFleet", "BarrierFleet", "ObsEncoder", "NUMA_NODES"]
+__all__ = ["VecFleet", "BarrierFleet", "AsyncFleet", "ObsEncoder", "NUMA_NODES"]
