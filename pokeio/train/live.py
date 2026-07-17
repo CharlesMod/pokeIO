@@ -309,7 +309,9 @@ def build_net_view(genome) -> tuple[list[dict], list[dict], dict[int, int], set[
 # champion showcase env
 # --------------------------------------------------------------------------
 class ChampionShowcase:
-    """A dedicated env that continuously plays the best-genome-so-far."""
+    """A dedicated env replaying the best-genome-so-far from newgame."""
+
+    STUCK_STEPS = 40  # identical frames before the run restarts (fixed point)
 
     def __init__(
         self,
@@ -344,6 +346,8 @@ class ChampionShowcase:
         self.obs_vis: np.ndarray | None = None
         self.last_action = 0
         self.last_probs: list[float] = [0.0] * N_OUT
+        self._still_sig: bytes | None = None
+        self._still_n = 0
         self._act: dict[str, float] = {}
         self._genes: dict = {"nodes": [], "conns": []}
 
@@ -357,11 +361,19 @@ class ChampionShowcase:
         )
         self.cp = pop.compile(self.device)
         self._prepare_net()
-        # Reset only the first time so the showcase plays continuously afterwards.
-        if self.screen is None:
-            self.screen = self.env.reset(self.reset_state)
-            self.wram = self.env.raw_wram()
-            self.obs_vis = self._encode_vis(self.screen, self.wram)
+        # Every new champion replays from the newgame state (matches the cage
+        # label "replays from newgame"). A deterministic argmax policy in a
+        # deterministic env converges to a fixed point (walking into furniture)
+        # within seconds, so "continuous play" just freezes the cage — each
+        # install is a fresh honest attempt instead.
+        self._reset_run()
+
+    def _reset_run(self) -> None:
+        self.screen = self.env.reset(self.reset_state)
+        self.wram = self.env.raw_wram()
+        self.obs_vis = self._encode_vis(self.screen, self.wram)
+        self._still_sig = None
+        self._still_n = 0
 
     def _encode_vis(self, screen, wram) -> np.ndarray:
         res = self.encoder.res
@@ -391,6 +403,20 @@ class ChampionShowcase:
             self.last_action = int(out.argmax().item())
             self.screen, self.wram, _done, _info = self.env.step(self.last_action)
         self.last_probs = [round(float(v), 4) for v in out.tolist()]
+
+        # Fixed-point detector: a deterministic policy that wedges itself into
+        # a wall produces pixel-identical frames forever. After STUCK_STEPS
+        # unchanged frames, restart the run from newgame so the cage stays
+        # alive (~16 s at realtime pace, ~7 s at max).
+        sig = self.screen[::8, ::8].tobytes() if self.screen is not None else None
+        if sig is not None and sig == self._still_sig:
+            self._still_n += 1
+            if self._still_n >= self.STUCK_STEPS:
+                self._reset_run()
+                return
+        else:
+            self._still_sig = sig
+            self._still_n = 0
 
         # capture per-node activations from the LAST forward (in slot space)
         vec = act_state[0, 0].detach().to("cpu").numpy()

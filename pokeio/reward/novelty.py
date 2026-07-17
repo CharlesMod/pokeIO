@@ -60,6 +60,13 @@ class WaveNovelty:
         # cells this player has already been credited for this episode (all modes
         # give distinct-cell credit, so we must not double-count within a genome).
         self._credited: list[set[bytes]] = [set() for _ in range(n_players)]
+        # The first cell a player reports is its SPAWN state (the fixed reset or
+        # a Go-Explore frontier restore). It is recorded but never credited:
+        # credit is for cells an agent REACHES, not the one it was handed —
+        # otherwise a do-nothing genome restored into a rare frontier cell
+        # collects near-full rarity credit for standing still (and such couch
+        # potatoes were literally winning championships).
+        self._spawn_seen: list[bool] = [False] * n_players
         # the most recent cell key / novelty flag per player (used by go-explore
         # to decide when to capture a restorable state).
         self.last_key: list[bytes | None] = [None] * n_players
@@ -75,6 +82,12 @@ class WaveNovelty:
         prior_visits = self.archive.visit(key)  # visits before this one
         self.last_key[player_idx] = key
         self.last_new[player_idx] = globally_new
+
+        if not self._spawn_seen[player_idx]:
+            # Spawn cell: archive it, never credit it (see __init__).
+            self._spawn_seen[player_idx] = True
+            self._credited[player_idx].add(key)
+            return False
 
         if self.mode == "global":
             if globally_new:
@@ -117,6 +130,12 @@ class WaveNovelty:
         """
         self.last_key[player_idx] = key
         self.last_new[player_idx] = globally_new
+
+        if not self._spawn_seen[player_idx]:
+            # Spawn cell: archive it, never credit it (see __init__).
+            self._spawn_seen[player_idx] = True
+            self._credited[player_idx].add(key)
+            return False
 
         if self.mode == "global":
             if globally_new:
