@@ -1785,7 +1785,12 @@ async function poll(){
       if($('s-spec'))$('s-spec').textContent=last.n_species;
       if($('s-fps'))$('s-fps').innerHTML=(last.throughput_sps/1000).toFixed(1)+'<small> k steps/s</small>';
       if($('cells'))$('cells').textContent=fmt(last.archive_cells);
-      if($('frontier'))$('frontier').textContent='+'+(last.archive_delta||0);
+      // NOTE: "Frontier this gen" is owned solely by the live poll (gen_delta,
+      // the RUNNING count of the current gen). Do NOT also write last.archive_delta
+      // here — that's the PREVIOUS gen's final total, and the two pollers
+      // (150ms live vs 1.5s telemetry) fighting over one tile made it flick
+      // up to ~10k and back every 1.5s. The completed-gen delta is shown in the
+      // event log and champ-stats instead.
       if($('fit-r'))$('fit-r').textContent='best '+fmt(last.fitness_best)+' ▲';
       if(last.wall_time!=null&&$('s-clock')){
         const s=Math.max(0,Math.round(last.wall_time)),hh=(s/3600|0),mm=(s%3600/60|0),ss=s%60;
