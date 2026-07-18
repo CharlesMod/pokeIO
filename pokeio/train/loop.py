@@ -3207,6 +3207,20 @@ def fast_reproduce(
     return new[:pop_size]
 
 
+def _stop_requested(run_dir) -> bool:
+    """True if the dashboard requested a graceful stop (``runs/<id>/stop.json``,
+    written by ``/api/stop`` / the wall STOP button). Consumes the file so a later
+    ``--resume`` doesn't immediately re-stop."""
+    p = Path(run_dir) / "stop.json"
+    if not p.exists():
+        return False
+    try:
+        p.unlink()  # consume: a resumed run should start, not re-stop
+    except OSError:
+        pass
+    return True
+
+
 # --------------------------------------------------------------------------
 # training loop
 # --------------------------------------------------------------------------
@@ -4469,14 +4483,19 @@ def train(
                 )
             _bt = _phase("reproduce", _bt)
 
-            # ---- checkpoint (survive power loss) --------------------------
+            # ---- checkpoint (survive power loss) + graceful stop ----------
             # After reproduction: `genomes` is the NEXT population and the
             # archives are quiescent (no wave mutating them), so a synchronous
             # snapshot here is race-free. gen+1 = the generation to resume at.
+            # A dashboard STOP (/api/stop -> runs/<id>/stop.json) forces a
+            # checkpoint here regardless of cadence, then breaks (below) to tear
+            # the fleet down — freeing worker procs + inference VRAM.
+            stop_now = _stop_requested(run_dir)
             if (
-                checkpoint_every > 0
-                and gen < gens - 1
-                and (gen + 1) % checkpoint_every == 0
+                (checkpoint_every > 0
+                 and gen < gens - 1
+                 and (gen + 1) % checkpoint_every == 0)
+                or stop_now
             ):
                 # Retina mode: persist the learner + optimizer + the currently
                 # frozen inference snapshot so a resumed run continues the SAME
@@ -4525,6 +4544,14 @@ def train(
                 f"(bound_calls={prof.get('spec_fit_bound_calls', 0)})",
                 flush=True,
             )
+
+            if stop_now:
+                print(
+                    f"[stop] stop.json requested — checkpointed gen {gen + 1}; "
+                    f"tearing down the fleet (freeing workers + VRAM) and exiting.",
+                    flush=True,
+                )
+                break
 
     if streamer is not None:
         streamer.close()
