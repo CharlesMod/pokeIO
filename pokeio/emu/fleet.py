@@ -693,6 +693,11 @@ class FovealEncoder:
             # for spreading a per-region invalidation over the covered buffer cells.
             self._g2m_row = np.minimum((np.arange(M) * g) // M, g - 1)
             self._g2m_col = np.minimum((np.arange(M) * g) // M, g - 1)
+            # Same G->M upsample as ONE flat (M*M,) gather index into a C-order
+            # (G,G) array, so ``sal[g2m_row][:, g2m_col]`` (two fancy indexes) is
+            # one ``np.take(...).reshape(M,M)`` (bit-identical, fewer/cheaper ops).
+            self._g2m_flat = (self._g2m_row[:, None] * g
+                              + self._g2m_col[None, :]).ravel()
 
         # Reuse the EXACT per-frame shade ranking used by the rest of the
         # pipeline (ObsBuilder.normalize_shades) so grayscale is consistent.
@@ -714,6 +719,10 @@ class FovealEncoder:
         if self.reflex_gaze:
             self._reflex_tx = np.zeros(self.n_envs, np.float64)
             self._reflex_ty = np.zeros(self.n_envs, np.float64)
+            # Centroid index vector for the soft-argmax (constant; == np.arange(P)
+            # where P = M with foveal memory on, else G).  Precomputed so the hot
+            # path skips a per-encode np.arange.
+            self._reflex_idx = np.arange(self.M if self.foveal_memory else self.G)
         # Trans-saccadic memory per-env state (§1a): the persistent scene buffer,
         # its staleness map, and the per-region divergence EMA that self-calibrates
         # invalidation.  PER-ENV is load-bearing for engine-parity — each env's
@@ -791,10 +800,12 @@ class FovealEncoder:
         self._last_dx[i] = float(dx)
         self._last_dy[i] = float(dy)
         if int(self._nstep[i]) % self.every_k == 0:
-            self._gx[i] = float(np.clip(
-                self._gx[i] + self.gain * np.tanh(float(dx)), self._gx_lo, self._gx_hi))
-            self._gy[i] = float(np.clip(
-                self._gy[i] + self.gain * np.tanh(float(dy)), self._gy_lo, self._gy_hi))
+            # Scalar clamp via builtin min/max (== np.clip for finite scalars, the
+            # gain*tanh term is bounded): ~6x cheaper than the np.clip wrapper.
+            nx = self._gx[i] + self.gain * np.tanh(float(dx))
+            self._gx[i] = min(max(nx, self._gx_lo), self._gx_hi)
+            ny = self._gy[i] + self.gain * np.tanh(float(dy))
+            self._gy[i] = min(max(ny, self._gy_lo), self._gy_hi)
         self._nstep[i] += 1
         return float(self._gy[i]), float(self._gx[i])
 
@@ -863,8 +874,9 @@ class FovealEncoder:
         sal = np.abs(motion.astype(np.float64) - 0.5)            # (G,G) motion mag
         if self.foveal_memory:
             # upsample motion G->M (nearest, reuse the §1a mapping) so it aligns
-            # with the M x M staleness map, then weight by staleness.
-            sal = sal[self._g2m_row][:, self._g2m_col] * self._stale[i]  # (M,M)
+            # with the M x M staleness map, then weight by staleness.  One flat
+            # np.take gather == the old sal[g2m_row][:, g2m_col] (bit-identical).
+            sal = np.take(sal, self._g2m_flat).reshape(self.M, self.M) * self._stale[i]
             P = self.M
         else:
             P = self.G
@@ -876,7 +888,7 @@ class FovealEncoder:
         w = np.exp(self.reflex_beta * (flat / smax - 1.0))
         w /= w.sum()
         wm = w.reshape(P, P)
-        idx = np.arange(P)
+        idx = self._reflex_idx                                   # == np.arange(P)
         r_star = float((wm.sum(axis=1) * idx).sum())             # row centroid
         c_star = float((wm.sum(axis=0) * idx).sum())             # col centroid
         tgt_x = (c_star + 0.5) / P * 2.0 - 1.0
@@ -900,16 +912,21 @@ class FovealEncoder:
         mu = self._chg_mu[i]
         var = self._chg_var[i]
         steps = int(self._mem_steps[i])
+        dev = c64 - mu  # deviation from the running mean: reused by fire + the EMA
         # warm: enough per-env history AND a live per-region variance to scale by.
-        warm = steps >= self.mem_stale_warmup
-        fire = warm & (var > 0.0) & ((c64 - mu) > self.mem_stale_z * np.sqrt(var))
+        # Short-circuit the sqrt+compare during warm-up (the pre-warm mask is all-
+        # False, exactly what ``warm & ...`` produced).
+        if steps >= self.mem_stale_warmup:
+            fire = (var > 0.0) & (dev > self.mem_stale_z * np.sqrt(var))
+        else:
+            fire = np.zeros_like(var, dtype=bool)
         d = self.mem_ema_decay
         if steps == 0:  # seed μ with the first sample (baseline never lags up from 0)
             mu_new = c64.copy()
             var_new = np.zeros_like(var)
         else:
-            mu_new = mu + (1.0 - d) * (c64 - mu)
-            var_new = d * var + (1.0 - d) * (c64 - mu) * (c64 - mu_new)
+            mu_new = mu + (1.0 - d) * dev
+            var_new = d * var + (1.0 - d) * dev * (c64 - mu_new)
         self._chg_mu[i] = mu_new
         self._chg_var[i] = var_new
         self._mem_steps[i] = steps + 1
@@ -949,15 +966,18 @@ class FovealEncoder:
         # 3. age every cell (steps-since-refresh confidence decay, horizon-
         #    normalized like proprio's step_frac; read live so the async
         #    episode_steps override tracks — NOT a hand-tuned magnitude).
-        self._stale[i] += 1.0 / float(self.episode_steps)
-        np.clip(self._stale[i], 0.0, 1.0, out=self._stale[i])
+        st = self._stale[i]
+        st += 1.0 / float(self.episode_steps)
+        st.clip(0.0, 1.0, out=st)  # method form: skips the np.clip dispatch wrapper
         # 4. invalidate fired regions: decay the buffer toward the live low-res
         #    periphery (fall back to what the periphery now shows), mark stale, and
         #    re-reference (we've accepted the new low-res state; watch for the NEXT
         #    change from here).
         if fire.any():
-            fire_m = fire[self._g2m_row][:, self._g2m_col]        # (M,M) bool
-            live_m = periph[self._g2m_row][:, self._g2m_col]      # (M,M) live low-res
+            # G->M nearest upsample via one flat np.take each (== the old
+            # fire[g2m_row][:, g2m_col] double fancy-index, bit-identical).
+            fire_m = np.take(fire, self._g2m_flat).reshape(self.M, self.M)  # (M,M) bool
+            live_m = np.take(periph, self._g2m_flat).reshape(self.M, self.M)  # live low-res
             self._mem[i][fire_m] = live_m[fire_m].astype(np.float32)
             self._stale[i][fire_m] = 1.0
             self._periph_ref[i][fire] = periph[fire]
@@ -1114,8 +1134,9 @@ class FovealEncoder:
         i = int(env_idx)
         if self.mode == "retina":
             return self._encode_retina(i, screen, wram, button=button, taps=taps)
-        norm = self._shade.normalize_shades(screen)          # (H,W) float32 [0,1]
-        normd = norm.astype(np.float64)
+        # Normalize straight to float64 (the dtype the resample matmuls + crop
+        # consume): one np.take gather instead of a float32 build + float64 copy.
+        normd = self._shade.normalize_shades_f64(screen)     # (H,W) float64 [0,1]
 
         periph = (self._prow @ normd @ self._pcol).astype(np.float32)   # (G,G)
         crop = self._crop(normd, self._gy[i], self._gx[i])             # (F,F)

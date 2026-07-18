@@ -98,6 +98,36 @@ class ObsBuilder:
         self._prev_coarse = None
 
     # -------------------------------------------------------------- normalize
+    def _uint8_shade_lut(self, g: np.ndarray) -> np.ndarray:
+        """(256,) float32 byte->level table for a uint8 frame ``g``.
+
+        Expresses the per-frame shade ranking as a lookup table so BOTH the
+        float32 (:meth:`normalize_shades`) and float64
+        (:meth:`normalize_shades_f64`) gathers share ONE construction and use the
+        fast ``np.take`` gather. All three uint8 sub-cases collapse to a 256-entry
+        table, bit-identical to the old inline paths:
+
+          * ``1 < n <= shades`` -> rank map onto evenly spaced levels;
+          * ``n == 1``          -> all-zero (single flat shade -> darkest);
+          * otherwise           -> plain byte/255 (>shades distinct, e.g. GBC).
+        """
+        # Presence histogram over the 256 possible byte values (counting sort, no
+        # comparison sort). present[v] == True iff v occurs in g.
+        present = np.bincount(g.ravel(), minlength=256) > 0
+        n = int(present.sum())
+        if 1 < n <= self.shades:
+            # rank (0-based) of a present value v == (#present values <= v) - 1.
+            ranks = np.cumsum(present) - 1  # length 256; valid for present v
+            # Identical construction to the old searchsorted path.
+            levels = (np.arange(n, dtype=np.float32) / (n - 1)).astype(np.float32)
+            return levels[ranks.clip(0, n - 1)]  # byte -> normalized level (method clip)
+        if n == 1:
+            # A single flat shade is ambiguous; treat it as darkest.
+            return np.zeros(256, dtype=np.float32)
+        # byte/255 as a table; ``arange(f32)/255.0`` matches ``g.astype(f32)/255``
+        # elementwise (both a single float32 division per byte value).
+        return np.arange(256, dtype=np.float32) / 255.0
+
     def normalize_shades(self, screen_gray: np.ndarray) -> np.ndarray:
         """Map a uint8 grayscale frame to float32 [0,1] robustly.
 
@@ -108,26 +138,12 @@ class ObsBuilder:
         palette LUT cannot reproduce it. Instead of ``np.unique`` (a full
         O(n log n) sort every frame) we detect the present values with an O(n)
         ``bincount`` presence histogram and build a 256-entry byte->level LUT
-        from the *same* ``levels`` array the old code used, so the output is
-        bit-for-bit identical while avoiding the sort.
+        from the *same* ``levels`` array the old code used, then gather with
+        ``np.take`` (~2x faster than fancy ``lut[g]``, bit-for-bit identical).
         """
         g = np.asarray(screen_gray)
         if g.dtype == np.uint8:
-            # Presence histogram over the 256 possible byte values (counting
-            # sort, no comparison sort). present[v] == True iff v occurs in g.
-            present = np.bincount(g.ravel(), minlength=256) > 0
-            n = int(present.sum())
-            if 1 < n <= self.shades:
-                # rank (0-based) of a present value v == (#present values <= v) - 1.
-                ranks = np.cumsum(present) - 1  # length 256; valid for present v
-                # Identical construction to the old searchsorted path.
-                levels = (np.arange(n, dtype=np.float32) / (n - 1)).astype(np.float32)
-                lut = levels[np.clip(ranks, 0, n - 1)]  # byte -> normalized level
-                return lut[g]
-            if n == 1:
-                # A single flat shade is ambiguous; treat it as darkest.
-                return np.zeros(g.shape, dtype=np.float32)
-            return g.astype(np.float32) / 255.0
+            return np.take(self._uint8_shade_lut(g), g)
 
         # Generic fallback for non-uint8 inputs (e.g. a GBC/color buffer).
         uniq = np.unique(g)
@@ -140,6 +156,19 @@ class ObsBuilder:
             # A single flat shade is ambiguous; treat it as darkest.
             return np.zeros(g.shape, dtype=np.float32)
         return (g.astype(np.float32) / 255.0)
+
+    def normalize_shades_f64(self, screen_gray: np.ndarray) -> np.ndarray:
+        """:meth:`normalize_shades` in float64 directly (encoder hot path).
+
+        Byte-identical to ``normalize_shades(screen_gray).astype(np.float64)`` but
+        skips the separate float32 build + float64 copy: the byte->level table is
+        promoted to float64 (a lossless f32->f64 widen) and gathered ONCE with
+        ``np.take`` straight into the float64 the resample matmuls consume.
+        """
+        g = np.asarray(screen_gray)
+        if g.dtype == np.uint8:
+            return np.take(self._uint8_shade_lut(g).astype(np.float64), g)
+        return self.normalize_shades(g).astype(np.float64)
 
     # -------------------------------------------------------------- sub-sheets
     def _coarse(self, norm: np.ndarray) -> np.ndarray:
