@@ -259,6 +259,7 @@ class LlamaClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         use_cache: bool = True,
+        images: list | None = None,
     ) -> Any:
         """Complete ``prompt``.
 
@@ -266,11 +267,16 @@ class LlamaClient:
         when ``schema`` is given. On schema failure the model is re-prompted with
         a repair instruction up to ``schema_retries`` times before raising
         :class:`SchemaError`.
+
+        ``images`` is an OPTIONAL list of base64 image parts (data URLs or raw
+        base64 strings) for a future multimodal card0 server (spec §2a). It is sent
+        only on the chat API; the text-only path is byte-unchanged when ``images``
+        is omitted (the cache key and wire payload are identical to today).
         """
         temperature = self.temperature if temperature is None else temperature
         max_tokens = self.max_tokens if max_tokens is None else max_tokens
 
-        key = self._cache_key(prompt, schema, system, temperature, max_tokens)
+        key = self._cache_key(prompt, schema, system, temperature, max_tokens, images)
         # Schema replies can be plausible-but-wrong (validated once, still not
         # what we wanted); gate their caching behind cache_schema_replies so a
         # suspect reply can be forced to regenerate without touching free-text.
@@ -281,7 +287,7 @@ class LlamaClient:
                 return cached["result"]
 
         if schema is None:
-            text = self._request(prompt, system, temperature, max_tokens)
+            text = self._request(prompt, system, temperature, max_tokens, images)
             if cache_ok:
                 self._cache_put(key, {"result": text, "raw": text})
             return text
@@ -295,7 +301,7 @@ class LlamaClient:
         last_err: Exception | None = None
         cur_prompt = prompt + repair_hint
         for attempt in range(self.schema_retries + 1):
-            text = self._request(cur_prompt, system, temperature, max_tokens)
+            text = self._request(cur_prompt, system, temperature, max_tokens, images)
             try:
                 value = extract_json(text)
                 validate_schema(value, schema)
@@ -328,7 +334,8 @@ class LlamaClient:
 
     # -- transport --------------------------------------------------------- #
     def _request(
-        self, prompt: str, system: str | None, temperature: float, max_tokens: int
+        self, prompt: str, system: str | None, temperature: float, max_tokens: int,
+        images: list | None = None,
     ) -> str:
         if self.api == "completion":
             url = f"{self.base_url}/completion"
@@ -343,7 +350,17 @@ class LlamaClient:
             messages = []
             if system:
                 messages.append({"role": "system", "content": system})
-            messages.append({"role": "user", "content": prompt})
+            # Text-only path (images is None) is byte-identical to before: a plain
+            # string content. With images, use the OpenAI multimodal content-parts
+            # shape so a future multimodal server can consume the rendered clips.
+            if images:
+                content: Any = [{"type": "text", "text": prompt}]
+                for img in images:
+                    url_val = img if str(img).startswith("data:") else f"data:image/png;base64,{img}"
+                    content.append({"type": "image_url", "image_url": {"url": url_val}})
+                messages.append({"role": "user", "content": content})
+            else:
+                messages.append({"role": "user", "content": prompt})
             payload = {
                 "model": self.model,
                 "messages": messages,
@@ -413,24 +430,29 @@ class LlamaClient:
         system: str | None,
         temperature: float,
         max_tokens: int,
+        images: list | None = None,
     ) -> str:
-        blob = orjson.dumps(
-            {
-                # cache_version + served-model fingerprint invalidate stale
-                # replies when the contract or the served weights change.
-                "cache_version": CACHE_VERSION,
-                "fingerprint": self.served_fingerprint or self.model,
-                "base_url": self.base_url,
-                "model": self.model,
-                "api": self.api,
-                "prompt": prompt,
-                "system": system,
-                "schema": schema,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            },
-            option=orjson.OPT_SORT_KEYS,
-        )
+        blob_dict = {
+            # cache_version + served-model fingerprint invalidate stale
+            # replies when the contract or the served weights change.
+            "cache_version": CACHE_VERSION,
+            "fingerprint": self.served_fingerprint or self.model,
+            "base_url": self.base_url,
+            "model": self.model,
+            "api": self.api,
+            "prompt": prompt,
+            "system": system,
+            "schema": schema,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        # Only mix images into the key when present, so text-only keys are
+        # byte-identical to pre-multimodal ones (no cache invalidation).
+        if images:
+            blob_dict["images"] = [
+                hashlib.sha256(str(img).encode()).hexdigest() for img in images
+            ]
+        blob = orjson.dumps(blob_dict, option=orjson.OPT_SORT_KEYS)
         return hashlib.sha256(blob).hexdigest()
 
     def _cache_path(self, key: str) -> Path:

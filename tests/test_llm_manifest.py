@@ -206,7 +206,7 @@ def test_schema_reply_cache_gate(tmp_path):
     schema = {"type": "object"}
     c = LlamaClient(cache_dir=tmp_path, cache_schema_replies=False)
     # Offline: shortcut the transport with a fixed reply (no server).
-    c._request = lambda prompt, system, temperature, max_tokens: '{"a": 1}'
+    c._request = lambda prompt, system, temperature, max_tokens, images=None: '{"a": 1}'
 
     # gate OFF: schema reply is NOT cached
     assert c.complete("p", schema=schema) == {"a": 1}
@@ -218,7 +218,7 @@ def test_schema_reply_cache_gate(tmp_path):
     assert len(list(tmp_path.glob("*.json"))) == 1
 
     # now served from cache: a changed transport reply is ignored
-    c._request = lambda prompt, system, temperature, max_tokens: '{"z": 9}'
+    c._request = lambda prompt, system, temperature, max_tokens, images=None: '{"z": 9}'
     assert c.complete("p", schema=schema) == {"a": 1}
 
 

@@ -36,7 +36,12 @@ __all__ = [
     "fallback_manifest",
     "generate_manifest",
     "ram_addresses_from_manifest",
+    "eventful_frames",
+    "milestone_ordering_digest",
 ]
+
+# WRAM column 0 maps to this GB address (kept in sync with reward.miner.WRAM_BASE).
+WRAM_BASE = 0xC000
 
 
 # JSON schema handed to LlamaClient.complete so the model returns the right
@@ -317,3 +322,56 @@ def ram_addresses_from_manifest(manifest: Any) -> list[int]:
             _add(ram.get("addr"))
 
     return out
+
+
+# --------------------------------------------------------------------------- #
+# [MF] consume helpers: eventful frames + anonymized milestone-ordering digest
+# --------------------------------------------------------------------------- #
+def eventful_frames(manifest: Any, wram_trace: Any) -> list[int]:
+    """Frame indices where a manifest-declared counter moved (offline; spec §6).
+
+    Reuses :func:`ram_addresses_from_manifest` to route reads through the manifest
+    (no hardcoded addresses), then returns the ``t`` at which any declared WRAM
+    counter changed between snapshot ``t-1`` and ``t``. ``wram_trace`` is a ``(T,
+    N)`` array of raw WRAM snapshots (column ``i`` -> ``0xC000 + i``), matching the
+    miner's input contract. Powers the active-learning "eventful frame" trigger in
+    :mod:`pokeio.reward.pairs` (spec §2b.5). Game-specific labels/addresses stay
+    OFFLINE — they only select which frames to sample, never enter Φ.
+    """
+    import numpy as np  # local: keep the module import-light
+
+    addrs = ram_addresses_from_manifest(manifest)
+    trace = np.asarray(wram_trace)
+    if trace.ndim != 2 or trace.shape[0] < 2 or not addrs:
+        return []
+    cols = [a - WRAM_BASE for a in addrs if 0 <= (a - WRAM_BASE) < trace.shape[1]]
+    if not cols:
+        return []
+    sub = trace[:, cols].astype(np.int64)
+    moved = np.any(np.diff(sub, axis=0) != 0, axis=1)  # (T-1,)
+    return [int(t + 1) for t in np.nonzero(moved)[0]]  # index where the move landed
+
+
+def milestone_ordering_digest(manifest: Any) -> dict:
+    """Anonymized milestone-ordering digest of a manifest (graft, MF-MM; spec §2a).
+
+    Each progress dimension becomes an ANONYMIZED node — ``counter_0``,
+    ``counter_1``, ... in manifest order — carrying only its direction and its
+    fraction along the discovered DAG. The game name, real labels, and addresses
+    are STRIPPED, so the digest is a game-agnostic ordering substrate for the
+    text-only prompt and the kNN-anchor order fractions. Never a model input.
+    """
+    dims = getattr(manifest, "progress_dimensions", None) or []
+    n = len(dims)
+    nodes = []
+    for i, pd in enumerate(dims):
+        d = getattr(pd, "dir", None)
+        if d is None and isinstance(pd, dict):
+            d = pd.get("dir", "up")
+        nodes.append({
+            "id": f"counter_{i}",
+            "dir": str(d or "up"),
+            "order": i,
+            "order_frac": (i + 1) / n if n else 0.0,
+        })
+    return {"n": n, "nodes": nodes}

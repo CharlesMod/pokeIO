@@ -286,6 +286,38 @@ class RetinaConfig:
 
 
 @dataclass
+class PrefConfig:
+    """[MF] Frozen LLM preference-potential Φ (docs/specs/manifest-reward.md §3/§5/§10).
+
+    A Motif-style Bradley-Terry potential over the pixel-latent slice, distilled
+    offline from LLM pairwise progress-preferences and entering selection as
+    potential-based shaping. ``enable`` is the single OFF switch: with it False the
+    loop is byte-identical to legacy (no pref term, no annotation worker). Every
+    other field is a CADENCE / BUDGET knob — none is a reward magnitude. The one
+    weight, ``w_pref_ref``, inherits the loop's existing add-on regime (defaults to
+    ``reward.w_resp``); the EFFECTIVE weight is ``c_acc * w_pref_ref`` where
+    ``c_acc`` is the model's own dimensionless held-out reliability (§5), so a
+    chance-level Φ self-zeroes and no new operating magnitude is introduced.
+    """
+
+    enable: bool = False        # single OFF switch; False => byte-identical legacy
+    pref_swap_gens: int = 10     # freeze-and-swap cadence (mirrors retina.swap_gens)
+    pref_train_steps: int = 300  # BT distillation grad steps per swap
+    pref_pairs_per_round: int = 64   # LLM pair budget enqueued per generation (cap)
+    pref_uniform_frac: float = 0.25  # reserve fraction drawn uniformly (active-learning guard)
+    pref_gamma: float = 0.99     # potential-shaping discount (derives from episode horizon)
+    pref_buf_cap: int = 4096     # max stored clips/labels before oldest are evicted
+    pref_val_frac: float = 0.2   # held-out split fraction for the accuracy gate
+    pref_subsample_k: int = 8    # frames per clip (K≈8, ~1s of progress transition)
+    pref_infer_card: int = 1     # card hosting the frozen PrefScorer (card 0 = LLM)
+    # w_pref_ref is NOT a new hand-tuned magnitude: it inherits the loop's existing
+    # policy add-on regime (defaults to reward.w_resp = 0.1). At full reliability the
+    # pref term carries the weight a trusted responsiveness term does; muted when
+    # unreliable via c_acc. Keep this equal to reward.w_resp unless w_resp changes.
+    w_pref_ref: float = 0.1
+
+
+@dataclass
 class GoExploreConfig:
     """Go-Explore cell source (docs/specs/active-vision-spine.md §5)."""
 
@@ -319,6 +351,7 @@ class Config:
     reward: RewardConfig = field(default_factory=RewardConfig)
     ac: ACConfig = field(default_factory=ACConfig)
     retina: RetinaConfig = field(default_factory=RetinaConfig)
+    pref: PrefConfig = field(default_factory=PrefConfig)
     goexplore: GoExploreConfig = field(default_factory=GoExploreConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     run: RunConfig = field(default_factory=RunConfig)
@@ -379,6 +412,7 @@ __all__ = [
     "RewardConfig",
     "ACConfig",
     "RetinaConfig",
+    "PrefConfig",
     "GoExploreConfig",
     "LLMConfig",
     "RunConfig",
