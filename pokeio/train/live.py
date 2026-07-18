@@ -111,20 +111,28 @@ def downscale_swarm(screen: np.ndarray) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
-# active-vision obs decoding (foveal block layout — spec §2.1)
+# active-vision obs decoding (foveal block layout — spec §2.1 / §1a)
 # --------------------------------------------------------------------------
-# A FovealEncoder obs vector is a contiguous [periph|fovea|motion|proprio|ram]
-# layout with G = periph_grid: periph [0:G^2], fovea [G^2:2G^2], motion
-# [2G^2:3G^2], proprio [3G^2:3G^2+14], ram trailing. These helpers pull the
-# optical views + gaze back out of a raw obs vector so the spectator can SEE
-# both the low-res periphery and the high-acuity fovea crop the agent looks at.
-# NOTE: these decoders assume the LEGACY uniform-grid layout (fovea_grid == G).
-# A sharp fovea (optical-frontend-v2 §2, fovea_grid > G) makes the fovea block
-# FG^2 wide, shifting the motion/proprio offsets — generalizing this decode to
-# read FG off the obs is the rendering increment (spec §8.7, task #12). Default
-# runs (fovea_grid=0 => FG=G) are byte-identical, so this stays correct for them.
+# A FovealEncoder obs vector is a contiguous
+#     periph(G^2) | fovea(FG^2) | motion(G^2) [| buffer(M^2) | staleness(M^2)] |
+#     proprio(14/16) | ram
+# layout (G = periph_grid, FG = fovea_grid, M = mem_grid).  With the LEGACY
+# uniform grid (fovea_grid 0 => FG==G, foveal_memory off) it collapses to
+# periph [0:G^2], fovea [G^2:2G^2], motion [2G^2:3G^2], proprio [3G^2:], which is
+# what :func:`_block2d` / :func:`_gaze_from_proprio` below decode.  A sharp fovea
+# (optical-frontend-v2 §2, FG>G) widens the fovea block and a trans-saccadic
+# memory run (§1a) inserts the buffer/staleness blocks, both of which shift every
+# later offset — so the GENERAL path is :func:`_optical_blocks` /
+# :func:`_gaze_from_obs`, which read the ENCODER'S OWN offsets (FG/M/o_proprio,
+# spec §8.7 task #12) instead of hardcoding G/3*G^2.  The legacy helpers are kept
+# as the byte-identity reference: for a legacy encoder the general decode returns
+# bit-for-bit the same blocks (verified in tests/test_live_v2_decode.py).
 def _block2d(vec, grid: int, block: str) -> np.ndarray:
-    """Extract a ``grid``x``grid`` optical block ('periph'|'fovea'|'motion')."""
+    """Extract a ``grid``x``grid`` optical block ('periph'|'fovea'|'motion').
+
+    LEGACY uniform-grid reference (all three blocks ``grid^2`` wide).  The general,
+    v2-aware decode is :func:`_optical_blocks` (reads the encoder's real offsets);
+    this stays correct for legacy runs and is the byte-identity anchor for it."""
     n = grid * grid
     off = {"periph": 0, "fovea": n, "motion": 2 * n}[block]
     a = np.asarray(vec[off : off + n], dtype=np.float32)
@@ -133,14 +141,56 @@ def _block2d(vec, grid: int, block: str) -> np.ndarray:
     return a.reshape(grid, grid)
 
 
+def _optical_blocks(vec, enc) -> dict:
+    """Decode the 2D optical blocks from a flat foveal obs using the ENCODER'S OWN
+    offsets — the v2-general decode (spec §8.7 / §2 / §1a).
+
+    Returns ``{"periph": (G,G), "fovea": (FG,FG), "motion": (G,G)}`` plus
+    ``"buffer"``/``"stale"`` (M,M) when ``enc.foveal_memory`` is on.  Reading FG/M
+    and the block offsets off the encoder (rather than the legacy uniform grid)
+    keeps a sharp fovea (FG>G) and the trans-saccadic memory blocks correctly
+    placed; for a legacy encoder (FG==G, memory off) the periph/fovea/motion
+    blocks are byte-identical to :func:`_block2d`.  Retina mode (no motion sheet)
+    keeps the pre-change uniform-grid crop so its rendering is unchanged."""
+    v = np.asarray(vec, dtype=np.float32)
+    if getattr(enc, "mode", "foveal") == "retina":
+        # retina obs (periph84|fovea84|proprio|ram): no motion/memory blocks, and
+        # the wall only shows a coarse GxG crop — keep the pre-change decode.
+        g = int(enc.G)
+        return {"periph": _block2d(v, g, "periph"), "fovea": _block2d(v, g, "fovea")}
+
+    def _sl(off: int, n: int, side: int) -> np.ndarray:
+        a = v[int(off) : int(off) + n]
+        if a.size < n:  # defensive: short/legacy vector -> pad
+            a = np.concatenate([a, np.zeros(n - a.size, np.float32)])
+        return a.reshape(side, side)
+
+    g, fg = int(enc.G), int(enc.FG)
+    out = {
+        "periph": _sl(enc._o_periph, g * g, g),
+        "fovea": _sl(enc._o_fovea, fg * fg, fg),
+        "motion": _sl(enc._o_motion, g * g, g),
+    }
+    if getattr(enc, "foveal_memory", False):
+        m = int(enc.M)
+        out["buffer"] = _sl(enc._o_buffer, m * m, m)   # persistent scene (§1a)
+        out["stale"] = _sl(enc._o_stale, m * m, m)     # 0 fresh .. 1 stale
+    return out
+
+
 def _b64_block(block2d) -> str:
-    """base64 grayscale of a [0,1] optical block (fovea/periphery/motion view)."""
+    """base64 grayscale of a [0,1] optical block (fovea/periphery/motion/buffer/
+    staleness view)."""
     g = np.clip(np.asarray(block2d, dtype=np.float32), 0.0, 1.0) * 255.0
     return b64_gray(g)
 
 
 def _gaze_from_proprio(vec, grid: int, screen_h: int, screen_w: int):
     """Recover the (gy, gx) screen-px fovea centre from a foveal obs vector.
+
+    LEGACY uniform-grid reference (proprio at 3*grid^2).  The general, v2-aware
+    recovery is :func:`_gaze_from_obs` (reads ``enc._o_proprio``); this stays the
+    byte-identity anchor for legacy runs.
 
     proprio[0]=gx*2/W-1, proprio[1]=gy*2/H-1 (spec §2.1), so the gaze a stored
     obs was cropped at is recoverable without the encoder that built it (used to
@@ -151,6 +201,37 @@ def _gaze_from_proprio(vec, grid: int, screen_h: int, screen_w: int):
     gx = (float(vec[off]) + 1.0) * 0.5 * screen_w
     gy = (float(vec[off + 1]) + 1.0) * 0.5 * screen_h
     return gy, gx
+
+
+def _gaze_from_obs(vec, enc):
+    """Recover the (gy, gx) screen-px fovea centre from a foveal obs using the
+    encoder's ACTUAL proprio offset — the v2-general gaze recovery.
+
+    proprio[0]=gx*2/W-1, proprio[1]=gy*2/H-1 (spec §2.1).  A sharp fovea / memory
+    run shifts proprio past the wider fovea and the memory blocks, so reading
+    ``enc._o_proprio`` (not the legacy 3*G^2, which would land inside the buffer)
+    is what keeps the recovered gaze correct.  Legacy (FG==G, memory off) =>
+    ``_o_proprio == 3*G^2``, matching :func:`_gaze_from_proprio` exactly."""
+    off = int(enc._o_proprio)
+    h, w = float(enc.H), float(enc.W)
+    if off + 1 >= len(vec):
+        return h / 2.0, w / 2.0
+    gx = (float(vec[off]) + 1.0) * 0.5 * w
+    gy = (float(vec[off + 1]) + 1.0) * 0.5 * h
+    return gy, gx
+
+
+def _reflex_from_obs(vec, enc):
+    """Recover the bottom-up reflex TARGET ``(tx, ty)`` in normalized [-1,1] screen
+    coords from ``proprio[14:16]`` (spec §4), or ``None`` when the run has no reflex
+    gaze.  For a stored fleet obs this is the only way back to the target (the
+    showcase reads it live via :meth:`FovealEncoder.reflex_target` instead)."""
+    if not getattr(enc, "reflex_gaze", False):
+        return None
+    off = int(enc._o_proprio) + 14
+    if off + 1 >= len(vec):
+        return None
+    return float(vec[off]), float(vec[off + 1])
 
 
 def _gaze_payload(gy, gx, screen_h, screen_w, fovea_px) -> dict:
@@ -172,6 +253,55 @@ def _gaze_payload(gy, gx, screen_h, screen_w, fovea_px) -> dict:
 def _saccade_payload(dx, dy) -> dict:
     """Raw (pre-tanh) saccade command out[9]/out[10]; update_gaze applies tanh."""
     return {"dx": round(float(dx), 4), "dy": round(float(dy), 4)}
+
+
+def _reflex_payload(tx, ty) -> dict | None:
+    """Reflex-target telemetry (spec §3/§4): the bottom-up gaze target (soft-argmax
+    of motion x staleness) as normalised [-1,1] coords + a [0,1] frame fraction, so
+    the wall can drop a marker where the reflex is pulling.  ``None`` (=> omitted)
+    when the run has no reflex gaze."""
+    if tx is None or ty is None:
+        return None
+    return {
+        "tx": round(float(tx), 4),
+        "ty": round(float(ty), 4),
+        "x01": round((float(tx) + 1.0) * 0.5, 4),
+        "y01": round((float(ty) + 1.0) * 0.5, 4),
+    }
+
+
+def _memplus(out: dict, enc, mem_res: int) -> None:
+    """Attach the trans-saccadic memory buffer + staleness map (§1a) and the reflex
+    target (§3/§4) to a champion/focus payload, read LIVE off the encoder's OWN
+    per-env state (the ``mem_buffer``/``mem_staleness``/``reflex_target`` accessors).
+    No-op when the run has neither, so legacy payloads are byte-unchanged.  For the
+    showcase (its private encoder tracks the last forward) this is the exact percept
+    the champion just acted on."""
+    if getattr(enc, "foveal_memory", False):
+        out["buffer_res"] = int(mem_res)
+        out["buffer_b64"] = _b64_block(enc.mem_buffer(0))    # accumulated scene
+        out["stale_b64"] = _b64_block(enc.mem_staleness(0))  # 0 fresh .. 1 stale
+    if getattr(enc, "reflex_gaze", False):
+        rp = _reflex_payload(*enc.reflex_target(0))
+        if rp is not None:
+            out["reflex"] = rp
+
+
+def _memplus_from_obs(out: dict, vec, enc, mem_res: int, blocks=None) -> None:
+    """Like :func:`_memplus` but decoded from a STORED flat obs — used for a fleet
+    focus agent, whose encoder state lives in its worker, not here.  Buffer/staleness
+    come from :func:`_optical_blocks`, the reflex target from :func:`_reflex_from_obs`."""
+    if blocks is None:
+        blocks = _optical_blocks(vec, enc)
+    if "buffer" in blocks:
+        out["buffer_res"] = int(mem_res)
+        out["buffer_b64"] = _b64_block(blocks["buffer"])
+        out["stale_b64"] = _b64_block(blocks["stale"])
+    rt = _reflex_from_obs(vec, enc)
+    if rt is not None:
+        rp = _reflex_payload(*rt)
+        if rp is not None:
+            out["reflex"] = rp
 
 
 def _split_head(out_np: np.ndarray):
@@ -493,6 +623,11 @@ class ChampionShowcase:
         self._reflex = ReflexGaze.maybe(self.encoder, 1)
         self._G = int(self.encoder.G)
         self._F = int(self.encoder.F)
+        # Sharp-fovea resample side (FG, spec §2) + trans-saccadic memory grid (M,
+        # §1a) — the block sides the rendering payload streams; FG==G / M unused on
+        # a legacy encoder (foveal_memory off), so legacy payloads are unchanged.
+        self._FG = int(self.encoder.FG)
+        self._M = int(self.encoder.M)
         # Explicit ram_addrs win; else route the UI taps through the manifest
         # (falling back to the quarantined Yellow table only when appropriate).
         if ram_addrs is not None:
@@ -595,12 +730,16 @@ class ChampionShowcase:
         self._state = None  # new episode → clear recurrent memory
 
     def _set_obs_views(self, obs_vec) -> None:
-        """Decode the periphery / fovea / motion optical views from a foveal obs."""
+        """Decode the periphery (GxG) / sharp fovea (FGxFG) / motion (GxG) optical
+        views from a foveal obs, using the private encoder's REAL offsets so a sharp
+        fovea (FG>G) / memory run is read correctly (spec §8.7).  The persistent
+        memory buffer + staleness are read live off the encoder accessors in
+        :meth:`payload` instead (they mirror this obs's blocks after ``encode``)."""
         self._last_obs = obs_vec
-        g = self._G
-        self.obs_vis = _block2d(obs_vec, g, "periph")
-        self.fovea_vis = _block2d(obs_vec, g, "fovea")
-        self.motion_vis = _block2d(obs_vec, g, "motion")
+        blocks = _optical_blocks(obs_vec, self.encoder)
+        self.obs_vis = blocks["periph"]
+        self.fovea_vis = blocks["fovea"]
+        self.motion_vis = blocks.get("motion")
 
     def _prepare_net(self) -> None:
         """Pick a bounded, self-consistent subgraph (hidden+out + strong inputs)."""
@@ -755,7 +894,7 @@ class ChampionShowcase:
         )
         gy, gx = self._gaze_disp
         dx, dy = self.saccade
-        return {
+        out = {
             "genome_id": self.genome_id,
             "spawn": "frontier" if self.spawn_state is not None else "newgame",
             "frame_w": _SCREEN_W,
@@ -764,9 +903,9 @@ class ChampionShowcase:
             # optical view: the low-res periphery the agent actually sees (GxG).
             "obs_res": int(self._G),
             "obs_b64": b64_gray(obs_gray) if obs_gray is not None else "",
-            # active vision: the high-acuity fovea crop + where it is looking +
-            # the raw saccade command that will move it next step.
-            "fovea_res": int(self._G),
+            # active vision: the high-acuity sharp fovea crop (FGxFG, spec §2) + the
+            # window it is looking through + the raw saccade command moving it next.
+            "fovea_res": int(self._FG),
             "fovea_px": int(self._F),
             "fovea_b64": _b64_block(self.fovea_vis) if self.fovea_vis is not None else "",
             "motion_b64": _b64_block(self.motion_vis) if self.motion_vis is not None else "",
@@ -783,6 +922,12 @@ class ChampionShowcase:
                 "act": self._act,
             },
         }
+        # Trans-saccadic foveal memory (§1a): the persistent scene buffer + its
+        # staleness map, read LIVE off the showcase encoder (accessors, not the flat
+        # obs) so the wall can render the accumulated hi-res percept FADING as it
+        # goes stale.  Only present when the run has foveal memory (legacy => omit).
+        _memplus(out, self.encoder, self._M)
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -1077,13 +1222,13 @@ class LiveStreamer:
         )
         gy, gx = sc._gaze_disp
         dx, dy = sc.saccade
-        return {
+        out = {
             "idx": -1,
             "genome_id": sc.genome_id,
             "frame_b64": b64_gray(sc.screen) if sc.screen is not None else "",
             "obs_res": int(sc._G),
             "obs_b64": b64_gray(obs_gray) if obs_gray is not None else "",
-            "fovea_res": int(sc._G),
+            "fovea_res": int(sc._FG),
             "fovea_px": int(sc._F),
             "fovea_b64": _b64_block(sc.fovea_vis) if sc.fovea_vis is not None else "",
             "motion_b64": _b64_block(sc.motion_vis) if sc.motion_vis is not None else "",
@@ -1101,6 +1246,8 @@ class LiveStreamer:
             },
             "genes": sc._genes,
         }
+        _memplus(out, sc.encoder, sc._M)  # buffer/staleness + reflex (live accessors)
+        return out
 
     def _focus_entry(self, idx: int) -> dict:
         """Compiled single-genome forward state for slot ``idx`` (cached per wave)."""
@@ -1150,21 +1297,22 @@ class LiveStreamer:
         buttons = [0] * N_BUTTONS
         if 0 <= action < N_BUTTONS:
             buttons[action] = 1
-        g = sc._G
-        # Optical views decoded straight from the stored 454-d obs the fleet fed
-        # this agent; gaze recovered from its proprio block (where it was looking).
-        obs_img = _block2d(obs[idx], g, "periph")
-        gy, gx = _gaze_from_proprio(obs[idx], g, sc.encoder.H, sc.encoder.W)
-        return {
+        # Optical views decoded straight from the stored obs the fleet fed this
+        # agent, using the encoder's REAL offsets (v2-general): periphery (GxG),
+        # sharp fovea (FGxFG), motion (GxG), and — on a memory run — the buffer +
+        # staleness (MxM).  Gaze + reflex target recovered from its proprio block.
+        blocks = _optical_blocks(obs[idx], sc.encoder)
+        gy, gx = _gaze_from_obs(obs[idx], sc.encoder)
+        out = {
             "idx": int(idx),
             "genome_id": entry["genome_id"],
             "frame_b64": b64_gray(screens[idx]),
-            "obs_res": int(g),
-            "obs_b64": _b64_block(obs_img),
-            "fovea_res": int(g),
+            "obs_res": int(sc._G),
+            "obs_b64": _b64_block(blocks["periph"]),
+            "fovea_res": int(sc._FG),
             "fovea_px": int(sc._F),
-            "fovea_b64": _b64_block(_block2d(obs[idx], g, "fovea")),
-            "motion_b64": _b64_block(_block2d(obs[idx], g, "motion")),
+            "fovea_b64": _b64_block(blocks["fovea"]),
+            "motion_b64": _b64_block(blocks["motion"]) if "motion" in blocks else "",
             "gaze": _gaze_payload(gy, gx, _SCREEN_H, _SCREEN_W, sc._F),
             "saccade": _saccade_payload(gdx, gdy),
             "action": action,
@@ -1179,6 +1327,8 @@ class LiveStreamer:
             },
             "genes": entry["genes"],
         }
+        _memplus_from_obs(out, obs[idx], sc.encoder, sc._M, blocks=blocks)
+        return out
 
     def _build_focus(self, screens, obs, actions) -> dict:
         idx = self._select_idx

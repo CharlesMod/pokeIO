@@ -322,8 +322,8 @@
             </div>
             <div class="vision-row">
               <div class="vision">
-                <canvas id="vis" width="40" height="36" style="width:112px;height:100px"></canvas>
-                <div class="cap">what the net sees</div>
+                <canvas id="vis" width="160" height="144" style="width:112px;height:100px"></canvas>
+                <div class="cap">what the AI sees · foveal</div>
               </div>
               <div class="ramtap">
                 <div class="h"><span>RAM tap · auto-mined</span><span id="ram-t">▲ progress bytes</span></div>
@@ -1176,9 +1176,9 @@ window.pokeSelectAgent=function(){window.pokeSelect(-1);}; // legacy alias
     gx.fillStyle=P[2];gx.fillRect(cxp,cyp+8,8,3);
     if((walkT|0)%2){gx.fillStyle=P[0];gx.fillRect(cxp+3,cyp+9,2,2);}
     vx.imageSmoothingEnabled=false;
-    vx.drawImage(gb,0,0,40,36);
+    vx.drawImage(gb,0,0,vis.width,vis.height);       // canvas dims (v2: 160×144, not 40×36)
     vx.fillStyle='rgba(0,0,0,0.10)';
-    for(let i=0;i<40;i+=2)vx.fillRect(i,0,1,36);
+    for(let i=0;i<vis.width;i+=4)vx.fillRect(i,0,2,vis.height);
   }
 
   const ramData=[
@@ -1985,13 +1985,99 @@ function drawChampionFrame(ch){
   gbCtx.imageSmoothingEnabled=false;
   gbCtx.drawImage(off,0,0,gbCv.width,gbCv.height);
 }
-function drawChampionObs(ch){
-  if(!visCtx||!ch.obs_b64||!ch.obs_res) return;
-  const off=decodeToOff(ch.obs_b64, ch.obs_res, ch.obs_res);
-  if(!off) return;
-  visCtx.imageSmoothingEnabled=false;
-  visCtx.clearRect(0,0,visCv.width,visCv.height);
-  visCtx.drawImage(off,0,0,visCv.width,visCv.height);
+/* --- active-vision composite (optical-frontend-v2 §1a/§2, task #12) ----------
+   Dedicated offscreen scratch per layer (the shared _off is used by the frame),
+   so the composite can stack periphery + memory + fovea without clobbering. */
+const _pvOff=document.createElement('canvas'), _pvx=_pvOff.getContext('2d',{willReadFrequently:true});
+const _mvOff=document.createElement('canvas'), _mvx=_mvOff.getContext('2d',{willReadFrequently:true});
+const _fvOff=document.createElement('canvas'), _fvx=_fvOff.getContext('2d',{willReadFrequently:true});
+
+/* grayscale block (res×res bytes) → offscreen canvas at native res (opaque) */
+function grayBlockOff(cv,cx,b64,res){
+  const bytes=b64bytes(b64);
+  if(!bytes||bytes.length!==res*res) return null;
+  cv.width=res; cv.height=res;
+  cx.putImageData(grayImage(cx,bytes,res,res),0,0);
+  return cv;
+}
+/* buffer(gray) + staleness(0..255) → RGBA offscreen: rgb = accumulated scene,
+   alpha = freshness (255 − staleness) so stale cells fade toward transparent and
+   the blurry periphery shows through (spec §1a change-blindness on the wall) */
+function memBlockOff(cv,cx,bufB64,staleB64,res){
+  const buf=b64bytes(bufB64), st=b64bytes(staleB64), n=res*res;
+  if(!buf||!st||buf.length!==n||st.length!==n) return null;
+  cv.width=res; cv.height=res;
+  const img=cx.createImageData(res,res), d=img.data;
+  for(let i=0;i<n;i++){const v=buf[i], o=i*4;
+    d[o]=v; d[o+1]=v; d[o+2]=v; d[o+3]=255-st[i];}   // freshness = 255 − staleness
+  cx.putImageData(img,0,0);
+  return cv;
+}
+/* gaze payload → fovea-box rect in canvas coords (w01/h01 = F/W,F/H fraction) */
+function foveaBox(g,W,H){
+  const w=(g&&g.w01)?g.w01*W:0.3*W, h=(g&&g.h01)?g.h01*H:0.3*H;
+  const cx=(g&&g.x01!=null?g.x01:0.5)*W, cy=(g&&g.y01!=null?g.y01:0.5)*H;
+  return {x:cx-w/2, y:cy-h/2, w, h, cx, cy};
+}
+/* small aqua crosshair where the reflex (motion×staleness) is pulling the gaze */
+function drawReflex(ctx,r,W,H,scale){
+  if(!r||r.x01==null) return;
+  const x=r.x01*W, y=r.y01*H, s=4*scale;
+  ctx.strokeStyle='rgba(24,162,196,0.9)'; ctx.lineWidth=Math.max(1,scale);
+  ctx.beginPath();
+  ctx.moveTo(x-s,y); ctx.lineTo(x+s,y);
+  ctx.moveTo(x,y-s); ctx.lineTo(x,y+s);
+  ctx.stroke();
+}
+
+/* the "what the AI sees" percept: BLURRY low-acuity periphery as the base, the
+   accumulated foveal MEMORY fading as it goes stale, and the razor-SHARP fovea
+   crisp inside its highlighted box at the gaze centre (+ the reflex marker). */
+function drawChampionVision(ch){
+  if(!visCtx) return;
+  const W=visCv.width, H=visCv.height;
+  visCtx.clearRect(0,0,W,H);
+  /* 1 · blurry periphery base — smoothed upscale of the GxG obs (low-acuity) */
+  if(ch.obs_b64&&ch.obs_res){
+    const off=grayBlockOff(_pvOff,_pvx,ch.obs_b64,ch.obs_res);
+    if(off){ visCtx.imageSmoothingEnabled=true; visCtx.drawImage(off,0,0,W,H); }
+  }
+  /* 2 · trans-saccadic memory — accumulated sharp scene, alpha = freshness, so
+     you watch the percept build up under the fovea and fade back to blur */
+  if(ch.buffer_b64&&ch.stale_b64&&ch.buffer_res){
+    const off=memBlockOff(_mvOff,_mvx,ch.buffer_b64,ch.stale_b64,ch.buffer_res);
+    if(off){ visCtx.imageSmoothingEnabled=false; visCtx.drawImage(off,0,0,W,H); }
+  }
+  /* 3 · razor-sharp fovea, crisp inside its box at the gaze centre */
+  if(ch.fovea_b64&&ch.fovea_res){
+    const off=grayBlockOff(_fvOff,_fvx,ch.fovea_b64,ch.fovea_res);
+    if(off){
+      const b=foveaBox(ch.gaze,W,H);
+      visCtx.imageSmoothingEnabled=false;
+      visCtx.drawImage(off,b.x,b.y,b.w,b.h);
+      visCtx.strokeStyle='rgba(224,168,56,0.95)'; visCtx.lineWidth=1;
+      visCtx.strokeRect(Math.round(b.x)+0.5,Math.round(b.y)+0.5,Math.round(b.w),Math.round(b.h));
+    }
+  }
+  /* 4 · reflex-target marker */
+  drawReflex(visCtx,ch.reflex,W,H,1);
+}
+
+/* fovea-box + reflex HUD overlaid on the REAL full-res cage frame (#gb) — where
+   the agent is looking, drawn over the ground-truth screen. */
+function drawFoveaHUD(ch){
+  if(!gbCtx||!ch.gaze) return;
+  const W=gbCv.width, H=gbCv.height, b=foveaBox(ch.gaze,W,H);
+  gbCtx.save();
+  gbCtx.strokeStyle='rgba(224,168,56,0.95)'; gbCtx.lineWidth=1;
+  gbCtx.strokeRect(b.x+0.5,b.y+0.5,b.w,b.h);
+  const t=Math.max(2,b.w*0.2);                       // corner fixation ticks
+  gbCtx.beginPath();
+  [[b.x,b.y,1,1],[b.x+b.w,b.y,-1,1],[b.x,b.y+b.h,1,-1],[b.x+b.w,b.y+b.h,-1,-1]]
+    .forEach(c=>{gbCtx.moveTo(c[0],c[1]+c[3]*t);gbCtx.lineTo(c[0],c[1]);gbCtx.lineTo(c[0]+c[2]*t,c[1]);});
+  gbCtx.stroke();
+  drawReflex(gbCtx,ch.reflex,W,H,1);
+  gbCtx.restore();
 }
 function drawRamTap(ram){
   if(!ramC||!ram) return;
@@ -2248,7 +2334,8 @@ async function pollLive(){
       window.POKE_FRAMES=true;
       if(j.run)window.POKE_RUN=j.run;
       drawChampionFrame(ch);
-      drawChampionObs(ch);
+      drawFoveaHUD(ch);            // fovea box + reflex marker over the real frame
+      drawChampionVision(ch);      // blurry periph + faded memory + sharp fovea box
       drawRamTap(ch.ram);
       if(champBadge&&ch.genome_id)champBadge.textContent='#'+ch.genome_id+' ▾';
       if(ch.net)renderNet(ch.net, ch.buttons);
