@@ -163,8 +163,35 @@ class RewardConfig:
     w_resp_var: float = 0.5
     # Emp: empowerment via the SPR inverse head (Phase 1+; 0 effect in Phase 0)
     w_emp: float = 0.1
-    # E1: optional short no-restore policy-eval (0 = off; judge override only)
-    policy_eval_steps: int = 0
+    # -- E1: play-from-boot selection eval (the composition-gap cure) ----------
+    # Each generation, run a SHORT no-restore rollout of the population from the
+    # canonical newgame state (restore_prob=0, Go-Explore capture OFF) and score
+    # every genome by exploration+progress achieved FROM BOOT (distinct cells
+    # opened; mined-progress advancement when taps are live). The score is
+    # rank-blended into selection fitness (``w_boot``) and picks the showcased/
+    # mined champion, so the population is pressured to PLAY from newgame instead
+    # of specialising on deep Go-Explore restore spawns. 0 = OFF (skips the extra
+    # env-steps entirely). This is the E1 the active-vision spine spec deferred,
+    # now real and ON by default for the Phase-0 foveal spine (no effect in
+    # retina mode, which has no controller-latent transform hook yet).
+    policy_eval_steps: int = 300
+    # Genomes to boot-eval each gen: 0 = the WHOLE population (cleanest signal;
+    # ~doubles per-gen eval cost when policy_eval_steps == episode_steps). A
+    # positive value evaluates only that many genomes — always including the
+    # current top-raw-fitness candidates — to bound the tax on long runs; the
+    # rest get a neutral boot quantile.
+    policy_eval_sample: int = 0
+    # Blend weight of from-boot competence into selection fitness:
+    #   sel_i <- (1 - w_boot)*sel_i + w_boot*q(boot_competence_i).
+    w_boot: float = 0.4
+    # -- Backward-shift restore curriculum (Explore-Go / boot-gauntlet D2) ------
+    # Bias Go-Explore restores toward SHALLOW (early-game) cells early, annealing
+    # the eligible bottom depth-quantile deeper as generations progress, so the
+    # population must re-earn the opening before deep frontier spawns dominate
+    # (the evolutionary analog of Go-Explore's backward algorithm).
+    restore_backward: bool = True
+    restore_backward_q0: float = 0.3  # gen 0: only bottom-30% depth cells eligible
+    restore_backward_anneal_gens: int = 60  # widen to the full frontier by this gen
 
 
 @dataclass

@@ -906,6 +906,7 @@ def evaluate_wave(
     probe_sink: list | None = None,
     probe_quota: int = 0,
     retina_pipe: "RetinaObsPipe | None" = None,
+    distinct_out: np.ndarray | None = None,
 ) -> int:
     """Evaluate one wave of genomes in lockstep; sets genome.fitness in place.
 
@@ -1019,6 +1020,8 @@ def evaluate_wave(
     for i, g in enumerate(genomes):
         g.fitness = float(wave.fitness[i])
         g._resp = float(resp[i])
+    if distinct_out is not None:  # play-from-boot eval: per-player distinct cells
+        distinct_out[:n] = wave.distinct_counts()
     return n * episode_steps
 
 
@@ -1050,6 +1053,7 @@ def evaluate_wave_parallel(
     probe_sink: list | None = None,
     probe_quota: int = 0,
     retina_pipe: "RetinaObsPipe | None" = None,
+    distinct_out: np.ndarray | None = None,
 ) -> int:
     """Parallel-barrier equivalent of :func:`evaluate_wave`.
 
@@ -1234,6 +1238,8 @@ def evaluate_wave_parallel(
     for i, g in enumerate(genomes):
         g.fitness = float(wave.fitness[i])
         g._resp = float(resp[i])
+    if distinct_out is not None:  # play-from-boot eval: per-player distinct cells
+        distinct_out[:n] = wave.distinct_counts()
     return n * episode_steps
 
 
@@ -1301,6 +1307,7 @@ def evaluate_wave_async(
     probe_sink: list | None = None,
     probe_quota: int = 0,
     retina_pipe: "RetinaObsPipe | None" = None,
+    distinct_out: np.ndarray | None = None,
 ) -> int:
     """Free-running ("furnace") equivalent of :func:`evaluate_wave_parallel`.
 
@@ -1695,6 +1702,8 @@ def evaluate_wave_async(
         g.fitness = float(wave.fitness[i])
         g.progress = float(progress[i])  # mined-counter advancement (0 w/o taps)
         g._resp = float(resp[i])
+    if distinct_out is not None:  # play-from-boot eval: per-player distinct cells
+        distinct_out[:n] = wave.distinct_counts()
     return n * R
 
 
@@ -1826,6 +1835,215 @@ def cohort_rank_normalize(
             sel = qpolicy
         for j, i in enumerate(idxs):
             genomes[i].fitness = float(sel[j])
+
+
+# --------------------------------------------------------------------------
+# Play-from-boot (E1): from-newgame selection eval + boot-competence champion
+# --------------------------------------------------------------------------
+# The composition-gap cure. Champions selected by raw/frontier fitness are
+# Go-Explore FRONTIER SPECIALISTS: their fitness came from deep restore spawns,
+# and from newgame they reach only 2-3 distinct screens. These helpers score
+# every genome by what it achieves FROM BOOT (distinct cells opened + mined
+# progress), rank-blend that into selection fitness, and pick the showcased/
+# mined champion by boot competence — so the population learns to PLAY from the
+# start (the M1 "leave the house" milestone). Pure + unit-tested in
+# tests/test_play_from_boot.py; the env-driven rollout lives in
+# :func:`boot_eval_population`.
+def boot_selection_rank(
+    boot_cells: np.ndarray,
+    boot_prog: np.ndarray,
+    evaluated: np.ndarray,
+    *,
+    progress_weight: float = 0.5,
+) -> np.ndarray:
+    """Per-genome from-boot competence quantile in ``[0, 1]`` (lever 1 score).
+
+    Ranks distinct-cells-from-boot (plus mined-progress-from-boot when any is
+    live) WITHIN the boot-evaluated set, then re-quantiles the combination so
+    the blend is scale-free. Genomes that were NOT boot-evaluated (a sampled
+    run) impute to the neutral ``0.5`` quantile — no boot pressure, up or down.
+    """
+    boot_cells = np.asarray(boot_cells, dtype=np.float64)
+    boot_prog = np.asarray(boot_prog, dtype=np.float64)
+    ev = np.asarray(evaluated, dtype=bool)
+    out = np.full(boot_cells.shape[0], 0.5, dtype=np.float64)
+    idx = np.nonzero(ev)[0]
+    if idx.size == 0:
+        return out
+    qc = _quantile_ranks(boot_cells[idx])
+    bp = boot_prog[idx]
+    if float(progress_weight) > 0.0 and np.any(bp != 0.0):
+        score = qc + float(progress_weight) * _quantile_ranks(bp)
+    else:
+        score = qc
+    out[idx] = _quantile_ranks(score)
+    return out
+
+
+def boot_blend_fitness(
+    sel_fitness: np.ndarray, boot_rank: np.ndarray, w_boot: float
+) -> np.ndarray:
+    """Blend from-boot competence into selection fitness (lever 1).
+
+    ``(1 - w_boot) * sel_fitness + w_boot * boot_rank`` — both operands live in
+    the ``[0, 1]`` quantile space produced by :func:`cohort_rank_normalize` and
+    :func:`boot_selection_rank`, so the result stays in ``[0, 1]``. A frontier
+    specialist (high ``sel``, low ``boot_rank``) is pulled down; a genome that
+    actually plays from newgame (lower ``sel``, high ``boot_rank``) is lifted.
+    """
+    w = float(w_boot)
+    return (1.0 - w) * np.asarray(sel_fitness, dtype=np.float64) + w * np.asarray(
+        boot_rank, dtype=np.float64
+    )
+
+
+def boot_champion_idx(
+    boot_cells: np.ndarray,
+    boot_prog: np.ndarray,
+    evaluated: np.ndarray,
+    raw_fits: np.ndarray,
+) -> int:
+    """Champion index by BOOT competence (lever 3), not raw frontier fitness.
+
+    The champion is the boot-evaluated genome that opened the most distinct
+    cells FROM NEWGAME (ties broken by mined-progress, then raw wave fitness).
+    Falls back to the raw-fitness argmax only when nothing was boot-evaluated.
+    """
+    boot_cells = np.asarray(boot_cells, dtype=np.float64)
+    boot_prog = np.asarray(boot_prog, dtype=np.float64)
+    raw_fits = np.asarray(raw_fits, dtype=np.float64)
+    ev = np.asarray(evaluated, dtype=bool)
+    if not ev.any():
+        return int(raw_fits.argmax())
+    primary = np.where(ev, boot_cells, -np.inf)
+    # np.lexsort: the LAST key is the primary sort key; the last index is the max.
+    order = np.lexsort((raw_fits, boot_prog, primary))
+    return int(order[-1])
+
+
+def boot_eval_population(
+    genomes,
+    *,
+    fleet,
+    envs,
+    encoder: FovealEncoder,
+    archive_kwargs: dict,
+    device: torch.device,
+    steps: int,
+    max_nodes: int,
+    max_conns: int,
+    reset_state: str,
+    engine: str,
+    parallel: bool,
+    players: int,
+    novelty_mode: str = "rarity",
+    novelty_floor: float = 0.01,
+    cp_provider=None,
+    taps: list[dict] | None = None,
+    recurrent_memory: bool = True,
+    softmax_temp: float = 0.0,
+    sample: int = 0,
+    raw_fits: np.ndarray | None = None,
+    rng: np.random.Generator | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """E1 — run a SHORT from-newgame rollout of the population and score boot play.
+
+    Returns ``(boot_cells, boot_prog, evaluated)`` — float arrays of length
+    ``len(genomes)`` (distinct cells opened from boot, mined-progress from boot)
+    plus a bool mask of which genomes were actually evaluated.
+
+    STRICTLY READ-ONLY against the LIVE archives: a THROWAWAY
+    :class:`NoveltyArchive` absorbs the from-newgame cell bookkeeping and
+    Go-Explore is passed ``None`` (``restore_prob`` is moot — every player spawns
+    from ``reset_state``, and no state is captured), so neither the real novelty
+    frontier / archive_delta nor the Go-Explore states are perturbed. Genome
+    ``.fitness`` / ``.progress`` / ``._resp`` are snapshotted before and restored
+    after (the eval overwrites them), so the caller's raw wave fitness survives.
+
+    Reuses the tested wave engines (furnace / barrier / serial) with restores
+    disabled and ``distinct_out`` collecting the per-player distinct-cell counts.
+    ``taps`` are forwarded (furnace only) so mined progress is measured from
+    boot. Skipped by the caller in retina mode (no controller-latent hook).
+    """
+    n_pop = len(genomes)
+    steps = int(steps)
+    boot_cells = np.zeros(n_pop, dtype=np.float64)
+    boot_prog = np.zeros(n_pop, dtype=np.float64)
+    evaluated = np.zeros(n_pop, dtype=bool)
+    if steps <= 0 or n_pop == 0:
+        return boot_cells, boot_prog, evaluated
+
+    # -- select the eval set (whole pop, or a sample incl. top raw-fitness) ----
+    whole = (not sample) or int(sample) >= n_pop
+    if whole:
+        eval_idx = np.arange(n_pop)
+        reuse_cp = cp_provider  # contiguous whole-pop -> reuse the compiled pack
+    else:
+        s = int(sample)
+        order = (
+            np.argsort(-np.asarray(raw_fits, dtype=np.float64))
+            if raw_fits is not None else np.arange(n_pop)
+        )
+        top = order[: max(1, s // 2)]                      # would-be champions
+        pool = np.setdiff1d(order, top, assume_unique=False)
+        if rng is not None and pool.size:
+            pool = pool[rng.permutation(pool.size)]
+        fill = pool[: max(0, s - top.size)]
+        eval_idx = np.union1d(top, fill)[:s]
+        reuse_cp = None  # non-contiguous sample -> compile its own sub-pack
+
+    # -- snapshot genome state the eval will clobber ---------------------------
+    saved = [
+        (g.fitness, float(getattr(g, "progress", 0.0)), float(getattr(g, "_resp", 0.0)))
+        for g in genomes
+    ]
+    throwaway = NoveltyArchive(**archive_kwargs)
+
+    eval_genomes = [genomes[int(i)] for i in eval_idx]
+    async_engine = parallel and fleet is not None and engine == "furnace"
+    eval_fn = (
+        evaluate_wave_async if async_engine
+        else evaluate_wave_parallel if (parallel and fleet is not None)
+        else None
+    )
+    try:
+        for a in range(0, len(eval_genomes), players):
+            wave = eval_genomes[a : a + players]
+            m = len(wave)
+            d_out = np.zeros(m, dtype=np.float64)
+            if eval_fn is not None:
+                eval_fn(
+                    wave, fleet, throwaway, device, steps, max_nodes, max_conns,
+                    streamer=None, gen=0, novelty_mode=novelty_mode,
+                    novelty_floor=novelty_floor, goexplore=None, restore_prob=0.0,
+                    cp_full=(reuse_cp if whole else None),
+                    wave_offset=(int(eval_idx[a]) if whole else 0),
+                    taps=(taps if (taps and async_engine) else None),
+                    recurrent_memory=recurrent_memory, softmax_temp=softmax_temp,
+                    probe_sink=None, probe_quota=0, retina_pipe=None,
+                    distinct_out=d_out,
+                )
+            else:  # serial (no fleet)
+                evaluate_wave(
+                    wave, envs[:m], encoder, throwaway, device, steps,
+                    max_nodes, max_conns, reset_state, streamer=None, gen=0,
+                    novelty_mode=novelty_mode, novelty_floor=novelty_floor,
+                    goexplore=None, restore_prob=0.0, wave_offset=0,
+                    recurrent_memory=recurrent_memory, softmax_temp=softmax_temp,
+                    distinct_out=d_out,
+                )
+            for j in range(m):
+                gi = int(eval_idx[a + j])
+                boot_cells[gi] = float(d_out[j])
+                boot_prog[gi] = float(getattr(wave[j], "progress", 0.0))
+                evaluated[gi] = True
+    finally:
+        # restore the real wave fitness/progress/_resp the caller depends on
+        for g, (f, p, r) in zip(genomes, saved):
+            g.fitness = f
+            g.progress = p
+            g._resp = r
+    return boot_cells, boot_prog, evaluated
 
 
 def idle_autonomous_bytes(
@@ -2605,6 +2823,23 @@ def train(
     blind_gate_on = bool(getattr(config.reward, "blind_gate", True))
     blind_gate_beta = float(getattr(config.reward, "blind_gate_beta", 8.0))
     blind_gate_dmin = float(getattr(config.reward, "blind_gate_dmin", 0.05))
+    # -- Play-from-boot (E1): from-newgame selection eval + boot champion ------
+    policy_eval_steps = int(getattr(config.reward, "policy_eval_steps", 0))
+    policy_eval_sample = int(getattr(config.reward, "policy_eval_sample", 0))
+    w_boot = float(getattr(config.reward, "w_boot", 0.0))
+    # -- Backward-shift restore curriculum (D2) --------------------------------
+    restore_backward = bool(getattr(config.reward, "restore_backward", True))
+    restore_backward_q0 = float(getattr(config.reward, "restore_backward_q0", 0.3))
+    restore_backward_anneal_gens = int(
+        getattr(config.reward, "restore_backward_anneal_gens", 60)
+    )
+    if retina_mode:
+        # Keep retina mode's behaviour UNCHANGED: the play-from-boot eval has no
+        # controller-latent transform hook yet (it would feed the 102-d net raw
+        # 14134 obs), and the backward-shift curriculum is a Phase-0 lever — so
+        # both are forced off in retina mode (Phase-1 follow-up).
+        policy_eval_steps = 0
+        restore_backward = False
     # Budgets: sized to the seed density + slack to grow. Sparse seeds are
     # ~(init_k+1)*N_OUT conns, so the pack/compile tensors shrink ~10x vs full.
     if init_connect == "full":
@@ -2718,6 +2953,7 @@ def train(
             capacity=goexplore_capacity,
             caps_per_round=goexplore_caps_per_round,
             rng=np.random.default_rng(config.run.seed + 1),
+            backward=restore_backward,  # D2 backward-shift restore curriculum
         )
         if goexplore
         else None
@@ -2727,6 +2963,13 @@ def train(
         f"(restore_prob={restore_prob}, cap={goexplore_capacity}, "
         f"caps/round={goexplore_caps_per_round}) "
         f"auto_species={'on' if auto_species else 'off'} (target={species_target})"
+    )
+    print(
+        f"[train] play-from-boot: policy_eval_steps={policy_eval_steps} "
+        f"(sample={'all' if not policy_eval_sample else policy_eval_sample}) "
+        f"w_boot={w_boot} | backward-shift restore="
+        f"{'on' if restore_backward else 'off'} "
+        f"(q0={restore_backward_q0}, anneal_gens={restore_backward_anneal_gens})"
     )
 
     # Create the emulator pool once; reused across every wave/generation.
@@ -2902,6 +3145,14 @@ def train(
             genomes = ckpt["genomes"]
             archive = ckpt["archive"]
             go = ckpt["goexplore"]
+            if go is not None:
+                # Reconcile the D2 backward-shift curriculum with the CURRENT
+                # config (and back-fill the fields on pre-feature checkpoints,
+                # whose pickled GoExplore predates them — unpickling skips
+                # __init__, so the attrs would otherwise be absent).
+                go.backward = restore_backward
+                if not hasattr(go, "backward_q"):
+                    go.backward_q = 1.0
             tracker = ckpt["tracker"]
             spec = ckpt["spec"]
             prev_reps = ckpt["prev_reps"]
@@ -3087,6 +3338,11 @@ def train(
             archive.begin_generation()
             if go is not None:
                 go.begin_generation(gen)
+                # D2 backward-shift: bias restores toward SHALLOW cells early,
+                # annealing the eligible depth-quantile deeper as gens progress.
+                go.set_backward_schedule(
+                    gen, restore_backward_q0, restore_backward_anneal_gens
+                )
             psutil.cpu_percent(None)
 
             steps_done = 0
@@ -3211,7 +3467,46 @@ def train(
 
             _bt = time.perf_counter()
             fits = np.array([g.fitness for g in genomes], dtype=np.float64)
-            champ_idx = int(fits.argmax())  # champion by RAW wave fitness (unchanged)
+            raw_fits = fits.copy()  # raw wave fitness -> telemetry labels only
+
+            # -- Play-from-boot eval (E1): a SHORT no-restore rollout from
+            # newgame scoring each genome by distinct cells opened + mined
+            # progress FROM BOOT, STRICTLY read-only vs the live archives. This
+            # is the composition-gap cure: it pressures from-newgame play and
+            # picks the champion by BOOT competence, not deep restore luck.
+            boot_cells = np.zeros(len(genomes), dtype=np.float64)
+            boot_prog = np.zeros(len(genomes), dtype=np.float64)
+            boot_evaluated = np.zeros(len(genomes), dtype=bool)
+            # Only meaningful WITH Go-Explore restores (the composition gap): with
+            # go off, the main eval already spawns every player from newgame.
+            if policy_eval_steps > 0 and go is not None:
+                if streamer is not None:
+                    streamer.set_phase("evolving", "play-from-boot eval")
+                boot_cells, boot_prog, boot_evaluated = boot_eval_population(
+                    genomes,
+                    fleet=fleet, envs=envs, encoder=encoder,
+                    archive_kwargs=archive_kwargs, device=device,
+                    steps=policy_eval_steps, max_nodes=max_nodes,
+                    max_conns=max_conns, reset_state=reset_state,
+                    engine=engine, parallel=parallel, players=players,
+                    novelty_mode=novelty_mode,
+                    novelty_floor=config.reward.novelty_floor,
+                    cp_provider=_cp_provider,
+                    taps=taps, recurrent_memory=recurrent_memory,
+                    softmax_temp=softmax_temp, sample=policy_eval_sample,
+                    raw_fits=raw_fits, rng=rng,
+                )
+            _bt = _phase("boot_eval", _bt)
+
+            # Champion by BOOT competence (lever 3) when the boot eval ran;
+            # otherwise the legacy raw-frontier argmax. Raw fitness is kept only
+            # for telemetry labels below.
+            if boot_evaluated.any():
+                champ_idx = boot_champion_idx(
+                    boot_cells, boot_prog, boot_evaluated, raw_fits
+                )
+            else:
+                champ_idx = int(fits.argmax())
             champion = genomes[champ_idx]
 
             # E3 blind-ablation gate (§6.2): the dominant selection multiplier
@@ -3235,7 +3530,7 @@ def train(
                 streamer.set_phase("evolving", "champion replay")
                 streamer.set_champion(
                     champion, f"gen{gen}_g{champ_idx}",
-                    gen=gen, fitness=float(fits.max()),
+                    gen=gen, fitness=float(raw_fits[champ_idx]),
                     spawn_state=spawn_states.get(champ_idx),
                 )
                 streamer.force_write(gen)
@@ -3487,6 +3782,19 @@ def train(
             if boot_metrics is not None:
                 # mirrored so the wall side panel shows it with zero UI work
                 reward_terms.update(boot_metrics)
+            # Play-from-boot eval telemetry (surfaces the composition gap on the
+            # wall): raw-frontier best vs the champion's from-boot distinct cells.
+            if boot_evaluated.any():
+                ev = boot_evaluated
+                reward_terms["boot_eval_cells_best"] = float(boot_cells[ev].max())
+                reward_terms["boot_eval_cells_med"] = float(np.median(boot_cells[ev]))
+                reward_terms["boot_eval_champ_cells"] = float(boot_cells[champ_idx])
+                reward_terms["boot_eval_n"] = float(int(ev.sum()))
+                reward_terms["champ_boot_picked"] = 1.0
+                reward_terms["champ_raw_fitness"] = float(raw_fits[champ_idx])
+                reward_terms["raw_fitness_best"] = float(raw_fits.max())
+                if taps:
+                    reward_terms["boot_eval_progress_best"] = float(boot_prog[ev].max())
             if go is not None:
                 reward_terms.update(go.stats())
 
@@ -3554,6 +3862,20 @@ def train(
                     restore_baseline=restore_baseline,
                     blind_gate=blind_gate_on,
                 )
+                # Play-from-boot blend (E1, lever 1): fold each genome's from-boot
+                # competence quantile into the within-cohort selection fitness, so
+                # a genome that PLAYS from newgame outranks a frontier specialist
+                # that only scored via deep restore spawns. Applied AFTER the
+                # cohort rank-normalize (both operands are [0,1] quantiles).
+                if w_boot > 0.0 and boot_evaluated.any():
+                    boot_rank = boot_selection_rank(
+                        boot_cells, boot_prog, boot_evaluated,
+                        progress_weight=progress_weight,
+                    )
+                    sel = np.array([g.fitness for g in genomes], dtype=np.float64)
+                    sel = boot_blend_fitness(sel, boot_rank, w_boot)
+                    for i, g in enumerate(genomes):
+                        g.fitness = float(sel[i])
                 genomes = fast_reproduce(
                     genomes, species, tracker, rng, rates,
                     pop_size=pop_size,
@@ -3607,9 +3929,9 @@ def train(
             boundary_t = wall_dt - rounds_t
             eff_sps = steps_done / wall_dt if wall_dt > 0 else 0.0
             keys = (
-                "go_sample", "reset_all", "pack_compile", "live_champ",
-                "replay", "spec_mat", "spec_fit", "spec_assign", "live_side",
-                "telemetry", "reproduce",
+                "go_sample", "reset_all", "pack_compile", "boot_eval",
+                "live_champ", "replay", "spec_mat", "spec_fit", "spec_assign",
+                "live_side", "telemetry", "reproduce",
             )
             parts = "  ".join(f"{k}={prof.get(k, 0.0):.2f}" for k in keys)
             accounted = sum(prof.get(k, 0.0) for k in keys)
@@ -3673,6 +3995,19 @@ def build_config(args) -> Config:
         cfg.retina.swap_gens = int(args.retina_swap_gens)
     if cfg.vision.mode == "retina":
         cfg.retina.enable = True
+    # -- play-from-boot (E1) + backward-shift restore (D2) CLI overrides -------
+    if getattr(args, "policy_eval_steps", None) is not None:
+        cfg.reward.policy_eval_steps = int(args.policy_eval_steps)
+    if getattr(args, "policy_eval_sample", None) is not None:
+        cfg.reward.policy_eval_sample = int(args.policy_eval_sample)
+    if getattr(args, "w_boot", None) is not None:
+        cfg.reward.w_boot = float(args.w_boot)
+    if getattr(args, "restore_backward", None) is not None:
+        cfg.reward.restore_backward = bool(args.restore_backward)
+    if getattr(args, "restore_backward_anneal_gens", None) is not None:
+        cfg.reward.restore_backward_anneal_gens = int(
+            args.restore_backward_anneal_gens
+        )
     return cfg
 
 
@@ -3705,6 +4040,29 @@ def main() -> None:
                          "(0 = off; see docs/specs/boot-gauntlet.md)")
     ap.add_argument("--boot-gauntlet-steps", type=int, default=0,
                     help="gauntlet episode length (0 = auto: 4*episode-steps)")
+    # -- play-from-boot (E1): from-newgame selection eval + boot champion ------
+    ap.add_argument("--policy-eval-steps", type=int, default=None,
+                    help="from-newgame selection-eval rollout length per genome "
+                         "(0 = OFF; default: config.reward.policy_eval_steps=300). "
+                         "Scores each genome by distinct cells + progress FROM "
+                         "BOOT, blended into selection and used to pick the "
+                         "champion (the composition-gap cure). Foveal-only.")
+    ap.add_argument("--policy-eval-sample", type=int, default=None,
+                    help="genomes to boot-eval per gen (0 = whole population; "
+                         ">0 bounds the tax, always incl. top raw-fitness).")
+    ap.add_argument("--w-boot", type=float, default=None,
+                    help="blend weight of from-boot competence into selection "
+                         "fitness (default config 0.4).")
+    ap.add_argument("--restore-backward", dest="restore_backward",
+                    action="store_true", default=None,
+                    help="bias Go-Explore restores toward SHALLOW cells early, "
+                         "annealing deeper (D2; default ON via config).")
+    ap.add_argument("--no-restore-backward", dest="restore_backward",
+                    action="store_false", default=None,
+                    help="disable the backward-shift restore curriculum.")
+    ap.add_argument("--restore-backward-anneal-gens", type=int, default=None,
+                    help="gens over which the shallow restore quantile widens to "
+                         "the full frontier (default config 60).")
     ap.add_argument("--resume", action="store_true", default=False,
                     help="append to existing telemetry instead of rotating it "
                          "aside (for checkpoint-resume; default starts fresh)")

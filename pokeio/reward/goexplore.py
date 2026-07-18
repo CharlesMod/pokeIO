@@ -96,6 +96,16 @@ class GoExplore:
     recency_halflife: float = 4.0
     depth_weight: float = 0.25
     caps_per_round: float = 0.0  # max captures per swarm round (0 = unlimited)
+    # --- backward-shift restore curriculum (docs/specs/boot-gauntlet.md D2) ---
+    # When ``backward`` is on, restore sampling is restricted to cells in the
+    # bottom depth-quantile ``backward_q`` (the shallow / early-game frontier),
+    # so early generations respawn near newgame and the population re-earns the
+    # opening before deep frontier spawns dominate. The training loop anneals
+    # ``backward_q`` from ``restore_backward_q0`` toward 1.0 (full frontier) via
+    # :meth:`set_backward_schedule`, called once per generation. ``backward_q ==
+    # 1.0`` (the default) disables the mask — identical to the legacy sampler.
+    backward: bool = False
+    backward_q: float = 1.0
     # --- eviction / detachment guard (A6) ------------------------------------
     # The eviction keep-score used to be recency * visits * depth, so the fast
     # 0.5^(age/halflife) recency term crushed a proven deep hub to ~0 after a
@@ -149,6 +159,23 @@ class GoExplore:
     # ------------------------------------------------------------------ gen
     def begin_generation(self, gen: int) -> None:
         self.cur_gen = int(gen)
+
+    def set_backward_schedule(
+        self, gen: int, q0: float, anneal_gens: int
+    ) -> None:
+        """Update the eligible bottom-depth quantile for ``gen`` (D2 curriculum).
+
+        Linearly anneals ``backward_q`` from ``q0`` (gen 0) to 1.0 (full
+        frontier) over ``anneal_gens`` generations. A no-op that pins
+        ``backward_q = 1.0`` when :attr:`backward` is off, so the sampler stays
+        byte-identical to the legacy (depth-weighted, no-mask) behaviour."""
+        if not self.backward:
+            self.backward_q = 1.0
+            return
+        anneal = max(1, int(anneal_gens))
+        frac = min(1.0, max(0.0, float(gen) / anneal))
+        q0 = float(q0)
+        self.backward_q = float(min(1.0, q0 + (1.0 - q0) * frac))
 
     # --------------------------------------------------------------- update
     def note(
@@ -316,6 +343,20 @@ class GoExplore:
             return []
         entries = list(self.cells.values())
         w = self._weights_vec(entries)
+        # Backward-shift curriculum (D2): restrict eligibility to the bottom
+        # ``backward_q`` depth-quantile (shallow cells) early, annealing to the
+        # full frontier as ``backward_q`` -> 1.0. The rarity/recency/depth
+        # weighting still applies WITHIN the shallow subset (so the deepest of
+        # the currently-eligible cells is still preferred — the edge of what the
+        # population has mastered). A no-op when backward is off / q>=1.0.
+        if self.backward and self.backward_q < 1.0 and len(entries) > 1:
+            dep = np.fromiter(
+                (e.depth for e in entries), dtype=np.float64, count=len(entries)
+            )
+            thresh = np.quantile(dep, self.backward_q)
+            masked = w * (dep <= thresh)
+            if masked.sum() > 0.0:  # keep the mask only if it leaves live weight
+                w = masked
         s = w.sum()
         if not np.isfinite(s) or s <= 0:
             idxs = self.rng.integers(len(entries), size=k)
@@ -354,4 +395,5 @@ class GoExplore:
             "goexplore_restores": float(self.n_restores),
             "goexplore_throttled": float(self.n_throttled),
             "goexplore_max_depth": float(max(depths)),
+            "goexplore_backward_q": float(self.backward_q),
         }

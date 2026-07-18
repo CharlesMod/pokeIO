@@ -101,6 +101,23 @@ class WaveNovelty:
         # when the population fits one wave that is exactly the generation start.)
         self._visit_baseline: dict[bytes, int] = {}
 
+    def distinct_counts(self) -> np.ndarray:
+        """Per-player count of DISTINCT non-spawn cells reached this wave.
+
+        ``_credited`` accumulates every cell a player was credited for PLUS its
+        spawn cell (recorded on the first observe, never credited), so distinct
+        cells REACHED = ``len(credited) - 1_spawn``. Unlike :attr:`fitness` this
+        is order-independent and archive-independent (pure per-player key sets),
+        which is exactly the from-boot exploration signal the play-from-boot
+        selection eval (``train.loop.boot_eval_population``) scores genomes on."""
+        return np.array(
+            [
+                len(c) - (1 if seen else 0)
+                for c, seen in zip(self._credited, self._spawn_seen)
+            ],
+            dtype=np.float64,
+        )
+
     def raw_fitness(self) -> np.ndarray:
         """The per-player raw rarity credit ``f_i`` (Ledger 1) as a copy.
 
