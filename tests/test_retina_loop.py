@@ -240,17 +240,55 @@ def test_retina_end_to_end_barrier(tmp_path, capsys):
 
 
 @pytest.mark.skipif(not _HAVE_ROM, reason="Yellow ROM / reset-state not available")
-def test_retina_furnace_engine_rejected(tmp_path):
-    """retina + furnace must fail loudly (barrier/serial only for v1)."""
-    cfg = _tiny_config("p1_furnace", tmp_path, mode="retina")
-    with pytest.raises(NotImplementedError):
-        train(
-            gens=1, pop_size=8, players=4, episode_steps=8, obs_res=24,
-            run_id=cfg.run.run_id, config=cfg,
-            device_str="cuda:1" if torch.cuda.is_available() else "cpu",
-            live=False, parallel=True, engine="furnace",
-            boot_gauntlet_every=0, checkpoint_every=0,
-        )
+def test_retina_pipe_env_id_routing():
+    """Under FURNACE async batching the parent gets an arbitrary, out-of-order
+    subset of ready envs per cycle. ``env_ids`` must route each row into its OWN
+    ring so every env's temporal 4-stack is its own last-4 frames in order,
+    independent of cross-env interleaving. (No ROM/GPU needed — pure ring logic.)"""
+    from collections import deque
+
+    pipe = RetinaObsPipe(None, 3, OFFSETS, side=SIDE, stack=4)
+
+    def _row(env, t):
+        v = np.float32((env * 10 + t) / 100.0)  # unique per (env,t), in [0,1]
+        f = np.full((SIDE, SIDE), v, np.float32)
+        return _raw_row(f, f, np.zeros(14, np.float32), np.zeros(N_RAM, np.float32)), v
+
+    # interleaved async batches of (env, frame_t) — out of order, partial subsets
+    batches = [[(0, 0), (2, 0)], [(1, 0)], [(0, 1), (1, 1), (2, 1)], [(2, 2), (0, 2)]]
+    exp = {e: deque(maxlen=4) for e in range(3)}
+    for batch in batches:
+        rows, ids, vals = [], [], []
+        for (e, t) in batch:
+            r, v = _row(e, t)
+            rows.append(r); ids.append(e); vals.append((e, v))
+        ps, fs, _, _ = pipe._stacks(np.stack(rows), env_ids=np.array(ids, dtype=int))
+        for (e, v) in vals:  # mirror the pipe's clamp-to-frame-0 fill on first frame
+            if not exp[e]:
+                for _ in range(4):
+                    exp[e].append(v)
+            else:
+                exp[e].append(v)
+        for i, (e, _t) in enumerate(batch):
+            got = ps[i][:, 0, 0]  # (4,) per-frame scalar of env e's stack
+            assert np.allclose(got, list(exp[e])), (
+                f"env {e}: stack {got} != own last-4 {list(exp[e])}")
+            assert np.allclose(fs[i][:, 0, 0], list(exp[e]))  # fovea ring too
+
+
+@pytest.mark.skipif(not _HAVE_ROM, reason="Yellow ROM / reset-state not available")
+def test_retina_furnace_engine_runs(tmp_path):
+    """retina + FURNACE now runs end-to-end (the async port): no stall/crash, the
+    warm-up trains, evolution runs on the 102-d latent, telemetry is written."""
+    cfg = _tiny_config("pf_run", tmp_path, mode="retina")
+    run_dir = train(
+        gens=1, pop_size=8, players=4, episode_steps=16, obs_res=24,
+        run_id=cfg.run.run_id, config=cfg,
+        device_str="cuda:1" if torch.cuda.is_available() else "cpu",
+        live=False, parallel=True, engine="furnace",
+        goexplore=True, boot_gauntlet_every=0, checkpoint_every=0,
+    )
+    assert (Path(run_dir) / "telemetry.jsonl").exists()
 
 
 # --------------------------------------------------------------------------

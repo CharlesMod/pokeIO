@@ -220,16 +220,26 @@ class RetinaObsPipe:
         ram = np.ascontiguousarray(raw[:, self.o_ram:self.dim])
         return periph, fovea, proprio, ram
 
-    def _stacks(self, raw: np.ndarray):
-        """Push one frame per env into the rings; return ``(periph_stack,
-        fovea_stack, proprio, ram)`` = ``(m,K,84,84)x2 + (m,14) + (m,8)``."""
+    def _stacks(self, raw: np.ndarray, env_ids=None):
+        """Push one frame per row into its env's ring; return ``(periph_stack,
+        fovea_stack, proprio, ram)`` = ``(m,K,84,84)x2 + (m,14) + (m,8)``.
+
+        ``env_ids`` (optional): the env id owning each ROW of ``raw``. Default
+        ``None`` means row i == env i (the lockstep barrier/serial invariant:
+        every env reports together, in order). Under the FURNACE engine the
+        parent batches whichever envs are ready — an ARBITRARY, out-of-order
+        subset — so ``env_ids[i]`` routes row i's frame into that env's OWN ring
+        instead of ring i. This is what makes the per-env temporal 4-stacks
+        correct regardless of cross-env interleaving.
+        """
         periph, fovea, proprio, ram = self.split(raw)
         m = raw.shape[0]
         s, k = self.side, self.stack
         ps = np.empty((m, k, s, s), np.float32)
         fs = np.empty((m, k, s, s), np.float32)
         for i in range(m):
-            rp, rf = self._rp[i], self._rf[i]
+            e = i if env_ids is None else int(env_ids[i])
+            rp, rf = self._rp[e], self._rf[e]
             if not rp:  # first frame after a reset: fill k copies (clamp-to-0)
                 for _ in range(k):
                     rp.append(periph[i].copy())
@@ -241,9 +251,14 @@ class RetinaObsPipe:
             fs[i] = np.stack(rf, axis=0)
         return ps, fs, proprio, ram
 
-    def transform(self, raw: np.ndarray) -> np.ndarray:
-        """``(m,dim) -> (m,102)`` controller latent obs via the frozen snapshot."""
-        ps, fs, proprio, ram = self._stacks(raw)
+    def transform(self, raw: np.ndarray, env_ids=None) -> np.ndarray:
+        """``(m,dim) -> (m,102)`` controller latent obs via the frozen snapshot.
+
+        ``env_ids`` (optional): the env id per row of ``raw`` (see :meth:`_stacks`).
+        Default ``None`` preserves the row==env behaviour barrier/serial callers
+        rely on; the furnace path passes the ready-env indices so each row's
+        temporal ring is its own last-4 frames."""
+        ps, fs, proprio, ram = self._stacks(raw, env_ids)
         z = self.snap.encode_np(ps, fs)  # (m, z_dim) fp32, no grad, eval
         if z.ndim == 1:
             z = z[None, :]
@@ -273,6 +288,63 @@ def _retina_collect_fleet(fleet, pipe: RetinaObsPipe, episode_steps: int, rng,
             bt[i].append(int(acts[i]))
             sc[i].append((float(gdx[i]), float(gdy[i])))
         obs, _keys, _dones, _cap = fleet.step_all(acts, None, gaze_dx=gdx, gaze_dy=gdy)
+    return _retina_pack_segments(pf, ff, bt, sc), n * episode_steps
+
+
+def _retina_collect_fleet_async(fleet, pipe: RetinaObsPipe, episode_steps: int, rng,
+                                *, n: int | None = None):
+    """AsyncFleet equivalent of :func:`_retina_collect_fleet`.
+
+    The barrier collector's ``reset_all``/``step_all`` do not exist on the
+    free-running :class:`AsyncFleet`, so this drives the lock-free
+    ``obs_seq``/``act_seq`` handshake directly: reset -> ``begin_wave`` -> service
+    every env whose newest obs is unanswered with a RANDOM action (published
+    payload-first, ``act_seq`` last) -> ``end_wave``. An env advances at most one
+    step per parent cycle (a worker can't emit obs ``k+1`` until the parent
+    submits action ``k``), so recording ``obs_shm[i]`` the cycle env ``i`` is
+    ready captures its frames strictly in seq order — each segment is one env's
+    contiguous single-frame rollout and never crosses an episode boundary (one
+    wave == one episode per env). Rings are untouched here (``pipe.split`` only)."""
+    n = int(n if n is not None else fleet.n_envs)
+    R = int(episode_steps)
+    fleet.reset_all_begin(None)
+    fleet.reset_all_end()
+    obs_seq = fleet.arr["obs_seq"]
+    obs_shm = fleet.arr["obs"]
+    pf = [[] for _ in range(n)]
+    ff = [[] for _ in range(n)]
+    bt = [[] for _ in range(n)]
+    sc = [[] for _ in range(n)]
+    acted = np.full(n, -1, dtype=np.int64)
+    alive_check = 0
+    fleet.begin_wave(n, R)
+    while True:
+        snap = obs_seq[:n].copy()
+        ready = (snap > acted) & (snap < R)
+        if ready.any():
+            idx = np.nonzero(ready)[0]
+            periph, fovea, _pr, _rm = pipe.split(
+                np.ascontiguousarray(obs_shm[idx], dtype=np.float32))
+            m = len(idx)
+            acts = rng.integers(0, 9, m).astype(np.int32)
+            gdx = rng.uniform(-1.0, 1.0, m).astype(np.float32)
+            gdy = rng.uniform(-1.0, 1.0, m).astype(np.float32)
+            for j in range(m):
+                ii = int(idx[j])
+                pf[ii].append(periph[j].copy())
+                ff[ii].append(fovea[j].copy())
+                bt[ii].append(int(acts[j]))
+                sc[ii].append((float(gdx[j]), float(gdy[j])))
+            fleet.submit_actions(idx, acts, gdx, gdy, snap[idx])
+            acted[idx] = snap[idx]
+        elif bool((snap >= R).all()):
+            break
+        else:
+            time.sleep(2e-5)
+        alive_check += 1
+        if alive_check % 512 == 0:
+            fleet.check_alive()
+    fleet.end_wave()
     return _retina_pack_segments(pf, ff, bt, sc), n * episode_steps
 
 
@@ -309,6 +381,62 @@ def _retina_collect_serial(envs, encoder, pipe: RetinaObsPipe, episode_steps: in
             wrams[i] = wr
             last_btn[i] = acts[i]
     return _retina_pack_segments(pf, ff, bt, sc), n * episode_steps
+
+
+def _retina_collect(fleet, envs, encoder, pipe: RetinaObsPipe, episode_steps: int,
+                    reset_state: str, rng):
+    """Engine-aware retina warm-up / between-gen collection dispatcher.
+
+    Furnace runs need the async handshake collector; the barrier fleet keeps its
+    ``reset_all``/``step_all`` path; a serial (no-fleet) run collects env-by-env.
+    All three return the same ``(segments, frames)`` shape so the caller is
+    engine-agnostic."""
+    if isinstance(fleet, AsyncFleet):
+        return _retina_collect_fleet_async(fleet, pipe, episode_steps, rng)
+    if fleet is not None:
+        return _retina_collect_fleet(fleet, pipe, episode_steps, rng)
+    return _retina_collect_serial(
+        envs, encoder, pipe, episode_steps, reset_state, rng)
+
+
+def _retina_ckpt_to_cpu(obj):
+    """Recursively move tensors in a state_dict / optimizer-state tree to CPU so
+    the pickle checkpoint is device-portable (resume can re-place them)."""
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _retina_ckpt_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_retina_ckpt_to_cpu(v) for v in obj)
+    return obj
+
+
+def _retina_build_ckpt(retina, opt, pipe, config) -> dict:
+    """Serializable retina-learner state for the pickle checkpoint.
+
+    Persists the learner + optimizer + the CURRENTLY-frozen inference snapshot
+    (``pipe.snap`` — the exact encoder the live population is being fed), all on
+    CPU, plus the config to rebuild the module. Resuming reloads this and
+    continues the SAME encoder instead of re-warming a fresh one."""
+    snap_sd = None
+    if pipe is not None and getattr(pipe, "snap", None) is not None:
+        snap_sd = _retina_ckpt_to_cpu(pipe.snap.state_dict())
+    return {
+        "learner": _retina_ckpt_to_cpu(retina.state_dict()),
+        "optimizer": _retina_ckpt_to_cpu(opt.state_dict()),
+        "snapshot": snap_sd,
+        "config": {
+            "z_periph": int(config.retina.z_periph),
+            "z_fovea": int(config.retina.z_fovea),
+            "spr_k": int(config.retina.spr_k),
+            "ema_tau": float(config.retina.ema_tau),
+            "inverse_dynamics": bool(config.retina.inverse_dynamics),
+            "fsq_levels": list(config.retina.fsq_levels),
+            "n_act": 9,
+            "aug_shift_px": int(config.retina.aug_shift_px),
+            "aug_jitter": float(config.retina.aug_jitter),
+        },
+    }
 
 
 def _retina_pack_segments(pf, ff, bt, sc):
@@ -1197,16 +1325,12 @@ def evaluate_wave_async(
     """
     n = len(genomes)  # sub-wave size (<= fleet.n_envs)
     R = int(episode_steps)
-    if retina_pipe is not None:
-        # The furnace engine batches whichever envs happen to be ready each
-        # round, so a single per-env 4-frame ring + one batched snapshot encode
-        # (the barrier/serial invariant "all envs report together") does not hold.
-        # Retina mode is gated to the barrier/serial engines in train(); this is a
-        # defensive guard so a stray call fails loudly instead of desyncing rings.
-        raise NotImplementedError(
-            "retina obs transform is not wired into the furnace/async engine; "
-            "use --engine barrier (or --no-parallel). See docs/specs/retina-in-loop.md."
-        )
+    # Retina mode (docs/specs/retina-in-loop.md): the fleet ships raw 14134-d
+    # pixel obs; the parent transforms whichever envs are READY this cycle into
+    # the 102-d learned latent via per-env rings routed by env id (env_ids=idx),
+    # so the temporal 4-stacks stay per-env-correct despite the async engine
+    # batching an arbitrary ready subset (never rows 0..m-1). See the ready
+    # block below. Foveal mode leaves ``retina_pipe`` None and forwards raw obs.
     wave = WaveNovelty(archive, n, mode=novelty_mode, floor=novelty_floor)
 
     def _mark(key: str, t0: float) -> float:
@@ -1237,14 +1361,23 @@ def evaluate_wave_async(
     _t = _mark("pack_compile", _t)
     fleet.reset_all_end()
     _t = _mark("reset_all", _t)
+    if retina_pipe is not None:  # fresh episode -> clear every env's periph/fovea rings
+        retina_pipe.reset()
     if streamer is not None:
         streamer.set_phase("wave")
 
     # Optional CUDA-graph forward: collapses the ~60 kernel launches of the
     # 4-hop sparse forward + argmax into one replay (~3ms -> <1ms). Opt-in
-    # until it has a quiet-box A/B (POKEIO_CUDAGRAPH=1).
+    # until it has a quiet-box A/B (POKEIO_CUDAGRAPH=1). Disabled in retina
+    # mode: the graph captures a fixed (n, fleet.obs_dim) input, but the
+    # controller consumes the 102-d latent (not fleet.obs_dim), and the latent
+    # is rebuilt each cycle from the ready subset — so eager forward only.
     graph_fwd = None
-    if os.environ.get("POKEIO_CUDAGRAPH") == "1" and device.type == "cuda":
+    if (
+        os.environ.get("POKEIO_CUDAGRAPH") == "1"
+        and device.type == "cuda"
+        and retina_pipe is None
+    ):
         # The streamer's pump thread runs the champion-showcase forward on
         # this SAME device; a kernel launched mid-capture aborts the capture
         # ("operation failed due to a previous error during capture", races
@@ -1333,6 +1466,12 @@ def evaluate_wave_async(
     booked = np.zeros(n, dtype=np.int64)     # obs index bookkept through
     pending: dict[int, tuple[bytes, int]] = {}
     last_X = None
+    # Retina mode: persistent (n, 102) latent buffer. Each cycle only the READY
+    # rows are re-encoded (via their own rings) and written back; non-ready rows
+    # keep last cycle's latent, harmless because only ready rows' outputs and
+    # recurrent state are consumed (exactly as the foveal path forwards all n
+    # obs rows but consumes only `idx`). Allocated lazily at the first encode.
+    X_lat = None
     last_actions = np.zeros(n, dtype=np.int32)
     # R_resp accumulators (§6.3): only rows that actually stepped (ready) tick.
     btn_hist = np.zeros((n, N_BUTTONS), dtype=np.int64)
@@ -1460,7 +1599,21 @@ def evaluate_wave_async(
         else:
             t_anchor = None
         if ready.any():
-            X = np.ascontiguousarray(obs_shm[:n], dtype=np.float32)
+            idx = np.nonzero(ready)[0]
+            if retina_pipe is not None:
+                # raw 14134 pixel obs -> 102-d learned latent, but ONLY for the
+                # ready envs, routed into their OWN rings via env_ids=idx (the
+                # furnace batches an arbitrary out-of-order ready subset). The
+                # result scatters into the persistent latent buffer; non-ready
+                # rows keep their stale latent (discarded downstream).
+                raw_ready = np.ascontiguousarray(obs_shm[idx], dtype=np.float32)
+                lat = retina_pipe.transform(raw_ready, env_ids=idx)  # (m, 102)
+                if X_lat is None:
+                    X_lat = np.zeros((n, lat.shape[1]), dtype=np.float32)
+                X_lat[idx] = lat
+                X = X_lat
+            else:
+                X = np.ascontiguousarray(obs_shm[:n], dtype=np.float32)
             if graph_fwd is not None:
                 outv, new_state = graph_fwd(X, state_t)  # outv: (n, N_OUT)
             elif recurrent_memory:
@@ -1477,7 +1630,6 @@ def evaluate_wave_async(
             # Split the tanh head: buttons (argmax) + RAW saccade (dx,dy). The
             # worker applies tanh inside update_gaze, so pass the raw floats.
             acts, gdx, gdy = _split_head(outv, softmax_temp)
-            idx = np.nonzero(ready)[0]
             # R_resp: accumulate only the rows that actually consume an action.
             btn_hist[idx, acts[idx]] += 1
             o_sum[idx] += outv[idx]
@@ -2407,13 +2559,10 @@ def train(
     # Phase-1 selector: retina mode ships raw pixel obs (14134-d) from the fleet
     # and feeds the controller a learned 102-d latent (built parent-side below).
     retina_mode = str(config.vision.mode) == "retina"
-    if retina_mode and engine == "furnace":
-        raise NotImplementedError(
-            "vision.mode='retina' is not wired into the furnace/async engine yet: "
-            "the per-env 4-frame rings + one batched snapshot encode need the "
-            "lockstep obs the barrier/serial engines provide. Re-run with "
-            "--engine barrier (or --no-parallel). Foveal mode is unaffected."
-        )
+    # Retina is wired into BOTH engines now: the furnace path (evaluate_wave_async)
+    # transforms whichever envs are ready each cycle through env-id-routed per-env
+    # rings, so the temporal 4-stacks stay correct under async interleaving
+    # (docs/specs/retina-in-loop.md; the barrier path remains the reference).
     encoder = FovealEncoder(
         max(1, players),
         periph_grid=config.vision.periph_grid,
@@ -2718,6 +2867,7 @@ def train(
         checkpoint_every = int(getattr(config.run, "checkpoint_every_gens", 25))
     start_gen = 0
     total_agent_steps = 0  # cumulative across all agents (drives Play Years)
+    retina_ckpt = None  # persisted retina learner+snapshot (retina mode; below)
     if resume:
         ckpt, ck_status = load_checkpoint_status(run_dir)
         if ckpt is None and ck_status != LOAD_ABSENT:
@@ -2760,6 +2910,7 @@ def train(
             taps = ckpt["taps"] or []
             miner_rollouts = _deque(ckpt["miner_rollouts"], maxlen=8)
             miner_exclude = ckpt["miner_exclude"]
+            retina_ckpt = ckpt.get("retina")  # None on foveal / pre-feature ckpts
             start_gen = int(ckpt["gen"])
             # pre-feature checkpoints lack the cumulative step count: estimate
             # it from the resume gen (each gen ran pop_size*episode_steps steps)
@@ -2839,41 +2990,88 @@ def train(
             f"swap_gens={retina_swap_gens} warmup_frames={warmup_frames}",
             flush=True,
         )
-        if resume and start_gen > 0:
+        # --- resume: reload the SAME encoder (learner+opt+frozen snapshot) so a
+        #     resumed run continues the encoder the checkpoint was training,
+        #     instead of re-warming a fresh one. Backward-compatible: a foveal or
+        #     pre-feature checkpoint has retina_ckpt=None -> re-warm with a note.
+        resumed_retina = False
+        if retina_ckpt is not None:
+            try:
+                retina.load_state_dict(retina_ckpt["learner"])
+                retina_opt.load_state_dict(retina_ckpt["optimizer"])
+                # Adam momentum buffers load on CPU (checkpoint is device-portable);
+                # move them onto the train card so train_step's in-place updates
+                # don't hit a device mismatch against the GPU grads.
+                for _st in retina_opt.state.values():
+                    for _k, _v in _st.items():
+                        if torch.is_tensor(_v):
+                            _st[_k] = _v.to(train_dev)
+                if retina_ckpt.get("snapshot") is not None:
+                    _sc = retina_ckpt.get("config", {})
+                    snap_mod = Retina(
+                        z_periph=int(_sc.get("z_periph", config.retina.z_periph)),
+                        z_fovea=int(_sc.get("z_fovea", config.retina.z_fovea)),
+                        spr_k=int(_sc.get("spr_k", spr_k)),
+                        ema_tau=float(_sc.get("ema_tau", config.retina.ema_tau)),
+                        inverse_dynamics=bool(_sc.get(
+                            "inverse_dynamics", config.retina.inverse_dynamics)),
+                        fsq_levels=tuple(_sc.get(
+                            "fsq_levels", config.retina.fsq_levels)),
+                        n_act=int(_sc.get("n_act", 9)),
+                        aug_shift_px=int(_sc.get(
+                            "aug_shift_px", config.retina.aug_shift_px)),
+                        aug_jitter=float(_sc.get(
+                            "aug_jitter", config.retina.aug_jitter)),
+                    )
+                    snap_mod.load_state_dict(retina_ckpt["snapshot"])
+                    retina_pipe.set_snapshot(snap_mod.snapshot(device=infer_dev))
+                else:  # learner present but no frozen snapshot: freeze the learner
+                    retina_pipe.set_snapshot(retina.snapshot(device=infer_dev))
+                resumed_retina = True
+                print(
+                    "[retina] resumed learner + frozen snapshot from checkpoint; "
+                    "skipping warm-up (same encoder continues)", flush=True,
+                )
+            except Exception as _e:  # never abort a resume over the encoder state
+                resumed_retina = False
+                print(
+                    f"[retina] checkpoint retina restore failed ({_e}); "
+                    "re-warming a fresh encoder before evolution", flush=True,
+                )
+        elif resume and start_gen > 0:
             print(
-                "[retina] NOTE: the retina learner is not checkpointed; a resumed "
-                "run re-warms a fresh encoder before evolution (Phase-1 limitation).",
-                flush=True,
+                "[retina] NOTE: checkpoint carries no retina learner state "
+                "(foveal / pre-feature checkpoint); re-warming a fresh encoder "
+                "before evolution.", flush=True,
             )
-        # --- warm-up: collect swarm frames, train SPR+inv-dyn, then snapshot ---
-        frames = 0
-        while frames < warmup_frames:
-            if fleet is not None:
-                segs, got = _retina_collect_fleet(
-                    fleet, retina_pipe, episode_steps, rng)
-            else:
-                segs, got = _retina_collect_serial(
-                    envs, encoder, retina_pipe, episode_steps, reset_state, rng)
-            retina_buffer.extend(segs)
-            _retina_buffer_trim(retina_buffer, retina_buf_cap)
-            frames += got
-        warm_steps = max(16, warmup_frames // retina_batch)
-        hist = _retina_train(
-            retina, retina_opt, retina_buffer, warm_steps, spr_k, rng,
-            batch_size=retina_batch, log_every=max(1, warm_steps // 8),
-            label="retina/warmup",
-        )
-        if hist:
-            print(
-                f"[retina] warm-up done: {frames} frames, {len(hist)} steps, "
-                f"SPR {hist[0]['spr']:.4f} -> {hist[-1]['spr']:.4f}, "
-                f"inv_acc {hist[0]['inv_acc']:.3f} -> {hist[-1]['inv_acc']:.3f}",
-                flush=True,
+
+        if not resumed_retina:
+            # --- warm-up: collect swarm frames, train SPR+inv-dyn, then snapshot ---
+            frames = 0
+            while frames < warmup_frames:
+                segs, got = _retina_collect(
+                    fleet, envs, encoder, retina_pipe, episode_steps,
+                    reset_state, rng)
+                retina_buffer.extend(segs)
+                _retina_buffer_trim(retina_buffer, retina_buf_cap)
+                frames += got
+            warm_steps = max(16, warmup_frames // retina_batch)
+            hist = _retina_train(
+                retina, retina_opt, retina_buffer, warm_steps, spr_k, rng,
+                batch_size=retina_batch, log_every=max(1, warm_steps // 8),
+                label="retina/warmup",
             )
-        # Snapshot AFTER warm-up: genomes never consume a random-init encoder.
-        retina_pipe.set_snapshot(retina.snapshot(device=infer_dev))
-        print("[retina] snapshot #0 frozen (evolution starts on the 102-d latent)",
-              flush=True)
+            if hist:
+                print(
+                    f"[retina] warm-up done: {frames} frames, {len(hist)} steps, "
+                    f"SPR {hist[0]['spr']:.4f} -> {hist[-1]['spr']:.4f}, "
+                    f"inv_acc {hist[0]['inv_acc']:.3f} -> {hist[-1]['inv_acc']:.3f}",
+                    flush=True,
+                )
+            # Snapshot AFTER warm-up: genomes never consume a random-init encoder.
+            retina_pipe.set_snapshot(retina.snapshot(device=infer_dev))
+            print("[retina] snapshot #0 frozen (evolution starts on the 102-d latent)",
+                  flush=True)
 
     with TelemetryWriter(run_dir, resume=resume) as writer:
         gen_wall_prev = time.perf_counter()
@@ -3175,12 +3373,9 @@ def train(
             # swaps); we re-snapshot only every swap_gens so the latent obs is a
             # stationary target for evolution (anti-drift discipline §4.5).
             if retina_mode and retina is not None:
-                if fleet is not None:
-                    _segs, _ = _retina_collect_fleet(
-                        fleet, retina_pipe, episode_steps, rng)
-                else:
-                    _segs, _ = _retina_collect_serial(
-                        envs, encoder, retina_pipe, episode_steps, reset_state, rng)
+                _segs, _ = _retina_collect(
+                    fleet, envs, encoder, retina_pipe, episode_steps,
+                    reset_state, rng)
                 retina_buffer.extend(_segs)
                 _retina_buffer_trim(retina_buffer, retina_buf_cap)
                 _rh = _retina_train(
@@ -3194,7 +3389,18 @@ def train(
                         f"spr={_rh[-1]['spr']:.4f} inv_acc={_rh[-1]['inv_acc']:.3f}",
                         flush=True,
                     )
-                if retina_swap_gens > 0 and (gen + 1) % retina_swap_gens == 0:
+                # Swap the frozen inference encoder every swap_gens — but NEVER
+                # after the final generation's evaluation: the population selected
+                # this gen evolved under the CURRENT snapshot, so a post-eval swap
+                # would leave retina_pipe.snap (and the saved retina.pt) holding an
+                # encoder the final population never saw (the off-by-one). Skipping
+                # it on the last gen keeps retina_pipe.snap == the encoder the
+                # population is actually being fed, at end-of-run and each ckpt.
+                if (
+                    retina_swap_gens > 0
+                    and gen < gens - 1
+                    and (gen + 1) % retina_swap_gens == 0
+                ):
                     retina_pipe.set_snapshot(
                         retina.snapshot(device=_retina_device(
                             config.retina.infer_card, fallback=device)))
@@ -3370,6 +3576,13 @@ def train(
                 and gen < gens - 1
                 and (gen + 1) % checkpoint_every == 0
             ):
+                # Retina mode: persist the learner + optimizer + the currently
+                # frozen inference snapshot so a resumed run continues the SAME
+                # encoder (None for foveal -> additive checkpoint field).
+                retina_ckpt_payload = (
+                    _retina_build_ckpt(retina, retina_opt, retina_pipe, config)
+                    if (retina_mode and retina is not None) else None
+                )
                 _ck_dt = save_checkpoint(
                     run_dir,
                     build_checkpoint_state(
@@ -3379,6 +3592,7 @@ def train(
                         rng=rng, taps=taps, miner_rollouts=miner_rollouts,
                         miner_exclude=miner_exclude,
                         total_agent_steps=total_agent_steps,
+                        retina=retina_ckpt_payload,
                     ),
                 )
                 print(f"[checkpoint] gen {gen + 1} saved in {_ck_dt:.1f}s",
@@ -3421,8 +3635,11 @@ def train(
     if showcase_env is not None:
         showcase_env.close()
     # Persist the frozen retina the final population evolved against, so a champion
-    # measured/replayed later sees the exact latent it was selected under (the
-    # learner itself is not in the pickle checkpoint — Phase-1 limitation).
+    # measured/replayed later sees the exact latent it was selected under. This is
+    # the snapshot currently in retina_pipe.snap — with the final-gen swap skipped
+    # (above), that IS the encoder the final population was fed (off-by-one fixed).
+    # The learner+optimizer+this snapshot also ride in the pickle checkpoint so a
+    # --resume continues the SAME encoder instead of re-warming.
     if retina_mode and retina_pipe is not None and getattr(retina_pipe, "snap", None) is not None:
         try:
             import torch as _torch
@@ -3543,7 +3760,7 @@ def main() -> None:
                     default=None,
                     help="obs mode (default: config, 'foveal'). 'retina' wires the "
                          "learned SPR/FSQ latent spine as the perceptual spine "
-                         "(Phase 1; requires --engine barrier or --no-parallel).")
+                         "(Phase 1; works on both --engine furnace and barrier).")
     ap.add_argument("--retina-warmup-frames", type=int, default=None,
                     help="retina SSL warm-up budget in env-frames before gen 0 "
                          "(retina mode; default config 200000; use a small value "

@@ -117,11 +117,21 @@ def build_state(
     miner_rollouts,
     miner_exclude,
     total_agent_steps=0,
+    retina=None,
 ) -> dict:
     """Assemble the checkpoint dict from the loop's live objects.
 
     ``gen`` is the NEXT generation to run on resume (the loop checkpoints after
     reproduction, so ``genomes`` is already the next population).
+
+    ``retina`` (optional, Phase-1 retina mode): the learned-encoder state — the
+    learner + optimizer + the CURRENTLY-frozen inference snapshot (CPU tensors)
+    plus the config to rebuild the module. ``None`` for foveal runs. On resume a
+    retina run reloads this and continues the SAME encoder instead of re-warming
+    a fresh one; a checkpoint written before this field existed simply lacks the
+    key (``data.get("retina")`` -> ``None``) and falls back to re-warm. Kept as
+    an ADDITIVE field so the schema is unchanged and older/foveal checkpoints
+    still load.
     """
     return {
         "gen": int(gen),
@@ -137,6 +147,7 @@ def build_state(
         "miner_rollouts": list(miner_rollouts),
         "miner_exclude": miner_exclude,
         "total_agent_steps": int(total_agent_steps),
+        "retina": retina,
     }
 
 
