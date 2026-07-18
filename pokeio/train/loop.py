@@ -42,7 +42,13 @@ from pokeio.config import Config
 from pokeio.emu.env import PokeEnv
 from pokeio.emu.fleet import AsyncFleet, BarrierFleet, FovealEncoder, ObsEncoder
 from pokeio.evo.forward import TANH, population_forward_sparse
-from pokeio.evo.genome import InnovationTracker, Population, make_genome
+from pokeio.evo.genome import (
+    HIDDEN,
+    OUTPUT,
+    InnovationTracker,
+    Population,
+    make_genome,
+)
 from pokeio.evo.ops import MutationRates, Speciation, compatibility_distance
 from pokeio.reward.archive import NoveltyArchive
 from pokeio.reward.goexplore import GoExplore
@@ -743,6 +749,32 @@ def _screen_ref(screen: np.ndarray) -> str:
     return "blake2b:" + hashlib.blake2b(screen.tobytes(), digest_size=8).hexdigest()
 
 
+def _champion_alpha_terms(champion, slow_thresh: float = 0.5) -> dict[str, float]:
+    """Champion's learned time-constant (alpha) distribution over its HIDDEN +
+    OUTPUT nodes, for the live wall (spec [TC] telemetry).
+
+    A healthy time-constants run is bimodal — a fast reflex mass at alpha≈1 plus
+    a slow-integrator mass at alpha<0.5. ``alpha_p10/p50/p90`` track the spread
+    and ``alpha_slow_frac`` (fraction with alpha < ``slow_thresh``) the slow
+    share. Returns ``{}`` when time constants are inert (a champion whose
+    controllable nodes are all alpha==1 -> nothing worth plotting) so the panel
+    stays clean on legacy/foveal-without-tau runs."""
+    alphas = [
+        float(n.alpha)
+        for n in champion.nodes.values()
+        if n.type in (HIDDEN, OUTPUT)
+    ]
+    if not alphas or all(a >= 1.0 for a in alphas):
+        return {}
+    a = np.asarray(alphas, dtype=np.float64)
+    return {
+        "alpha_p10": float(np.percentile(a, 10)),
+        "alpha_p50": float(np.percentile(a, 50)),
+        "alpha_p90": float(np.percentile(a, 90)),
+        "alpha_slow_frac": float(np.mean(a < slow_thresh)),
+    }
+
+
 # --------------------------------------------------------------------------
 # live pace switching (spectate mode)
 # --------------------------------------------------------------------------
@@ -874,6 +906,11 @@ def _slice_compiled(cp, lo: int, hi: int):
         cp,
         node_act=cp.node_act[lo:hi],
         node_bias=cp.node_bias[lo:hi],
+        # Time constants (spec [TC]): node_tau is None on a legacy (all-alpha==1)
+        # population — keep None; once alpha<1 is live compile() emits a full
+        # (N, M) tensor and the per-wave slice must track node_act/node_bias, else
+        # the forward shape-mismatches. (mirrors forward.population_forward's a:b.)
+        node_tau=None if cp.node_tau is None else cp.node_tau[lo:hi],
         conn_in_slot=cp.conn_in_slot[lo:hi],
         conn_out_slot=cp.conn_out_slot[lo:hi],
         conn_weight=cp.conn_weight[lo:hi],
@@ -2508,7 +2545,13 @@ def _fast_copy(g):
     return _G(
         n_in=g.n_in,
         n_out=g.n_out,
-        nodes={k: _NG(v.id, v.type, v.act, v.bias) for k, v in g.nodes.items()},
+        # carry the time-constant gene (alpha) like Genome.copy()'s replace() does
+        # — else a copied elite/parent would silently reset to alpha=1 and diverge
+        # from ops.reproduce.
+        nodes={
+            k: _NG(v.id, v.type, v.act, v.bias, alpha=v.alpha)
+            for k, v in g.nodes.items()
+        },
         conns={
             k: _CG(c.in_id, c.out_id, c.weight, c.enabled, c.innov)
             for k, c in g.conns.items()
@@ -2554,9 +2597,15 @@ def _fast_crossover(p1, p2, rng, disabled_inherit_prob: float = 0.75):
     p2n = p2.nodes
     cn = child.nodes
     for nid in needed:
-        ng = p1n.get(nid) or p2n.get(nid)
+        n1 = p1n.get(nid)
+        n2 = p2n.get(nid)
+        ng = n1 or n2
         if ng is not None:
-            cn[nid] = _NG(ng.id, ng.type, ng.act, ng.bias)
+            # Matching node (in both parents) inherits the AVERAGE alpha; a
+            # disjoint/excess node keeps its own. Deterministic (no rng), so this
+            # mirrors ops.crossover and leaves the rng stream unchanged.
+            alpha = 0.5 * (n1.alpha + n2.alpha) if (n1 and n2) else ng.alpha
+            cn[nid] = _NG(ng.id, ng.type, ng.act, ng.bias, alpha=alpha)
     return child
 
 
@@ -2589,6 +2638,7 @@ def _fast_mutate(g, tracker, rng, rates, weight_scale: float = 1.0):
         _HIDDEN_ACTS,
         mutate_add_connection,
         mutate_add_node,
+        mutate_tau,
         mutate_toggle,
     )
     from pokeio.evo.genome import HIDDEN as _HID
@@ -2607,6 +2657,13 @@ def _fast_mutate(g, tracker, rng, rates, weight_scale: float = 1.0):
         if hids:
             nid = int(rng.choice(hids))
             g.nodes[nid].act = _HIDDEN_ACTS[int(rng.integers(len(_HIDDEN_ACTS)))]
+    # Time-constant mutation (spec [TC]): guarded EXACTLY like mutate_act above
+    # and at the same point in the rng stream as ops.mutate_genome, so a
+    # mutate_tau==0 run draws zero extra rng (fast_reproduce identity contract).
+    # Delegates to ops.mutate_tau, which iterates g.nodes in the same order the
+    # fast path builds it — bit-identical draws to ops.reproduce with tau active.
+    if rates.mutate_tau and rng.random() < rates.mutate_tau:
+        mutate_tau(g, rng, rates)
     return g
 
 
@@ -2908,6 +2965,16 @@ def train(
             n_proprio=14,
             protect_ram_taps=bool(config.evo.protect_ram_taps),
             protect_proprio=bool(config.evo.protect_proprio),
+            # Neural-native timing (spec [TC]): seed a timescale spread on the
+            # gen-0 OUTPUT nodes so slow integrators exist from the start. α is
+            # controller-side (applies to foveal AND retina); config-driven only.
+            # With time_constants=False this draws ZERO rng and every node stays
+            # α=1 (bit-identical legacy).
+            time_constants=bool(config.evo.time_constants),
+            tau_min=float(config.evo.tau_min),
+            tau_init_fast_frac=float(config.evo.tau_init_fast_frac),
+            tau_init_slow_lo=float(config.evo.tau_init_slow_lo),
+            tau_init_slow_hi=float(config.evo.tau_init_slow_hi),
         )
         for _ in range(pop_size)
     ]
@@ -2934,6 +3001,13 @@ def train(
         weight_perturb_sigma=0.1 * init_std,
         weight_reset_scale=init_std,
         weight_clamp=4.0 * init_std,
+        # Neural-native timing (spec [TC]): per-genome prob of a log-scale α
+        # perturbation on hidden/output nodes. mutate_tau=0.0 draws ZERO extra
+        # rng (guarded exactly like mutate_act), preserving the fast_reproduce
+        # rng-identity contract for legacy runs.
+        mutate_tau=config.evo.mutate_tau,
+        tau_min=config.evo.tau_min,
+        tau_perturb_sigma=config.evo.tau_perturb_sigma,
     )
     spec = Speciation(threshold=config.evo.species_threshold, c1=1.0, c2=1.0, c3=0.4)
     # Calibrate the WRAM churn-mask before the archive exists: strided WRAM
@@ -3797,6 +3871,9 @@ def train(
                     reward_terms["boot_eval_progress_best"] = float(boot_prog[ev].max())
             if go is not None:
                 reward_terms.update(go.stats())
+            # Neural-native timing (spec [TC]): surface the champion's learned
+            # alpha spread so the wall can watch the fast/slow split emerge.
+            reward_terms.update(_champion_alpha_terms(champion))
 
             # Push the real side-panel payloads to the live stream (species +
             # per-term reward breakdown; archive stats are read live).

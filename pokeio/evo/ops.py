@@ -11,6 +11,7 @@ function also takes explicit overrides so the module is testable in isolation.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -41,6 +42,15 @@ class MutationRates:
     weight_reset_scale: float = 1.0
     toggle: float = 0.01
     mutate_act: float = 0.0
+    # -- neural-native timing (spec [TC]) -------------------------------------
+    # ``mutate_tau``: per-genome probability of perturbing node time constants.
+    # DEFAULTS TO 0.0 so a plain ``MutationRates()`` draws ZERO extra rng — this
+    # keeps ``ops.mutate_genome`` bit-for-bit rng-identical to loop.py's
+    # ``_fast_mutate`` (which does not know about alpha), preserving the
+    # fast_reproduce determinism contract. The trainer sets it from config.
+    mutate_tau: float = 0.0
+    tau_min: float = 0.05  # alpha floor (slowest neuron)
+    tau_perturb_sigma: float = 0.15  # sigma of the log10(alpha) Gaussian step
     feedforward: bool = True  # forbid cycles on add-connection
     # |w| ceiling applied after perturb/reset (0 = unbounded).  IMPORTANT at
     # wide input: the perturb/reset random walk has stationary weight std
@@ -192,6 +202,25 @@ def mutate_toggle(g: Genome, rng: np.random.Generator) -> None:
     c.enabled = not c.enabled
 
 
+def mutate_tau(g: Genome, rng: np.random.Generator, rates: MutationRates) -> None:
+    """Perturb each hidden/output node's leaky-integration rate ``alpha`` on a
+    LOG scale (time constants are multiplicative, so a fixed additive step in
+    ``log10(alpha)`` is scale-free), bounded to ``[rates.tau_min, 1.0]``.
+
+    Only HIDDEN/OUTPUT nodes carry a meaningful alpha (INPUT/BIAS are re-clamped
+    every hop). ``alpha == 1`` = fast reflex; small alpha = slow integrator."""
+    lo = math.log10(rates.tau_min)
+    sigma = rates.tau_perturb_sigma
+    for n in g.nodes.values():
+        if n.type in (HIDDEN, OUTPUT):
+            la = math.log10(n.alpha) + float(rng.normal(0.0, sigma))
+            if la > 0.0:
+                la = 0.0  # alpha <= 1
+            elif la < lo:
+                la = lo  # alpha >= tau_min
+            n.alpha = 10.0 ** la
+
+
 def mutate_genome(
     g: Genome,
     tracker: InnovationTracker,
@@ -213,6 +242,11 @@ def mutate_genome(
         if hids:
             nid = int(rng.choice(hids))
             g.nodes[nid].act = _HIDDEN_ACTS[int(rng.integers(len(_HIDDEN_ACTS)))]
+    # Short-circuit guard (like mutate_act): with mutate_tau == 0 NO rng is drawn,
+    # so this is a no-op that keeps mutate_genome rng-identical to loop.py's
+    # _fast_mutate (fast_reproduce determinism contract).
+    if rates.mutate_tau and rng.random() < rates.mutate_tau:
+        mutate_tau(g, rng, rates)
     return g
 
 
@@ -263,9 +297,16 @@ def crossover(
     for nid in list(p1.input_ids()) + [p1.bias_id] + list(p1.output_ids()):
         needed.add(nid)
     for nid in needed:
-        ng = p1.nodes.get(nid) or p2.nodes.get(nid)
+        n1 = p1.nodes.get(nid)
+        n2 = p2.nodes.get(nid)
+        ng = n1 or n2
         if ng is not None:
-            child.nodes[nid] = NodeGene(ng.id, ng.type, ng.act, ng.bias)
+            # Carry the time-constant gene like a weight: a matching node (present
+            # in both parents) inherits the AVERAGE alpha; a disjoint/excess node
+            # keeps its own. Deterministic (no rng draw), so crossover stays
+            # rng-identical to loop.py's _fast_crossover.
+            alpha = 0.5 * (n1.alpha + n2.alpha) if (n1 and n2) else ng.alpha
+            child.nodes[nid] = NodeGene(ng.id, ng.type, ng.act, ng.bias, alpha=alpha)
     return child
 
 
@@ -467,6 +508,7 @@ __all__ = [
     "mutate_add_connection",
     "mutate_add_node",
     "mutate_toggle",
+    "mutate_tau",
     "mutate_genome",
     "crossover",
     "compatibility_distance",

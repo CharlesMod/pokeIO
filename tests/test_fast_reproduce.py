@@ -44,7 +44,10 @@ def _genome_sig(g):
     being hostage to the last ULP (both paths are pure-python float math, so in
     practice they match exactly — the rounding is belt-and-suspenders)."""
     nodes = tuple(
-        sorted((n.id, n.type, n.act, round(float(n.bias), 12)) for n in g.nodes.values())
+        sorted(
+            (n.id, n.type, n.act, round(float(n.bias), 12), round(float(n.alpha), 12))
+            for n in g.nodes.values()
+        )
     )
     conns = tuple(
         sorted(
@@ -59,11 +62,14 @@ def _sigs(genomes):
     return [_genome_sig(g) for g in genomes]
 
 
-def _build(seed, npop, *, n_in=3, n_out=2, diversify=0, threshold=100.0):
+def _build(seed, npop, *, n_in=3, n_out=2, diversify=0, threshold=100.0, time_constants=False):
     """A small, evaluable population + its species assignment + tracker."""
     rng = np.random.default_rng(seed)
     tracker = InnovationTracker(n_in, n_out)
-    genomes = [make_genome(n_in, n_out, tracker, rng, connect="full") for _ in range(npop)]
+    genomes = [
+        make_genome(n_in, n_out, tracker, rng, connect="full", time_constants=time_constants)
+        for _ in range(npop)
+    ]
     for i, g in enumerate(genomes):
         for _ in range(i % (diversify + 1) if diversify else 0):
             ops.mutate_add_node(g, tracker, rng)
@@ -134,6 +140,34 @@ def test_identity_holds_with_nondefault_rates():
     )
     ko, ro, kf, rf = _run_both(genomes, species, tracker, pop_size=20, rates=rates)
     assert _sigs(ko) == _sigs(kf)
+    assert ro.bit_generator.state == rf.bit_generator.state
+
+
+def test_identity_holds_with_tau_active():
+    """The rng-identity contract must survive the time-constants gene (spec [TC]).
+
+    The default rates leave ``mutate_tau=0`` (tau perturbation drawn zero times),
+    so the other cases above never exercise the α path — the determinism proof
+    with α *live* previously lived only in a throwaway scratch script. This pins
+    it in CI: seed a genuine timescale spread (``time_constants=True`` seeds
+    α<1 slow integrators at gen 0), reproduce with a heavy ``mutate_tau=0.5``,
+    and require both the offspring fingerprint (now including α) AND the final
+    rng bit-generator state to match between the fast path and ``ops.reproduce``.
+    If ``_fast_mutate`` drew tau at a different stream position, or ``_fast_copy``
+    /``_fast_crossover`` dropped/averaged α differently, this goes RED."""
+    genomes, species, tracker = _build(11, 20, threshold=1e9, time_constants=True)
+    # Sanity: the seed actually produced slow integrators, else the test is vacuous.
+    assert any(
+        float(n.alpha) < 1.0 for g in genomes for n in g.nodes.values()
+    ), "time_constants=True seeded no α<1 node — test would be vacuous"
+    rates = ops.MutationRates(mutate_tau=0.5, tau_perturb_sigma=0.2)
+    ko, ro, kf, rf = _run_both(genomes, species, tracker, pop_size=20, rates=rates)
+    assert len(ko) == len(kf) == 20
+    # At least one child's α must have moved, else mutate_tau never fired.
+    assert any(
+        float(n.alpha) < 1.0 for g in kf for n in g.nodes.values()
+    ), "no α<1 survived reproduction — mutate_tau path not exercised"
+    assert _sigs(ko) == _sigs(kf), "offspring (incl. α) diverged with tau active"
     assert ro.bit_generator.state == rf.bit_generator.state
 
 

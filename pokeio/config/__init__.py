@@ -126,6 +126,18 @@ class EvoConfig:
     protect_ram_taps: bool = True  # connect tap->output at init, exempt from toggle/split
     protect_proprio: bool = True  # same for proprio->output edges
     softmax_temp: float = 0.0  # 0 = plain argmax over out[:9]; >0 = temperature-softmax
+    # -- Neural-native timing: evolvable per-neuron time constant (spec [TC]) ---
+    # CTRNN leaky integration a_t = (1-alpha)*a_{t-1} + alpha*f(net), one gene per
+    # node (stored on NodeGene.alpha). alpha=1 = fast reflex (legacy overwrite);
+    # small alpha = slow integrator (~1/alpha-step native dwell-timer). Evolution
+    # discovers the timescale mix per game/state.
+    time_constants: bool = True  # False => force alpha=1 everywhere (exact legacy)
+    tau_min: float = 0.05  # slowest neuron: alpha floor (~20-step integration window)
+    tau_init_fast_frac: float = 0.5  # fraction of nodes seeded alpha≈1 (reflex) at init
+    tau_init_slow_lo: float = 0.1  # slow-band alpha lower bound (log-uniform seed)
+    tau_init_slow_hi: float = 0.5  # slow-band alpha upper bound
+    mutate_tau: float = 0.2  # per-genome prob of a log-scale alpha mutation
+    tau_perturb_sigma: float = 0.15  # sigma of the log10(alpha) Gaussian step
 
 
 @dataclass

@@ -39,7 +39,7 @@ from pokeio.evo.forward import IDENTITY, SIGMOID, TANH, CompiledPopulation
 
 # attribute extractors used by the vectorized packer (C-level, one call per gene
 # instead of one attribute-lookup expression compiled per element).
-_NODE_ATTRS = attrgetter("type", "act", "bias")
+_NODE_ATTRS = attrgetter("type", "act", "bias", "alpha")
 _CONN_ATTRS = attrgetter("in_id", "out_id", "weight", "enabled")
 
 # node types
@@ -62,6 +62,16 @@ class NodeGene:
     type: int  # INPUT / BIAS / OUTPUT / HIDDEN
     act: int  # activation index (see forward.ACT_NAMES)
     bias: float = 0.0
+    # -- neural-native timing: evolvable CTRNN leaky-integration gene ----------
+    # ``alpha`` is the per-step update rate in (0, 1] of the leaky node update
+    # ``a_t = (1-alpha)*a_{t-1} + alpha*f(net)`` (see forward.propagate_sparse).
+    # ``alpha == 1`` = fast reflex, i.e. the legacy full-overwrite update (this is
+    # the DEFAULT, so any node/genome built without touching alpha is bit-for-bit
+    # the pre-time-constants network). ``alpha`` small = slow integrator that
+    # averages ~1/alpha steps — a native dwell-timer / "how long since X". Bounded
+    # to [config.evo.tau_min, 1.0]; mutated on a log scale (see ops.mutate_tau).
+    # Stored directly as alpha (not log-space) so the forward uses it verbatim.
+    alpha: float = 1.0
 
 
 @dataclass
@@ -169,6 +179,11 @@ def make_genome(
     n_proprio: int = 0,
     protect_ram_taps: bool = True,
     protect_proprio: bool = True,
+    time_constants: bool = False,
+    tau_min: float = 0.05,
+    tau_init_fast_frac: float = 0.5,
+    tau_init_slow_lo: float = 0.1,
+    tau_init_slow_hi: float = 0.5,
 ) -> Genome:
     """Create a minimal genome (inputs + bias + outputs).
 
@@ -204,16 +219,41 @@ def make_genome(
     and ``ops.mutate_add_node`` skip protected edges, so evolution may re-weight
     the channel but never sever it.
 
+    Time-constant seeding (spec [TC])
+    ---------------------------------
+    With ``time_constants=True`` the OUTPUT nodes (the only non-I/O nodes that
+    exist at gen 0; hidden nodes are grown later by mutation, seeded fast) are
+    given a spread of leaky-integration rates ``alpha`` so timescale diversity is
+    present from generation 0: a fraction ``tau_init_fast_frac`` are seeded
+    ``alpha == 1`` (fast reflex, legacy behaviour) and the rest draw a slow
+    ``alpha`` log-uniformly in ``[tau_init_slow_lo, tau_init_slow_hi]`` (clamped
+    to ``[tau_min, 1]``). With ``time_constants=False`` (the DEFAULT, every legacy
+    caller) NO rng is drawn for alpha and every node keeps ``alpha == 1.0`` — the
+    genome, its weight-init rng stream, and the forward are all bit-for-bit
+    unchanged from before this feature.
+
     Safe defaults: with ``n_ram = n_proprio = 0`` (every existing caller) the
     block is empty, nothing is protected, and ``sparse`` adds no extra edges —
     the only change from before is the fan-in-scaled ``full`` weight std.
     """
+
+    def _seed_alpha() -> float:
+        """Draw a seed alpha; only touches ``rng`` when time_constants is on."""
+        if not time_constants:
+            return 1.0
+        if rng.random() < tau_init_fast_frac:
+            return 1.0  # fast reflex neuron (legacy full-overwrite)
+        lo, hi = math.log10(tau_init_slow_lo), math.log10(tau_init_slow_hi)
+        a = 10.0 ** float(rng.uniform(lo, hi))  # log-uniform slow integrator
+        return float(min(1.0, max(tau_min, a)))
+
     g = Genome(n_in=n_in, n_out=n_out)
     for i in g.input_ids():
         g.nodes[i] = NodeGene(id=i, type=INPUT, act=IDENTITY, bias=0.0)
     g.nodes[g.bias_id] = NodeGene(id=g.bias_id, type=BIAS, act=IDENTITY, bias=0.0)
     for o in g.output_ids():
-        g.nodes[o] = NodeGene(id=o, type=OUTPUT, act=output_act, bias=0.0)
+        g.nodes[o] = NodeGene(id=o, type=OUTPUT, act=output_act, bias=0.0,
+                              alpha=_seed_alpha())
 
     # trailing connect-protected block:  [ ... proprio (n_proprio) | ram (n_ram) ]
     ram_lo = n_in - n_ram
@@ -286,6 +326,7 @@ class Population:
     node_type: Tensor  # (N, M) long   (-1 pads)
     node_act: Tensor  # (N, M) long
     node_bias: Tensor  # (N, M) float
+    node_tau: Tensor  # (N, M) float  (per-node leaky-integration alpha; 1.0 pads)
     node_mask: Tensor  # (N, M) bool
 
     conn_in: Tensor  # (N, C) long   (global src id; -1 pads)
@@ -357,6 +398,9 @@ class Population:
         node_type = np.full((N, M), -1, dtype=np.int64)
         node_act = np.zeros((N, M), dtype=np.int64)
         node_bias = np.zeros((N, M), dtype=np.float32)
+        # pad alpha = 1.0 (a padded/empty slot is a legacy full-overwrite node, so
+        # an all-1.0 tensor means "no time constants" and compile() can drop it).
+        node_tau = np.ones((N, M), dtype=np.float32)
         node_mask = np.zeros((N, M), dtype=np.bool_)
 
         conn_in = np.full((N, C), -1, dtype=np.int64)
@@ -405,11 +449,14 @@ class Population:
             ids = sorted(nodes)
             k = len(ids)
             node_id[i, :k] = ids
-            # gather (type, act, bias) for the sorted nodes in one C-level pass
-            types, acts, biases = zip(*map(_NODE_ATTRS, (nodes[nid] for nid in ids)))
+            # gather (type, act, bias, alpha) for the sorted nodes in one C-level pass
+            types, acts, biases, alphas = zip(
+                *map(_NODE_ATTRS, (nodes[nid] for nid in ids))
+            )
             node_type[i, :k] = types
             node_act[i, :k] = acts
             node_bias[i, :k] = biases
+            node_tau[i, :k] = alphas
             node_mask[i, :k] = True
 
             conns = g.conns
@@ -430,6 +477,7 @@ class Population:
             node_type[ridx] = prev.node_type.cpu().numpy()[ridx]
             node_act[ridx] = prev.node_act.cpu().numpy()[ridx]
             node_bias[ridx] = prev.node_bias.cpu().numpy()[ridx]
+            node_tau[ridx] = prev.node_tau.cpu().numpy()[ridx]
             node_mask[ridx] = prev.node_mask.cpu().numpy()[ridx]
             conn_in[ridx] = prev.conn_in.cpu().numpy()[ridx]
             conn_out[ridx] = prev.conn_out.cpu().numpy()[ridx]
@@ -448,6 +496,7 @@ class Population:
             node_type=torch.from_numpy(node_type),
             node_act=torch.from_numpy(node_act),
             node_bias=torch.from_numpy(node_bias),
+            node_tau=torch.from_numpy(node_tau),
             node_mask=torch.from_numpy(node_mask),
             conn_in=torch.from_numpy(conn_in),
             conn_out=torch.from_numpy(conn_out),
@@ -473,6 +522,16 @@ class Population:
         out_slot = torch.searchsorted(node_id, cout.clamp(min=0)).clamp(max=self.M - 1)
 
         valid = self.conn_mask.to(dev) & self.conn_enabled.to(dev)
+        # Time-constants: only attach a per-node alpha tensor when at least one
+        # node actually integrates (alpha < 1). An all-1.0 tensor is the legacy
+        # full-overwrite network, so we hand the forward ``None`` and it takes the
+        # bit-for-bit unchanged path. This is ALSO a safety valve for the trainer:
+        # a legacy population compiles to ``node_tau=None``, which ``_slice_compiled``
+        # (dataclasses.replace) carries through unharmed. NOTE for the loop wiring
+        # (TC follow-up): once time constants are live (alpha<1), ``node_tau`` is a
+        # full (N, M) tensor and ``_slice_compiled`` in train/loop.py MUST slice it
+        # alongside node_act/node_bias, else the per-wave forward will shape-mismatch.
+        node_tau = None if bool(torch.all(self.node_tau == 1.0)) else self.node_tau.to(dev)
         return CompiledPopulation(
             node_act=self.node_act.to(dev),
             node_bias=self.node_bias.to(dev),
@@ -483,6 +542,7 @@ class Population:
             n_in=self.n_in,
             n_out=self.n_out,
             M=self.M,
+            node_tau=node_tau,
         )
 
 

@@ -94,6 +94,11 @@ class CompiledPopulation:
     n_in: int
     n_out: int
     M: int
+    # per-node leaky-integration rate alpha (N, M) for CTRNN time constants, or
+    # ``None`` for the legacy full-overwrite network (alpha == 1 everywhere).
+    # Optional + trailing so every existing constructor (and the trainer's
+    # ``dataclasses.replace``-based row-slicer) keeps working unchanged.
+    node_tau: Tensor | None = None
 
     @property
     def device(self) -> torch.device:
@@ -135,6 +140,7 @@ def propagate(
     n_out: int,
     X: Tensor,
     steps: int,
+    node_tau: Tensor | None = None,
 ) -> Tensor:
     """Iterated propagation over a ready weight tensor.
 
@@ -143,6 +149,8 @@ def propagate(
     ``node_act``  : ``(N, M)`` long.
     ``node_bias`` : ``(N, M)`` float.
     ``X``         : ``(N, B, n_in)`` inputs (``B`` = inputs evaluated per genome).
+    ``node_tau``  : ``(N, M)`` float per-node leaky-integration rate ``alpha``, or
+                    ``None`` for the legacy full-overwrite update (see below).
     returns       : ``(N, B, n_out)`` outputs.
     """
     N, M, _ = W.shape
@@ -156,12 +164,17 @@ def propagate(
     bias_slot = n_in
     x[:, :, bias_slot] = 1.0
 
+    # alpha broadcasts over the B axis: (N, 1, M). None => legacy overwrite.
+    alpha = None if node_tau is None else node_tau.to(dev, dtype).unsqueeze(1)
     nbias = node_bias.unsqueeze(1)  # (N, 1, M)
     for _ in range(steps):
         # z[n,b,i] = sum_j W[n,i,j] x[n,b,j]
         z = torch.bmm(W, x.transpose(1, 2)).transpose(1, 2)  # (N, B, M)
         z = z + nbias
-        x = apply_activation(z, node_act)
+        x_new = apply_activation(z, node_act)
+        # leaky integration a = (1-alpha)*a_prev + alpha*f(net); alpha==1 (or the
+        # ``None`` fast path) reproduces the legacy overwrite bit-for-bit.
+        x = x_new if alpha is None else (1.0 - alpha) * x + alpha * x_new
         # re-clamp the driven nodes (inputs + bias) every step
         x[:, :, 0:n_in] = Xc
         x[:, :, bias_slot] = 1.0
@@ -184,6 +197,7 @@ def propagate_sparse(
     steps: int,
     state: Tensor | None = None,
     return_state: bool = False,
+    node_tau: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """Edge-list propagation that never materialises the dense ``(M, M)`` matrix.
 
@@ -202,6 +216,15 @@ def propagate_sparse(
     evolved hidden/output state persists).  ``None`` seeds zeros (the classic
     memoryless behaviour).  With ``return_state=True`` the final ``x`` is
     returned alongside the output so the caller can feed it back next step.
+
+    ``node_tau`` (optional, ``(N, M)``): per-node leaky-integration rate ``alpha``
+    for CTRNN time constants.  The node update becomes
+    ``a = (1-alpha)*a_prev + alpha*f(net)`` where ``a_prev`` is the persisted
+    ``x`` — so ``alpha`` integrates over BOTH the within-step propagation hops
+    AND (because ``state`` seeds ``x``) the cross-agent-step recurrence, using the
+    same gene consistently.  ``alpha == 1`` (and ``node_tau is None``) reproduce
+    the legacy full-overwrite update bit-for-bit.  Inputs/bias are re-clamped
+    after the update, so their alpha never matters.
     """
     N, E = conn_in_slot.shape
     B = X.shape[1]
@@ -220,6 +243,8 @@ def propagate_sparse(
     x[:, :, 0:n_in] = Xc
     x[:, :, n_in] = 1.0
     nbias = node_bias.unsqueeze(1)
+    # alpha broadcasts over the B axis: (N, 1, M). None => legacy overwrite.
+    alpha = None if node_tau is None else node_tau.to(dev, dtype).unsqueeze(1)
 
     for _ in range(steps):
         x_in = torch.gather(x, 2, in_idx)  # (N, B, E)
@@ -227,7 +252,9 @@ def propagate_sparse(
         z = torch.zeros(N, B, M, device=dev, dtype=dtype)
         z.scatter_add_(2, out_idx, contrib)
         z = z + nbias
-        x = apply_activation(z, node_act)
+        x_new = apply_activation(z, node_act)
+        # leaky integration over the persisted state; alpha==1 / None is legacy.
+        x = x_new if alpha is None else (1.0 - alpha) * x + alpha * x_new
         x[:, :, 0:n_in] = Xc
         x[:, :, n_in] = 1.0
 
@@ -264,6 +291,7 @@ def population_forward_sparse(
         steps,
         state=state,
         return_state=return_state,
+        node_tau=cp.node_tau,
     )
 
 
@@ -285,6 +313,7 @@ def population_forward(
     if chunk is None:
         chunk = N
 
+    tau = cp.node_tau
     outs: list[Tensor] = []
     for a in range(0, N, chunk):
         b = min(a + chunk, N)
@@ -297,6 +326,7 @@ def population_forward(
             cp.n_out,
             X[a:b],
             steps,
+            node_tau=None if tau is None else tau[a:b],
         )
         outs.append(out)
     return torch.cat(outs, dim=0)
