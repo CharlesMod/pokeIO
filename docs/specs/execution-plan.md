@@ -5,6 +5,16 @@ thesis track in parallel**. Everything routed through the live dashboard (Tailsc
 http://100.74.178.26:8600) so testing is watchable. Each build item = agent → `--live` smoke on the
 wall → commit. The real multi-day run launches once the controller improvements are in.
 
+**BINDING CONSTRAINT — cross-game species bootstrap (user, 2026-07-17).** A goal is to seed the NEXT
+game's population with THIS game's evolved species. A genome only transfers if its input weights read a
+**transfer-stable, game-agnostic observation**. So: keep the genome obs transfer-stable — the **foveal
+encoder qualifies** (hand-defined, fixed n_in=454 / N_OUT=12, game-invariant grid semantics); the
+**per-game learned retina latent does NOT** (transfer-breaking unless made a universal/shared retina).
+[MF]/Φ is orthogonal (genomes transfer via the obs; Φ re-warms per game). The only game-specific piece
+of the foveal obs is the 8 RAM taps → reset/re-discover them on transfer. Bootstrap TOOLING (export
+species → seed pop, reset taps, re-base InnovationTracker) deferred until a run earns it. See
+`memory: pokeio-cross-game-transfer`. Do not commit to the per-game retina latent in a way that breaks this.
+
 Legend: ☐ todo · ◐ in progress · ☑ done. Handles in [brackets].
 
 ## Critical path — SEQUENTIAL (all touch loop.py / genome / forward; one at a time, commit between)
