@@ -26,6 +26,7 @@ Endpoints
 * ``GET /api/live?run=ID``       → parsed runs/<run-or-newest>/live.json (real frames + champion net) or {}
 * ``GET /api/select?run=ID&idx=N`` → writes runs/<ID>/select.json (focus agent; -1 = champion)
 * ``GET /api/pace?run=ID&mode=realtime|max`` → writes runs/<ID>/pace.json (live spectate toggle)
+* ``GET /api/stop?run=ID``       → writes runs/<ID>/stop.json (graceful stop: checkpoint + free VRAM)
 * ``GET /api/host``              → {"cpu_pct","cpu_per_core":[...],"gpu":[...]}
 
 Dependency-light: stdlib + psutil (+ orjson via the telemetry reader). Never 500s
@@ -174,6 +175,7 @@ def _live(run: str | None) -> dict:
 
 SELECT_FILENAME = "select.json"  # focus-agent selection, read by the trainer
 PACE_FILENAME = "pace.json"  # spectate/max pace toggle, read by the trainer
+STOP_FILENAME = "stop.json"  # graceful-stop request, read by the trainer
 _PACE_MODES = ("realtime", "max")
 
 
@@ -222,6 +224,28 @@ def _select(run: str | None, idx) -> dict:
     except Exception:
         return {"ok": False}
     return {"ok": True, "idx": i}
+
+
+def _stop(run: str | None) -> dict:
+    """Atomically write ``runs/<run>/stop.json`` = {"stop": true, "ts": now}.
+
+    The RUNNING trainer stat-polls this at each generation boundary; on seeing it,
+    it saves a checkpoint, tears down the fleet (freeing the worker procs + the
+    inference GPU/VRAM), and exits cleanly — the run is resumable from the
+    checkpoint. Missing run dir -> {"ok": false} (always HTTP 200; never raises).
+    """
+    if not run:
+        return {"ok": False}
+    d = RUNS_DIR / run
+    if not d.is_dir():
+        return {"ok": False}
+    tmp = d / (STOP_FILENAME + ".tmp")
+    try:
+        tmp.write_text(json.dumps({"stop": True, "ts": time.time()}))
+        os.replace(tmp, d / STOP_FILENAME)
+    except Exception:
+        return {"ok": False}
+    return {"ok": True, "stopping": run}
 
 
 def _telemetry(run: str | None) -> dict:
@@ -282,6 +306,10 @@ class Handler(BaseHTTPRequestHandler):
                 run = (q.get("run") or [None])[0]
                 mode = (q.get("mode") or [None])[0]
                 self._json(_pace(run, mode))
+            elif path == "/api/stop":
+                q = parse_qs(u.query)
+                run = (q.get("run") or [None])[0]
+                self._json(_stop(run))
             elif path == "/api/host":
                 self._json(_host_stats())
             elif path == "/healthz":

@@ -213,6 +213,10 @@
   .pacebtn:hover{color:var(--ink-dim)}
   .pacebtn.on{color:var(--amber); border-color:var(--amber); box-shadow:0 0 8px rgba(224,168,56,.25)}
   #pace-rt.on{color:var(--aqua); border-color:var(--aqua); box-shadow:0 0 8px rgba(24,162,196,.25)}
+  .stopbtn{font-family:var(--mono); font-size:9.5px; letter-spacing:.12em; text-transform:uppercase; padding:5px 9px; margin-left:2px; border:1px solid rgba(214,90,70,.5); border-radius:5px; background:transparent; color:rgba(214,96,76,.92); cursor:pointer}
+  .stopbtn:hover{color:#e0654a; border-color:#e0654a; box-shadow:0 0 8px rgba(214,90,70,.3)}
+  .stopbtn.armed{color:#fff; background:rgba(196,52,40,.9); border-color:#e0654a; box-shadow:0 0 10px rgba(214,90,70,.5)}
+  .stopbtn:disabled{opacity:.6; cursor:default}
   #cd-v.evolving{color:var(--violet); font-size:11.5px; line-height:1.5; white-space:nowrap}
 
   @media (prefers-reduced-motion:reduce){*{animation-duration:.001ms!important; transition-duration:.001ms!important}}
@@ -239,6 +243,7 @@
     <div class="pacewrap" title="live-toggle the RUNNING trainer — no restart">
       <button class="pacebtn" id="pace-rt">▶ SPECTATE<small>real-time</small></button>
       <button class="pacebtn on" id="pace-max">🔥 FURNACE<small>max</small></button>
+      <button class="stopbtn" id="stop-run" title="checkpoint + stop the run, free VRAM & workers">■ STOP</button>
     </div>
     <div class="grow"></div>
     <div class="rom">
@@ -1821,6 +1826,37 @@ poll(); setInterval(poll,1500);
 </script>
 
 <script>
+/* ===== STOP CONTROL — graceful checkpoint-and-stop (frees VRAM + workers) =====
+   Destructive => two-click arm→confirm. GET /api/stop?run=<id> writes
+   runs/<id>/stop.json; the RUNNING trainer stat-polls it at the gen boundary,
+   checkpoints, tears down the fleet (freeing worker procs + inference VRAM), and
+   exits cleanly (resumable from the checkpoint). */
+(function(){
+"use strict";
+var $=function(id){return document.getElementById(id);};
+function runId(){
+  if(window.POKE_RUN)return window.POKE_RUN;
+  try{return new URLSearchParams(location.search).get('run')||'';}catch(e){return '';}
+}
+var b=$('stop-run'); if(!b)return;
+var armed=false, t=0;
+function disarm(){armed=false; b.classList.remove('armed'); b.textContent='■ STOP';}
+b.addEventListener('click',function(){
+  if(!armed){                                   /* first click: arm for 4s */
+    armed=true; b.classList.add('armed'); b.textContent='CONFIRM STOP?';
+    clearTimeout(t); t=setTimeout(disarm,4000); return;
+  }
+  clearTimeout(t); armed=false; b.classList.remove('armed');
+  var run=runId();
+  if(!run){b.textContent='(no run)'; setTimeout(disarm,1500); return;}
+  b.textContent='STOPPING…'; b.disabled=true;   /* second click: send */
+  try{fetch('/api/stop?run='+encodeURIComponent(run),{cache:'no-store'})
+    .then(function(){b.textContent='■ STOPPED';})
+    .catch(function(){b.textContent='■ STOP'; b.disabled=false;});}
+  catch(e){b.textContent='■ STOP'; b.disabled=false;}
+});
+})();
+
 /* ===== PACE CONTROL — spectate/max toggle + BREEDING countdown ==============
    Backend contract: GET /api/pace?run=<id>&mode=realtime|max atomically writes
    runs/<id>/pace.json; the RUNNING trainer stat-polls it and flips live (no
