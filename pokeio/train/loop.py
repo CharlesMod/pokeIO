@@ -398,6 +398,61 @@ def _blind_ablation_gate(cp, probe_obs, device, *, beta, dmin, optical_hi=432):
     return gate, float(np.median(delta))
 
 
+def _channel_dependence(cp, probe_obs, device, enc) -> dict[str, float]:
+    """[optical-frontend-v2] Per-channel-group action dependence for the CHAMPION.
+
+    Mirrors :func:`_blind_ablation_gate`'s batched forward, but instead of one
+    optical block it zeroes EACH v2 channel group independently and measures the
+    champion's action shift ``Δ_g = mean_P || a_real − a_zeroed_g ||_1`` over the
+    probe buffer ``P``.  ``cp`` is a 1-genome CHAMPION population (N==1), so each
+    group costs one tiny forward — this answers "does the controller USE this
+    channel, or ignore the extra ~2000 dims?".  TELEMETRY ONLY — a separate cp
+    from the selection gate, never fed back into fitness/gate/determinism.
+
+    Returns ``{}`` on legacy/coarse foveal (FG==G, no memory/reflex) and on retina
+    obs (the 102-d latent has no v2 channels) so the panel stays clean; otherwise
+    ``dep_periph/dep_fovea/dep_motion`` (always, foveal) plus ``dep_buffer/dep_stale``
+    (``foveal_memory``) and ``dep_reflex`` (``reflex_gaze``) for the groups that
+    exist.  Reuses the exact blind-gate forward idiom (L1 over out, mean over P)."""
+    if probe_obs is None or len(probe_obs) == 0:
+        return {}
+    # v2-active gate: only meaningful once a NEW v2 channel is present (sharp
+    # fovea, trans-saccadic memory, or reflex gaze).  A pure legacy/coarse foveal
+    # obs (FG==G, no memory/reflex) — and retina's 102-d latent — emit nothing.
+    if enc is None or getattr(enc, "mode", "foveal") == "retina":
+        return {}
+    if not (bool(getattr(enc, "foveal_memory", False))
+            or bool(getattr(enc, "reflex_gaze", False))
+            or int(getattr(enc, "FG", 0)) != int(getattr(enc, "G", 0))):
+        return {}
+    # Channel-group [lo:hi) slices from the encoder's REAL offsets (skip absent
+    # features).  motion's hi is o_motion_hi (== _o_buffer with memory, else
+    # _o_proprio); reflex is the 2 target dims INSIDE proprio the blind gate keeps.
+    groups: list[tuple[str, int, int]] = [
+        ("periph", enc._o_periph, enc._o_fovea),
+        ("fovea", enc._o_fovea, enc._o_motion),
+        ("motion", enc._o_motion, enc.o_motion_hi),
+    ]
+    if getattr(enc, "foveal_memory", False):
+        groups.append(("buffer", enc._o_buffer, enc._o_stale))
+        groups.append(("stale", enc._o_stale, enc._o_proprio))
+    if getattr(enc, "reflex_gaze", False):
+        groups.append(("reflex", enc._o_proprio + 14, enc._o_proprio + 16))
+    P = np.ascontiguousarray(np.asarray(probe_obs, dtype=np.float32))
+    out: dict[str, float] = {}
+    with torch.no_grad():
+        xt = torch.from_numpy(P).to(device)              # (P,dim) -> (1,P,dim)
+        real = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
+        for name, lo, hi in groups:
+            Pz = P.copy()
+            Pz[:, int(lo):int(hi)] = 0.0
+            xtz = torch.from_numpy(Pz).to(device)
+            zeroed = population_forward_sparse(cp, xtz, steps=FORWARD_STEPS)
+            d = (real - zeroed).abs().sum(dim=2).mean(dim=1)  # (1,): L1 over out, mean P
+            out[f"dep_{name}"] = float(d[0].item())
+    return out
+
+
 # --------------------------------------------------------------------------
 # Phase-1 retina spine (docs/specs/retina-in-loop.md; active-vision-spine §4/§6)
 # --------------------------------------------------------------------------
@@ -1074,6 +1129,33 @@ def _champion_cadence_terms(champion) -> dict[str, float]:
             out["cadence_dwell_lo_sal"] = float(d[lo].mean())
         if (~lo).any():
             out["cadence_dwell_hi_sal"] = float(d[~lo].mean())
+    return out
+
+
+def _champion_v2_terms(champion) -> dict[str, float]:
+    """[optical-frontend-v2 §3/§4/§1a] Champion's solo-replay active-vision
+    dynamics for the live wall (mirrors ``_champion_cadence_terms``).
+
+    Reads the reflex-aiming + memory-freshness stats stashed on the champion by
+    ``replay_champion`` (which steps a LIVE encoder over the solo replay).  The
+    reflex block proves the bottom-up reflex actually AIMS the gaze —
+    ``gaze_motion_capture`` is the fraction of gaze-updates whose realized move
+    pointed TOWARD the reflex target, ``gaze_motion_cos`` the mean cosine, and
+    ``reflex_pull_mag`` the mean raw pull magnitude ``|target − gaze|`` (§3).
+    The memory block proves the trans-saccadic buffer is maintained —
+    ``mem_mean_stale`` (0 fresh .. 1 stale) and ``mem_fresh_frac`` (cells with
+    staleness < 0.5).  Returns ``{}`` when neither feature is on (nothing stashed)
+    so the legacy/coarse/retina panel stays clean."""
+    out: dict[str, float] = {}
+    rfx = getattr(champion, "_v2_reflex", None)
+    if rfx:
+        out["gaze_motion_capture"] = float(rfx["capture"])
+        out["gaze_motion_cos"] = float(rfx["cos"])
+        out["reflex_pull_mag"] = float(rfx["pull"])
+    mem = getattr(champion, "_v2_mem", None)
+    if mem:
+        out["mem_mean_stale"] = float(mem["stale"])
+        out["mem_fresh_frac"] = float(mem["fresh"])
     return out
 
 
@@ -2619,6 +2701,23 @@ def replay_champion(
     trace = np.empty((steps, wram.size), dtype=np.uint8) if record_wram else None
     state = None  # recurrent node-state carried across the replay episode
     last_button = 8  # NOOP until the first action lands
+    # [optical-frontend-v2 §3/§4/§1a] active-vision telemetry accumulated over the
+    # solo replay + stashed on the genome below (_champion_v2_terms reads it back).
+    # Reflex-aiming: does the emitted gaze move TOWARD the bottom-up reflex target?
+    # Memory: is the trans-saccadic buffer kept fresh?  Both no-op when off.
+    _v2_reflex_on = reflex is not None
+    _v2_mem_on = bool(getattr(encoder, "foveal_memory", False))
+    _o_prop = int(encoder.o_proprio)
+    _v2_pull_n = 0           # gaze-updates the reflex ran on
+    _v2_pull_sum = 0.0       # Σ |reflex target − gaze| (raw pull magnitude; §3).
+    # (NOT the self-calibrated command — that EMA-normalizes to ~gain and blows up
+    #  on the reset-frame zero-pull seed; the raw pull is bounded [0,~2.8] & honest.)
+    _v2_cap_valid = 0        # gaze-updates with a nonzero realized move AND pull
+    _v2_cap_hits = 0         # ... whose move pointed TOWARD the reflex target
+    _v2_cap_cos_sum = 0.0    # Σ cos(gaze_delta, target − gaze)
+    _v2_mem_steps = 0
+    _v2_mem_stale_sum = 0.0  # Σ mean staleness (0 fresh .. 1 stale)
+    _v2_mem_fresh_sum = 0.0  # Σ fraction of buffer cells fresh (staleness < 0.5)
     for t in range(steps):
         x = encoder.encode(0, screen, wram, button=int(last_button))
         if retina_pipe is not None:  # raw 14134 pixel obs -> 102-d learned latent
@@ -2645,6 +2744,31 @@ def replay_champion(
         else:
             action = int(acts[0])
         encoder.update_gaze(0, float(gdx[0]), float(gdy[0]))  # steer next fovea
+        # [telemetry §3/§4] did the realized gaze move TOWARD the reflex target?
+        # Pre-move gaze + target read from the SAME obs x the blend used (proprio,
+        # normalized [-1,1]); post-move gaze from the encoder, same normalization.
+        if _v2_reflex_on:
+            _gy_px, _gx_px = encoder.gaze(0)
+            _gx0, _gy0 = float(x[_o_prop + 0]), float(x[_o_prop + 1])
+            _dgx = _gx_px * 2.0 / encoder.W - 1.0 - _gx0   # realized Δgaze (normed)
+            _dgy = _gy_px * 2.0 / encoder.H - 1.0 - _gy0
+            _px = float(x[_o_prop + 14]) - _gx0            # pull toward reflex target
+            _py = float(x[_o_prop + 15]) - _gy0
+            _nm, _npull = math.hypot(_dgx, _dgy), math.hypot(_px, _py)
+            _v2_pull_n += 1
+            _v2_pull_sum += _npull
+            if _nm > 1e-9 and _npull > 1e-9:
+                _dot = _dgx * _px + _dgy * _py
+                _v2_cap_valid += 1
+                _v2_cap_hits += 1 if _dot > 0.0 else 0
+                _v2_cap_cos_sum += _dot / (_nm * _npull)
+        # [telemetry §1a] trans-saccadic buffer freshness (mean staleness + fresh %).
+        if _v2_mem_on:
+            _st = encoder.mem_staleness(0)
+            if _st.size:
+                _v2_mem_steps += 1
+                _v2_mem_stale_sum += float(_st.mean())
+                _v2_mem_fresh_sum += float((_st < 0.5).mean())
         last_button = action
         screen, wram, _done, info = env.step(action)
         time.sleep(0)  # cooperative GIL handoff for the live pump thread
@@ -2669,6 +2793,20 @@ def replay_champion(
         genome._ac_dwells = list(clock.dwells)
         genome._ac_dwell_sal = list(clock.dwell_sal)
         genome._ac_break_cause = dict(clock.break_cause)
+    # [optical-frontend-v2 §3/§4/§1a] stash the solo-replay active-vision dynamics
+    # on the champion for the wall panel (_champion_v2_terms reads them; absent =>
+    # legacy-clean).  Reflex aiming needs ≥1 valid (moved) gaze-update this replay.
+    if _v2_reflex_on and _v2_cap_valid > 0:
+        genome._v2_reflex = {
+            "capture": _v2_cap_hits / _v2_cap_valid,
+            "cos": _v2_cap_cos_sum / _v2_cap_valid,
+            "pull": (_v2_pull_sum / _v2_pull_n) if _v2_pull_n else 0.0,
+        }
+    if _v2_mem_on and _v2_mem_steps > 0:
+        genome._v2_mem = {
+            "stale": _v2_mem_stale_sum / _v2_mem_steps,
+            "fresh": _v2_mem_fresh_sum / _v2_mem_steps,
+        }
     return trace
 
 
@@ -4110,6 +4248,19 @@ def train(
                 )
             _bt = _phase("blind_gate", _bt)
 
+            # [optical-frontend-v2] per-channel-group action dependence for the
+            # CHAMPION (telemetry only): mirror the blind gate's batched forward on
+            # a fresh 1-genome champion cp, zeroing each v2 channel group in turn.
+            # {} on legacy/coarse/retina obs; a SEPARATE cp — never feeds selection,
+            # the gate, or fast_reproduce.
+            dep_terms: dict[str, float] = {}
+            if probe_sink:
+                _dep_cp = Population.from_genomes(
+                    [champion], max_nodes=max_nodes, max_conns=max_conns
+                ).compile(device)
+                dep_terms = _channel_dependence(_dep_cp, probe_sink, device, encoder)
+            _bt = _phase("chan_dep", _bt)
+
             # Update the showcase to this generation's real champion and push a
             # fresh live frame at the generation boundary.
             if streamer is not None:
@@ -4391,6 +4542,12 @@ def train(
             # break-cause histogram + commit-gate alpha (stashed by replay_champion
             # above).  Returns {} when AC is off, so the legacy panel stays clean.
             reward_terms.update(_champion_cadence_terms(champion))
+            # [optical-frontend-v2] champion active-vision dynamics (reflex aiming +
+            # memory freshness, stashed by replay_champion above) + per-channel-group
+            # dependence (computed after the blind gate).  All {} when the v2 features
+            # are off, so the legacy/coarse/retina panel stays clean.  TELEMETRY ONLY.
+            reward_terms.update(_champion_v2_terms(champion))
+            reward_terms.update(dep_terms)
 
             # Push the real side-panel payloads to the live stream (species +
             # per-term reward breakdown; archive stats are read live).
