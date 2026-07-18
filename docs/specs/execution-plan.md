@@ -25,13 +25,18 @@ Legend: ☐ todo · ◐ in progress · ☑ done. Handles in [brackets].
   fast neurons emerge); no instability. **DONE `d3c6dcf`** — 259 tests green (incl. tau-active
   fast_reproduce determinism); `tc_live` on the wall showed a stable bimodal split (α p10≈0.15 slow /
   p90=1.0 fast, slow_frac≈0.5) across gens with no instability.
-- ◐ **[AC] Adaptive cadence.** Learned (button, dwell-duration) with a reflex floor (k=1), decoupled
+- ☑ **[AC] Adaptive cadence.** Learned (button, dwell-duration) with a reflex floor (k=1), decoupled
   gaze vs motor clocks, salience-interruptible dwell (uses the magno signal when available; a
   surprise term for now). **Design of record: `docs/specs/adaptive-cadence.md` (LatchGate — dwell = a
   commit-gate output neuron whose TC α IS the dwell clock; reuses [TC], no evo-core edit; feature
   lives in config + loop.py).** Files: train/loop.py, config (env/genome/forward/ops/fleet unchanged).
   **Accept (UI):** a `--live` smoke where dwell is state-dependent (long in menus/dialogue, ~1 in
   motion); reflex floor + break-cause histogram reachable; gate-α slow; no stall; boot-gauntlet holds.
+  **DONE — skeleton `30b0a8a` + self-tuning `dc03413`.** 288 tests green; determinism intact
+  (fast_reproduce==ops at N_OUT 11 & 12, AC-off byte-identical, engine-parity). Self-tuning mandate
+  §11b honored: per-env EMA-z salience (no fixed magnitude), reflex-margin off, R_resp→salience↔commit
+  correlation. `ac_selftune_live` wall showed the bimodal split emerge in the champion (gen-2:
+  dwell_lo_sal 65 ≫ hi_sal 33.5, slow gate-α). Stability of dwell-dominance is a real-run question.
 - ☐ **[RUN] Launch the real run.** Wipe `runs/live1` (authorized), launch a fresh square-0 `--live`
   Phase-0 run with PB+TC+AC folded in, furnace engine, boot gauntlet on, watchable on the wall.
   Runs for days — this item = launch + verify healthy, not finish.
