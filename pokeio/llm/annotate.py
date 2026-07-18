@@ -123,7 +123,7 @@ class AnnotationWorker(threading.Thread):
         self.queue: "queue.Queue" = queue.Queue()
         self.use_cache = bool(use_cache)
         self.poll = float(poll)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()  # NOT _stop: Thread._stop is a bound method
         self.n_written = 0
         self.n_failed = 0
 
@@ -138,7 +138,7 @@ class AnnotationWorker(threading.Thread):
 
     # -- consumer side ------------------------------------------------------
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 item = self.queue.get(timeout=self.poll)
             except queue.Empty:
@@ -205,7 +205,7 @@ class AnnotationWorker(threading.Thread):
         """Signal the worker to finish. ``drain`` waits for the queue to empty first."""
         if drain:
             self.queue.join()
-        self._stop.set()
+        self._stop_event.set()
         self.queue.put(self._SENTINEL)  # unblock a get() that is waiting
         if self.is_alive():
             self.join(timeout=timeout)
