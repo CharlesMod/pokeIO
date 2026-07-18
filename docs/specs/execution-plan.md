@@ -9,7 +9,7 @@ Legend: ☐ todo · ◐ in progress · ☑ done. Handles in [brackets].
 
 ## Critical path — SEQUENTIAL (all touch loop.py / genome / forward; one at a time, commit between)
 
-- ☐ **[PB] Play-from-boot — the top blocker.** Both spines' champions are Go-Explore frontier
+- ☑ **[PB] Play-from-boot — the top blocker.** Both spines' champions are Go-Explore frontier
   specialists that don't play from newgame (composition gap). Make selection reward from-boot
   competence: (a) enable/refine the from-newgame eval blended into selection fitness
   (`reward.policy_eval_steps`, scored by progress+exploration from boot); (b) backward-shift the
@@ -18,25 +18,29 @@ Legend: ☐ todo · ◐ in progress · ☑ done. Handles in [brackets].
   fitness. Files: train/loop.py, reward/*, config. **Accept (UI):** a `--live` smoke where the
   champion, from newgame, reaches materially more distinct screens / leaves the start area vs the
   frontier-specialist baseline; boot-gauntlet depth rises.
-- ☐ **[TC] Time-constants — neural-native timing.** Evolvable per-neuron time constant (CTRNN leaky
+- ☑ **[TC] Time-constants — neural-native timing.** Evolvable per-neuron time constant (CTRNN leaky
   integration `h=(1-α)h+α·f(Wx+b)`), one gene/node, log-scale mutation, bounded, seeded with a
   timescale spread. Files: evo/genome.py, evo/forward.py, evo/ops.py, config. **Accept (UI):** XOR/
   timing unit tests pass; a `--live` smoke shows the learned α distribution differentiates (slow +
-  fast neurons emerge); no instability.
-- ☐ **[AC] Adaptive cadence.** Learned (button, dwell-duration) with a reflex floor (k=1), decoupled
+  fast neurons emerge); no instability. **DONE `d3c6dcf`** — 259 tests green (incl. tau-active
+  fast_reproduce determinism); `tc_live` on the wall showed a stable bimodal split (α p10≈0.15 slow /
+  p90=1.0 fast, slow_frac≈0.5) across gens with no instability.
+- ◐ **[AC] Adaptive cadence.** Learned (button, dwell-duration) with a reflex floor (k=1), decoupled
   gaze vs motor clocks, salience-interruptible dwell (uses the magno signal when available; a
-  surprise term for now). Files: emu/env.py, evo/genome.py+forward.py, train/loop.py, emu/fleet.py,
-  config. **Accept (UI):** a `--live` smoke where the learned dwell distribution adapts (long dwells
-  in menus/dialogue, short in motion); reflex floor reachable; no stall.
+  surprise term for now). **Design of record: `docs/specs/adaptive-cadence.md` (LatchGate — dwell = a
+  commit-gate output neuron whose TC α IS the dwell clock; reuses [TC], no evo-core edit; feature
+  lives in config + loop.py).** Files: train/loop.py, config (env/genome/forward/ops/fleet unchanged).
+  **Accept (UI):** a `--live` smoke where dwell is state-dependent (long in menus/dialogue, ~1 in
+  motion); reflex floor + break-cause histogram reachable; gate-α slow; no stall; boot-gauntlet holds.
 - ☐ **[RUN] Launch the real run.** Wipe `runs/live1` (authorized), launch a fresh square-0 `--live`
   Phase-0 run with PB+TC+AC folded in, furnace engine, boot gauntlet on, watchable on the wall.
   Runs for days — this item = launch + verify healthy, not finish.
 
 ## Parallel tracks — ISOLATED files (run alongside the critical path)
 
-- ☐ **[CR] Credibility harness.** New `pokeio/eval/`: noise/blank-frame ablation control,
+- ☑ **[CR] Credibility harness.** New `pokeio/eval/`: noise/blank-frame ablation control,
   random-weight-search baseline, geometric-mean-of-milestones metric (IQM + CIs). Isolated new
-  module + tests. **Accept:** runnable on a checkpoint; metric computed from telemetry.
+  module + tests. **Accept:** runnable on a checkpoint; metric computed from telemetry. **DONE `561a5c2`.**
 - ☐ **[MF] Manifest/LLM loop (thesis keystone).** Wire manifest generate→consume and a
   distill-then-FREEZE reward (ONI/Motif: async caption annotation → small frozen reward model the CPU
   loop optimizes; never a live inner-loop judge). Non-loop parts (llm/, manifest/, reward/) build in
@@ -44,9 +48,18 @@ Legend: ☐ todo · ◐ in progress · ☑ done. Handles in [brackets].
   a frozen reward term influences selection; game-agnostic (no Yellow constants leak).
 
 ## Shelved research branch (revisit after PB+TC+AC show progress on a real run)
+Framing (generalization thought-experiment, 2026-07-17 — Tetris/Mario/BoxBoy): the perception+control
+substrate (optical obs, saccade, TC, AC) is game-agnostic by construction; generalization is
+bottlenecked by the game-agnostic PROGRESS signal (→ [MF] is the keystone), and each shelved branch
+closes a *specific game-class* gap, not a random research bet:
 - Retinal channels (ON/OFF + magno/parvo + motion-saccade) — layer onto retina once it earns the spine.
+  **Closes the scroller gap:** in side-scrollers (Mario) ego-motion scrolls the whole screen, so the
+  motion-sheet salience fires on self-motion not objects; an optic-flow/magno channel disentangles it.
 - Retina-as-spine commitment + FSQ cells — bench-race vs Phase 0 only after the base actually plays.
-- World model / imagination — far-later bet.
+  **Closes the Go-Explore cell-abstraction gap:** learned latent cells generalize where pixel-hash cells
+  explode (Tetris boards) or blur progress.
+- World model / imagination — far-later bet. **Closes the planning gap:** puzzles (Box Boy) need
+  multi-step lookahead a reactive evolved policy + Go-Explore memorization can't supply.
 
 ## Process
 - Dashboard up on :8600 (newest-run view) for the whole session → http://100.74.178.26:8600.

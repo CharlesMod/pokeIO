@@ -229,6 +229,31 @@ class LLMConfig:
 
 
 @dataclass
+class ACConfig:
+    """[AC] Adaptive cadence — learned dwell via the commit-gate output.
+
+    See ``docs/specs/adaptive-cadence.md``. Dwell is the leaky-integrated
+    activation of ONE appended OUTPUT neuron (the commit gate); that node's
+    evolvable time-constant ``alpha`` (spec [TC]) IS the dwell clock. A parent-
+    side ``MotorClock`` re-emits the held button until the gate opens (or an
+    interrupt fires). ``enable`` drives the effective ``N_OUT`` (11 off, 12 on);
+    every other knob is inert when ``enable`` is False (bit-identical legacy).
+    """
+
+    enable: bool = False            # single OFF switch; drives N_OUT (11 off, 12 on)
+    commit_thresh: float = 0.0      # gate_raw >= thresh -> re-decide (open)
+    min_dwell: int = 1              # reflex floor reachable; >1 forces a minimum hold
+    max_dwell: int = 64             # hard liveness cap (0 = uncapped) — no-stall guarantee
+    salience_interrupt: bool = True
+    salience_thresh: float = 0.08   # foveal motion mean-abs-dev threshold (game-agnostic)
+    reflex_margin: float = 0.5      # logit[argmax]-logit[held] > margin -> force re-decide (0 = off)
+    saccade_interrupt: bool = False  # optional gaze->motor coupling (eye jump -> re-decide hand)
+    saccade_deadband: float = 0.05  # |saccade| beyond this counts as "moved"
+    seed_gate_slow: bool = False    # rng-free: overwrite gen-0 gate alpha into the slow band
+    gate_seed_alpha: float = 0.3
+
+
+@dataclass
 class RetinaConfig:
     """Learned decoder-free retina (Phase 1; docs/specs/active-vision-spine.md §4).
 
@@ -286,6 +311,7 @@ class Config:
     vision: VisionConfig = field(default_factory=VisionConfig)
     evo: EvoConfig = field(default_factory=EvoConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
+    ac: ACConfig = field(default_factory=ACConfig)
     retina: RetinaConfig = field(default_factory=RetinaConfig)
     goexplore: GoExploreConfig = field(default_factory=GoExploreConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
@@ -345,6 +371,7 @@ __all__ = [
     "VisionConfig",
     "EvoConfig",
     "RewardConfig",
+    "ACConfig",
     "RetinaConfig",
     "GoExploreConfig",
     "LLMConfig",

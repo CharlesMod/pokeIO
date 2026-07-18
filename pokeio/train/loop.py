@@ -38,7 +38,7 @@ import numpy as np
 import psutil
 import torch
 
-from pokeio.config import Config
+from pokeio.config import ACConfig, Config  # noqa: F401 (ACConfig: type hints)
 from pokeio.emu.env import PokeEnv
 from pokeio.emu.fleet import AsyncFleet, BarrierFleet, FovealEncoder, ObsEncoder
 from pokeio.evo.forward import TANH, population_forward_sparse
@@ -77,6 +77,14 @@ _SCREEN_W = 160
 N_OUT = 11  # 9 button logits (argmax) + saccade dx,dy (tanh); rebound from config.evo.n_out in train()
 N_BUTTONS = 9  # up down left right A B START SELECT NOOP (the argmax-consumed head slice)
 FORWARD_STEPS = 4  # propagation hops per inference (covers evolved depth)
+# [AC] Adaptive cadence (docs/specs/adaptive-cadence.md §3.1): the commit-gate is
+# appended as the 12th output, so its column is a pure append after the 2 saccade
+# outputs — a CONSTANT index independent of N_OUT.  Only read when N_OUT == 12.
+GATE_IDX = N_BUTTONS + 2  # 11 — commit-gate output column at width 12
+# Foveal motion-block offsets for the [AC] salience slice (spec §3.4), rebound in
+# train() from config.vision (None => salience off, e.g. retina/fovea_static).
+_AC_MOTION_LO: int | None = None
+_AC_MOTION_HI: int | None = None
 
 
 def _split_head(outv: np.ndarray, softmax_temp: float = 0.0):
@@ -87,6 +95,11 @@ def _split_head(outv: np.ndarray, softmax_temp: float = 0.0):
     / ``out[10]`` are the RAW saccade commands.  The gaze integrator applies
     ``tanh`` internally (``FovealEncoder.update_gaze`` / the fleet workers), so
     the raw values are forwarded verbatim — no tanh here (double-tanh bug).
+
+    [AC] adaptive cadence (spec §3.1): when the width is 12 (``ac.enable``) the
+    appended commit-gate column ``out[11]`` is returned as a 4th element so the
+    parent-side ``MotorClock`` can read it; at width 11 the legacy 3-tuple is
+    returned unchanged (callers that don't need the gate ignore the extra value).
     """
     logits = outv[:, :N_BUTTONS]
     if softmax_temp and softmax_temp > 0.0:
@@ -100,7 +113,151 @@ def _split_head(outv: np.ndarray, softmax_temp: float = 0.0):
         buttons = logits.argmax(axis=1).astype(np.int32)
     dx = np.ascontiguousarray(outv[:, N_BUTTONS], dtype=np.float32)
     dy = np.ascontiguousarray(outv[:, N_BUTTONS + 1], dtype=np.float32)
+    if outv.shape[1] >= GATE_IDX + 1:  # width 12: the commit gate is present
+        gate = np.ascontiguousarray(outv[:, GATE_IDX], dtype=np.float32)
+        return buttons, dx, dy, gate
     return buttons, dx, dy
+
+
+def _foveal_salience(X: np.ndarray, lo: int | None, hi: int | None) -> np.ndarray:
+    """[AC] §3.4 parent-side surprise scalar from the foveal motion sheet.
+
+    ``surprise = mean(|X[:, lo:hi] - 0.5|)`` — the mean-abs-deviation of the
+    gaze-invariant whole-screen frame-difference block (which sits at ``0.5``
+    when nothing moved) already written into the obs, so this is zero extra
+    emulator/GPU work and no ``prev_periph`` state.  Returns zeros when the
+    motion block is unavailable (retina / fovea_static): retina salience is the
+    deferred controller-latent L1 (spec §3.4), so AC ships salience foveal-only.
+    """
+    if lo is None or hi is None:
+        return np.zeros(X.shape[0], dtype=np.float32)
+    return np.abs(X[:, lo:hi] - 0.5).mean(axis=1).astype(np.float32)
+
+
+class MotorClock:
+    """[AC] parent-side motor-cadence latch (docs/specs/adaptive-cadence.md §3.2).
+
+    Per-env bookkeeping — ``held_btn`` (last committed button) and ``dwell_len``
+    (consecutive closed-gate steps) — that re-emits the held button until the
+    commit gate opens or an interrupt fires.  The batched forward already runs
+    EVERY ready agent-step (gaze + gate + salience all need it), so ``decide``
+    re-reads the gate at the finest grain: a closed gate is a preference, never a
+    lock (reflex floor, §2c).  **Zero rng, pure inference-time threshold** — it
+    perturbs neither the reproduce stream nor rollout determinism (§4), which is
+    why all five eval engines can share it without a fast_reproduce edit.
+
+    ``decide`` clocks only the ``ready_idx`` subset (the furnace batches an
+    out-of-order ready set; a non-ready env didn't step, so its dwell must not
+    tick — exactly mirroring the recurrent ``state_t`` update).  With
+    ``ready_idx=None`` every env is ready (serial / barrier lockstep).
+    """
+
+    # break-cause labels (telemetry only), in force-open priority order.
+    _CAUSES = ("gate", "salience", "reflex_margin", "saccade", "cap")
+    _NOOP = 8  # released button (init hold)
+
+    def __init__(self, n: int, ac):
+        self.n = int(n)
+        self.ac = ac
+        self.held_btn = np.full(self.n, self._NOOP, dtype=np.int32)
+        self.dwell_len = np.zeros(self.n, dtype=np.int32)
+        self.prev_lat: np.ndarray | None = None  # retina L1 surprise (deferred)
+        # telemetry accumulators (committed hold lengths + salience + break cause)
+        self.break_cause: dict[str, int] = {c: 0 for c in self._CAUSES}
+        self.dwells: list[int] = []
+        self.dwell_sal: list[float] = []
+
+    def reset(self, i: int | None = None) -> None:
+        """Clear env ``i`` (or all) to the released-NOOP hold — called at every
+        per-episode-state boundary alongside ``encoder.reset`` (§6.6)."""
+        if i is None:
+            self.held_btn[:] = self._NOOP
+            self.dwell_len[:] = 0
+        else:
+            self.held_btn[int(i)] = self._NOOP
+            self.dwell_len[int(i)] = 0
+
+    def decide(
+        self,
+        argmax_btn: np.ndarray,
+        gate_raw: np.ndarray,
+        logits: np.ndarray,
+        salience: np.ndarray | None,
+        saccade_moved: np.ndarray | None,
+        ready_idx: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Return the per-env EMITTED button (held or freshly committed).
+
+        Force-open the gate (re-decide) on ANY of: learned commit
+        (``gate_raw >= commit_thresh``), a salience spike, a reflex-margin gap
+        (``logit[argmax] - logit[held] > reflex_margin``), a saccade jump
+        (optional), or the ``max_dwell`` liveness cap — one vectorized ``|=``
+        (§3.3).  ``min_dwell > 1`` additionally forces a minimum hold.  Only the
+        ``ready_idx`` rows are advanced; the full-width held-button vector is
+        returned so callers can gather whichever rows they submit."""
+        ac = self.ac
+        idx = (
+            np.arange(self.n) if ready_idx is None
+            else np.asarray(ready_idx, dtype=np.intp)
+        )
+        m = idx.shape[0]
+        if m == 0:
+            return self.held_btn.copy()
+        held = self.held_btn[idx].astype(np.int64)
+        amax = argmax_btn[idx].astype(np.int32)
+        dl = self.dwell_len[idx]
+        lg = logits[idx]                          # (m, N_BUTTONS)
+        ar = np.arange(m)
+        gap = lg[ar, amax] - lg[ar, held]         # reflex margin
+        gr = gate_raw[idx]
+        sal = (
+            salience[idx] if salience is not None
+            else np.zeros(m, dtype=np.float32)
+        )
+        sacc = (
+            saccade_moved[idx].astype(bool) if saccade_moved is not None
+            else np.zeros(m, dtype=bool)
+        )
+        z = np.zeros(m, dtype=bool)
+        open_gate = gr >= ac.commit_thresh
+        open_sal = (sal > ac.salience_thresh) if ac.salience_interrupt else z
+        open_reflex = (gap > ac.reflex_margin) if ac.reflex_margin > 0 else z
+        open_sacc = sacc if ac.saccade_interrupt else z
+        open_cap = (dl >= ac.max_dwell) if ac.max_dwell > 0 else z
+        opened = open_gate | open_sal | open_reflex | open_sacc | open_cap
+        # min_dwell only forces a hold when > 1 (default 1 = reflex floor intact).
+        if ac.min_dwell > 1:
+            opened &= dl >= ac.min_dwell
+
+        # Telemetry: on each commit, record the just-ended hold length (dl closed
+        # steps + the step it was first emitted) + its salience + the break cause.
+        for j in np.nonzero(opened)[0]:
+            self.dwells.append(int(dl[j]) + 1)
+            self.dwell_sal.append(float(sal[j]))
+            self.break_cause[self._cause(
+                bool(open_gate[j]), bool(open_sal[j]), bool(open_reflex[j]),
+                bool(open_sacc[j]), bool(open_cap[j]),
+            )] += 1
+
+        emitted = held.copy()
+        emitted[opened] = amax[opened]
+        self.held_btn[idx] = emitted.astype(np.int32)
+        self.dwell_len[idx] = np.where(opened, 0, dl + 1).astype(np.int32)
+        return self.held_btn.copy()
+
+    @classmethod
+    def _cause(cls, gate, sal, reflex, sacc, cap) -> str:
+        """First-firing break cause in priority order (learned commit first, the
+        liveness cap last) when several force-opens coincide."""
+        if gate:
+            return "gate"
+        if sal:
+            return "salience"
+        if reflex:
+            return "reflex_margin"
+        if sacc:
+            return "saccade"
+        return "cap"
 
 
 def _resp_scores(btn_hist, o_sum, o_sq, o_cnt, w_resp_var):
@@ -775,6 +932,58 @@ def _champion_alpha_terms(champion, slow_thresh: float = 0.5) -> dict[str, float
     }
 
 
+def _champion_gate_alpha(champion) -> float | None:
+    """The commit-gate's time constant — the [AC] dwell clock (spec §1).  The
+    gate is the highest-id OUTPUT node (appended last, §3.1); ``None`` if the
+    champion has no outputs.  A slow gate alpha confirms dwell rides the TC
+    substrate rather than a bolt-on counter (§8.3)."""
+    outs = [n for n in champion.nodes.values() if n.type == OUTPUT]
+    if not outs:
+        return None
+    return float(max(outs, key=lambda n: n.id).alpha)
+
+
+def _champion_cadence_terms(champion) -> dict[str, float]:
+    """Champion's [AC] cadence panel for the live wall (mirrors
+    ``_champion_alpha_terms``; spec §8 telemetry).
+
+    Reads the dwell-length distribution + break-cause histogram stashed on the
+    champion by the solo showcase replay (``replay_champion`` clocks a
+    ``MotorClock(1)``), plus the commit-gate ``alpha``.  Returns ``{}`` when AC
+    is off (no ``_ac_dwells`` stashed) so the legacy/foveal panel stays clean."""
+    dwells = getattr(champion, "_ac_dwells", None)
+    if not dwells:
+        return {}
+    d = np.asarray(dwells, dtype=np.float64)
+    out = {
+        "cadence_commits": float(d.size),
+        "cadence_dwell_mean": float(d.mean()),
+        "cadence_dwell_p50": float(np.percentile(d, 50)),
+        "cadence_dwell_p90": float(np.percentile(d, 90)),
+        "cadence_dwell_max": float(d.max()),
+        "cadence_dwell_frac_gt1": float(np.mean(d > 1.0)),
+    }
+    breaks = getattr(champion, "_ac_break_cause", None) or {}
+    tot = float(sum(breaks.values())) or 1.0
+    for c in MotorClock._CAUSES:
+        out[f"cadence_break_{c}"] = float(breaks.get(c, 0)) / tot
+    ga = _champion_gate_alpha(champion)
+    if ga is not None:
+        out["cadence_gate_alpha"] = ga
+    # Bimodal headline (§8.1): mean dwell in low- vs high-salience commits — long
+    # holds should concentrate in low-motion (menu/dialogue) states.
+    sal = getattr(champion, "_ac_dwell_sal", None)
+    if sal:
+        s = np.asarray(sal, dtype=np.float64)
+        med = float(np.median(s))
+        lo = s <= med
+        if lo.any():
+            out["cadence_dwell_lo_sal"] = float(d[lo].mean())
+        if (~lo).any():
+            out["cadence_dwell_hi_sal"] = float(d[~lo].mean())
+    return out
+
+
 # --------------------------------------------------------------------------
 # live pace switching (spectate mode)
 # --------------------------------------------------------------------------
@@ -944,6 +1153,7 @@ def evaluate_wave(
     probe_quota: int = 0,
     retina_pipe: "RetinaObsPipe | None" = None,
     distinct_out: np.ndarray | None = None,
+    ac: "ACConfig | None" = None,
 ) -> int:
     """Evaluate one wave of genomes in lockstep; sets genome.fitness in place.
 
@@ -955,6 +1165,9 @@ def evaluate_wave(
     Returns the number of agent-steps performed (n_genomes * episode_steps)."""
     n = len(genomes)
     wave = WaveNovelty(archive, n, mode=novelty_mode, floor=novelty_floor)
+    # [AC] parent-side motor-cadence latch (spec §3.2); None => legacy every-step
+    # re-decide (emitted == raw argmax).  Fresh per wave = reset dwell state.
+    clock = MotorClock(n, ac) if (ac is not None and ac.enable) else None
 
     # reset each player: either restore from a promising frontier cell (go-explore)
     # or fall back to the canonical new-game state.
@@ -965,6 +1178,8 @@ def evaluate_wave(
         encoder.reset(i)  # gaze -> centre, motion -> 0.5 (per episode/restore)
         if retina_pipe is not None:  # clear the env's 4-frame periph/fovea rings
             retina_pipe.reset(i)
+        if clock is not None:  # clear env i's held button + dwell (spec §6.6)
+            clock.reset(i)
         entry = None
         if (
             goexplore is not None
@@ -1019,9 +1234,19 @@ def evaluate_wave(
         else:
             out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
         outv = out[:, 0, :].detach().cpu().numpy()
-        actions, gdx, gdy = _split_head(outv, softmax_temp)
-        # R_resp bookkeeping (all rows step every round in lockstep).
-        btn_hist[np.arange(n), actions] += 1
+        head = _split_head(outv, softmax_temp)
+        actions, gdx, gdy = head[0], head[1], head[2]
+        # [AC] latch the emitted button: re-emit the held button until the commit
+        # gate opens / an interrupt fires (spec §3.2).  Legacy path: emitted==argmax.
+        if clock is not None:
+            sal = _foveal_salience(X, _AC_MOTION_LO, _AC_MOTION_HI)
+            moved = (np.abs(gdx) > ac.saccade_deadband) | (np.abs(gdy) > ac.saccade_deadband)
+            emitted = clock.decide(actions, head[3], outv[:, :N_BUTTONS], sal, moved)
+        else:
+            emitted = actions
+        # R_resp bookkeeping (all rows step every round in lockstep).  Histogram
+        # over the EMITTED button (holds lower its entropy — the §8 w_resp note).
+        btn_hist[np.arange(n), emitted] += 1
         o_sum += outv
         o_sq += (outv * outv).sum(axis=1)
         o_cnt += 1
@@ -1033,8 +1258,8 @@ def evaluate_wave(
         for i in range(n):
             # Efference copy: obs t's saccade steers obs t+1's fovea (§3.3).
             encoder.update_gaze(i, float(gdx[i]), float(gdy[i]))
-            screen, wram, done, _info = envs[i].step(int(actions[i]))
-            last_button[i] = actions[i]
+            screen, wram, done, _info = envs[i].step(int(emitted[i]))
+            last_button[i] = emitted[i]
             screens[i] = screen
             wrams[i] = wram
             dead[i] = dead[i] or bool(done)
@@ -1050,7 +1275,7 @@ def evaluate_wave(
         if streamer is not None:
             streamer.maybe_write(
                 gen, screens, wave.fitness, dead,
-                obs=X, actions=actions, round_t=t,
+                obs=X, actions=emitted, round_t=t,
             )
 
     resp = _resp_scores(btn_hist, o_sum, o_sq, o_cnt, w_resp_var)
@@ -1091,6 +1316,7 @@ def evaluate_wave_parallel(
     probe_quota: int = 0,
     retina_pipe: "RetinaObsPipe | None" = None,
     distinct_out: np.ndarray | None = None,
+    ac: "ACConfig | None" = None,
 ) -> int:
     """Parallel-barrier equivalent of :func:`evaluate_wave`.
 
@@ -1139,6 +1365,11 @@ def evaluate_wave_parallel(
     _t = _mark("reset_all", _t)
     if retina_pipe is not None:  # fresh episode -> clear the periph/fovea rings
         retina_pipe.reset()
+    # [AC] motor-cadence latch (spec §3.2), reset at wave start (workers auto-reset
+    # only at _OP_RESET, never mid-wave, so a wave-start clear matches state_t).
+    clock = MotorClock(n, ac) if (ac is not None and ac.enable) else None
+    if clock is not None:
+        clock.reset()
     if streamer is not None:
         streamer.set_phase("wave")
 
@@ -1181,11 +1412,19 @@ def evaluate_wave_parallel(
         else:
             out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
         outv = out[:, 0, :].detach().cpu().numpy()
-        actions, gdx, gdy = _split_head(outv, softmax_temp)  # buttons + RAW saccade
+        head = _split_head(outv, softmax_temp)  # buttons + RAW saccade
+        actions, gdx, gdy = head[0], head[1], head[2]
+        # [AC] latch the emitted button (spec §3.2); legacy path: emitted==argmax.
+        if clock is not None:
+            sal = _foveal_salience(X, _AC_MOTION_LO, _AC_MOTION_HI)
+            moved = (np.abs(gdx) > ac.saccade_deadband) | (np.abs(gdy) > ac.saccade_deadband)
+            emitted = clock.decide(actions, head[3], outv[:, :N_BUTTONS], sal, moved)
+        else:
+            emitted = actions
         actions_full[:] = 0
-        actions_full[:n] = actions
-        # R_resp bookkeeping.
-        btn_hist[np.arange(n), actions] += 1
+        actions_full[:n] = emitted
+        # R_resp bookkeeping (histogram over the EMITTED button; §8 w_resp note).
+        btn_hist[np.arange(n), emitted] += 1
         o_sum += outv
         o_sq += (outv * outv).sum(axis=1)
         o_cnt += 1
@@ -1258,7 +1497,7 @@ def evaluate_wave_parallel(
             # so the focus capture-forward reproduces the acted-on decision.
             streamer.maybe_write(
                 gen, fleet.screens[:n], wave.fitness, dead,
-                obs=X, actions=actions, round_t=t,
+                obs=X, actions=emitted, round_t=t,
             )
         if _prof:
             _t_book += time.perf_counter() - _c2
@@ -1345,6 +1584,7 @@ def evaluate_wave_async(
     probe_quota: int = 0,
     retina_pipe: "RetinaObsPipe | None" = None,
     distinct_out: np.ndarray | None = None,
+    ac: "ACConfig | None" = None,
 ) -> int:
     """Free-running ("furnace") equivalent of :func:`evaluate_wave_parallel`.
 
@@ -1407,6 +1647,12 @@ def evaluate_wave_async(
     _t = _mark("reset_all", _t)
     if retina_pipe is not None:  # fresh episode -> clear every env's periph/fovea rings
         retina_pipe.reset()
+    # [AC] motor-cadence latch (spec §3.2), reset at wave start.  Clocked ONLY on
+    # the ready idx subset each cycle (mirrors state_t: a non-ready env didn't step,
+    # so its dwell must not tick), which is what keeps furnace dwell == serial (§10.3).
+    clock = MotorClock(n, ac) if (ac is not None and ac.enable) else None
+    if clock is not None:
+        clock.reset()
     if streamer is not None:
         streamer.set_phase("wave")
 
@@ -1673,9 +1919,22 @@ def evaluate_wave_async(
                 new_state = None
             # Split the tanh head: buttons (argmax) + RAW saccade (dx,dy). The
             # worker applies tanh inside update_gaze, so pass the raw floats.
-            acts, gdx, gdy = _split_head(outv, softmax_temp)
-            # R_resp: accumulate only the rows that actually consume an action.
-            btn_hist[idx, acts[idx]] += 1
+            head = _split_head(outv, softmax_temp)
+            acts, gdx, gdy = head[0], head[1], head[2]
+            # [AC] latch the emitted button, clocking ONLY the ready idx subset
+            # (spec §3.2); legacy path: emitted==argmax.  emitted is full-width;
+            # gather idx for R_resp/submit exactly like acts[idx].
+            if clock is not None:
+                sal = _foveal_salience(X, _AC_MOTION_LO, _AC_MOTION_HI)
+                moved = (np.abs(gdx) > ac.saccade_deadband) | (np.abs(gdy) > ac.saccade_deadband)
+                emitted = clock.decide(
+                    acts, head[3], outv[:, :N_BUTTONS], sal, moved, ready_idx=idx
+                )
+            else:
+                emitted = acts
+            # R_resp: accumulate only the rows that actually consume an action
+            # (histogram over the EMITTED button; §8 w_resp note).
+            btn_hist[idx, emitted[idx]] += 1
             o_sum[idx] += outv[idx]
             o_sq[idx] += (outv[idx] * outv[idx]).sum(axis=1)
             o_cnt[idx] += 1
@@ -1687,14 +1946,14 @@ def evaluate_wave_async(
                 probe_sink.extend(X[int(k)].copy() for k in idx[:take])
                 probe_taken += take
             # submit_actions publishes gaze + buttons FIRST, act_seq LAST (§3.4).
-            fleet.submit_actions(idx, acts[idx], gdx[idx], gdy[idx], snap[idx])
+            fleet.submit_actions(idx, emitted[idx], gdx[idx], gdy[idx], snap[idx])
             acted[idx] = snap[idx]
             # advance memory ONLY for envs that stepped (ready rows)
             if new_state is not None:
                 state_t[torch.from_numpy(idx).to(device)] = new_state[
                     torch.from_numpy(idx).to(device)
                 ]
-            last_X, last_actions = X, acts
+            last_X, last_actions = X, emitted
             if realtime:
                 nd = next_due[idx] + period
                 overrun = nd < now  # stalled past a full period: re-anchor
@@ -1982,6 +2241,7 @@ def boot_eval_population(
     sample: int = 0,
     raw_fits: np.ndarray | None = None,
     rng: np.random.Generator | None = None,
+    ac: "ACConfig | None" = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """E1 — run a SHORT from-newgame rollout of the population and score boot play.
 
@@ -2058,7 +2318,7 @@ def boot_eval_population(
                     taps=(taps if (taps and async_engine) else None),
                     recurrent_memory=recurrent_memory, softmax_temp=softmax_temp,
                     probe_sink=None, probe_quota=0, retina_pipe=None,
-                    distinct_out=d_out,
+                    distinct_out=d_out, ac=ac,
                 )
             else:  # serial (no fleet)
                 evaluate_wave(
@@ -2067,7 +2327,7 @@ def boot_eval_population(
                     novelty_mode=novelty_mode, novelty_floor=novelty_floor,
                     goexplore=None, restore_prob=0.0, wave_offset=0,
                     recurrent_memory=recurrent_memory, softmax_temp=softmax_temp,
-                    distinct_out=d_out,
+                    distinct_out=d_out, ac=ac,
                 )
             for j in range(m):
                 gi = int(eval_idx[a + j])
@@ -2183,6 +2443,7 @@ def replay_champion(
     recurrent_memory: bool = True,
     softmax_temp: float = 0.0,
     retina_pipe: "RetinaObsPipe | None" = None,
+    ac: "ACConfig | None" = None,
 ) -> np.ndarray | None:
     """Replay the generation champion solo and log a few ChampionSteps.
 
@@ -2200,6 +2461,12 @@ def replay_champion(
     encoder.reset(0)  # gaze -> centre, motion -> 0.5 (solo replay uses env slot 0)
     if retina_pipe is not None:  # clear env slot 0's periph/fovea rings
         retina_pipe.reset(0)
+    # [AC] solo-replay motor-cadence latch so the wall's dwell matches training
+    # (spec §6.5). Its accumulated dwell/break-cause stats are stashed on the
+    # genome below for the "Cadence" telemetry panel.
+    clock = MotorClock(1, ac) if (ac is not None and ac.enable) else None
+    if clock is not None:
+        clock.reset(0)
     if spawn_state is not None:
         env.load_state(spawn_state)
         screen = env.reset(None)  # clear held input + settle a frame
@@ -2221,8 +2488,16 @@ def replay_champion(
         else:
             out = population_forward_sparse(cp, xt, steps=FORWARD_STEPS)
         outv = out[0, 0, :].detach().cpu().numpy()[None, :]  # (1, N_OUT)
-        acts, gdx, gdy = _split_head(outv, softmax_temp)
-        action = int(acts[0])
+        head = _split_head(outv, softmax_temp)
+        acts, gdx, gdy = head[0], head[1], head[2]
+        # [AC] latch the emitted button (spec §3.2); legacy path: emitted==argmax.
+        if clock is not None:
+            sal = _foveal_salience(x[None, :], _AC_MOTION_LO, _AC_MOTION_HI)
+            moved = (np.abs(gdx) > ac.saccade_deadband) | (np.abs(gdy) > ac.saccade_deadband)
+            emitted = clock.decide(acts, head[3], outv[:, :N_BUTTONS], sal, moved)
+            action = int(emitted[0])
+        else:
+            action = int(acts[0])
         encoder.update_gaze(0, float(gdx[0]), float(gdy[0]))  # steer next fovea
         last_button = action
         screen, wram, _done, info = env.step(action)
@@ -2242,6 +2517,12 @@ def replay_champion(
         )
         if trace is not None:
             trace[t] = wram
+    # [AC] stash the solo-replay cadence stats on the champion for the "Cadence"
+    # panel (_champion_cadence_terms reads them; absent => panel stays legacy-clean).
+    if clock is not None:
+        genome._ac_dwells = list(clock.dwells)
+        genome._ac_dwell_sal = list(clock.dwell_sal)
+        genome._ac_break_cause = dict(clock.break_cause)
     return trace
 
 
@@ -2822,8 +3103,13 @@ def train(
         torch.cuda.manual_seed_all(int(config.run.seed))
 
     # Output layout is config-driven (§3.1): 9 button logits + 2 saccade = 11.
-    global N_OUT
-    N_OUT = int(config.evo.n_out)
+    # [AC] adaptive cadence (docs/specs/adaptive-cadence.md §3.1): with ac.enable
+    # a 12th OUTPUT — the commit gate at GATE_IDX=N_BUTTONS+2 — is appended, so
+    # the effective width is DERIVED here (do not hardcode 11).  ac off => 11
+    # (bit-identical legacy: no gate node, MotorClock never built).
+    global N_OUT, _AC_MOTION_LO, _AC_MOTION_HI
+    ac_on = bool(config.ac.enable)
+    N_OUT = int(config.evo.n_out) + (1 if ac_on else 0)
 
     # Active-vision spine (§2/§3): stateful foveal obs (periphery + gaze-driven
     # fovea + motion + proprio + connect-protected RAM taps). The parent encoder
@@ -2854,11 +3140,20 @@ def train(
     # n_in=encoder.dim (454). The fleet is always sized to encoder.dim so workers
     # auto-select the right mode.
     z_dim_ctrl = int(config.retina.z_periph) + int(config.retina.z_fovea)  # 80
+    # [AC] parent-side salience slice (spec §3.4): the foveal motion block offsets,
+    # or None (retina/fovea_static -> salience off; retina L1 surprise is deferred).
+    _AC_MOTION_LO = getattr(encoder, "o_motion", None)
+    _AC_MOTION_HI = getattr(encoder, "o_proprio", None)
     if retina_mode:
         n_in = z_dim_ctrl + 14 + int(config.vision.obs_ram_bytes)  # 102
-        assert int(N_OUT) == 11, (
-            f"retina mode requires n_out=11 (9 buttons + 2 saccade); got {N_OUT}"
+        # [AC] §6.2: relax the retina assert to {11,12} (mode-aware) so a future
+        # retina+AC run fails loudly on a real mismatch, not silently.  Foveal-
+        # first: retina AC is deferred (§7), so AC-on retina is not wired yet.
+        assert int(N_OUT) in (11, 12), (
+            f"retina mode requires n_out in (11, 12) (9 buttons + 2 saccade "
+            f"[+ 1 commit gate if ac.enable]); got {N_OUT}"
         )
+        _AC_MOTION_LO = _AC_MOTION_HI = None  # no motion sheet in the 102-d latent
         # E3 blind gate zeroes the learned latent [0:80], keeps proprio+ram.
         optical_hi = z_dim_ctrl
         if live:
@@ -2978,6 +3273,16 @@ def train(
         )
         for _ in range(pop_size)
     ]
+    # [AC] optional deterministic slow-seed (spec §3.5): bias the gen-0 commit
+    # gate into the slow band so early dwell has a chance to emerge.  The gate is
+    # the LAST output, so its _seed_alpha draw already happened last in make_genome
+    # — overwriting the resulting value shifts NO subsequent rng draw (rng-free,
+    # stream-preserving; no genome.py edit).  Default off.
+    if ac_on and config.ac.seed_gate_slow:
+        for g in genomes:
+            g.nodes[max(g.output_ids())].alpha = float(config.ac.gate_seed_alpha)
+        print(f"[train] [AC] gate slow-seed: gen-0 commit-gate α="
+              f"{float(config.ac.gate_seed_alpha)}")
     n_c0 = sum(len(g.conns) for g in genomes) // max(1, len(genomes))
     print(f"[train] seed genomes: connect={init_connect} (~{n_c0} conns/genome)")
 
@@ -3510,6 +3815,7 @@ def train(
                         probe_sink=probe_sink,
                         probe_quota=probe_quota,
                         retina_pipe=retina_pipe,
+                        ac=config.ac,
                     )
                 else:
                     steps_done += evaluate_wave(
@@ -3537,6 +3843,7 @@ def train(
                         probe_sink=probe_sink,
                         probe_quota=probe_quota,
                         retina_pipe=retina_pipe,
+                        ac=config.ac,
                     )
 
             _bt = time.perf_counter()
@@ -3568,7 +3875,7 @@ def train(
                     cp_provider=_cp_provider,
                     taps=taps, recurrent_memory=recurrent_memory,
                     softmax_temp=softmax_temp, sample=policy_eval_sample,
-                    raw_fits=raw_fits, rng=rng,
+                    raw_fits=raw_fits, rng=rng, ac=config.ac,
                 )
             _bt = _phase("boot_eval", _bt)
 
@@ -3635,6 +3942,7 @@ def train(
                 recurrent_memory=recurrent_memory,
                 softmax_temp=softmax_temp,
                 retina_pipe=retina_pipe,
+                ac=config.ac,
             )
             if trace is not None and trace.shape[0] >= 2:
                 # Dedup at the source (A9): the champion replay is a single
@@ -3874,6 +4182,10 @@ def train(
             # Neural-native timing (spec [TC]): surface the champion's learned
             # alpha spread so the wall can watch the fast/slow split emerge.
             reward_terms.update(_champion_alpha_terms(champion))
+            # [AC] adaptive cadence (spec §8): the champion's dwell distribution +
+            # break-cause histogram + commit-gate alpha (stashed by replay_champion
+            # above).  Returns {} when AC is off, so the legacy panel stays clean.
+            reward_terms.update(_champion_cadence_terms(champion))
 
             # Push the real side-panel payloads to the live stream (species +
             # per-term reward breakdown; archive stats are read live).
@@ -4085,6 +4397,19 @@ def build_config(args) -> Config:
         cfg.reward.restore_backward_anneal_gens = int(
             args.restore_backward_anneal_gens
         )
+    # -- [AC] adaptive cadence CLI overrides (docs/specs/adaptive-cadence.md) ----
+    if getattr(args, "ac_enable", False):
+        cfg.ac.enable = True
+    if getattr(args, "ac_max_dwell", None) is not None:
+        cfg.ac.max_dwell = int(args.ac_max_dwell)
+    if getattr(args, "ac_commit_thresh", None) is not None:
+        cfg.ac.commit_thresh = float(args.ac_commit_thresh)
+    if getattr(args, "ac_salience_thresh", None) is not None:
+        cfg.ac.salience_thresh = float(args.ac_salience_thresh)
+    if getattr(args, "ac_reflex_margin", None) is not None:
+        cfg.ac.reflex_margin = float(args.ac_reflex_margin)
+    if getattr(args, "ac_seed_gate_slow", False):
+        cfg.ac.seed_gate_slow = True
     return cfg
 
 
@@ -4207,6 +4532,32 @@ def main() -> None:
     ap.add_argument("--retina-train-steps", type=int, default=32,
                     help="retina SGD steps per generation during evolution "
                          "(retina mode).")
+    # -- [AC] adaptive cadence (docs/specs/adaptive-cadence.md) ----------------
+    ap.add_argument("--ac-enable", dest="ac_enable", action="store_true",
+                    default=False,
+                    help="learned motor dwell via the commit-gate output (spec "
+                         "[AC]): appends a 12th OUTPUT whose evolved time-constant "
+                         "IS the dwell clock; a parent-side MotorClock re-emits the "
+                         "held button until the gate opens. OFF (default) is "
+                         "bit-identical legacy (N_OUT=11).")
+    ap.add_argument("--ac-max-dwell", dest="ac_max_dwell", type=int, default=None,
+                    help="hard liveness cap: force a re-decide after this many "
+                         "consecutive held steps (0 = uncapped; default config 64).")
+    ap.add_argument("--ac-commit-thresh", dest="ac_commit_thresh", type=float,
+                    default=None,
+                    help="gate_raw >= thresh re-opens the gate (default config 0.0).")
+    ap.add_argument("--ac-salience-thresh", dest="ac_salience_thresh", type=float,
+                    default=None,
+                    help="foveal motion mean-abs-dev above which a salience spike "
+                         "force-commits mid-dwell (default config 0.08).")
+    ap.add_argument("--ac-reflex-margin", dest="ac_reflex_margin", type=float,
+                    default=None,
+                    help="logit[argmax]-logit[held] gap that force-commits "
+                         "mid-dwell (0 = off; default config 0.5).")
+    ap.add_argument("--ac-seed-gate-slow", dest="ac_seed_gate_slow",
+                    action="store_true", default=False,
+                    help="rng-free: bias the gen-0 commit-gate alpha into the slow "
+                         "band (config.ac.gate_seed_alpha) so early dwell emerges.")
     args = ap.parse_args()
 
     cfg = build_config(args)

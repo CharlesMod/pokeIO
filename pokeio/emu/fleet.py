@@ -541,6 +541,10 @@ class FovealEncoder:
             self._o_fovea = self.n_periph84              # fovea84  [7056:14112]
             self._o_proprio = self._o_fovea + self.n_fovea84   # proprio [14112:14126]
             self._o_ram = self._o_proprio + self.n_proprio     # ram     [14126:14134]
+            # No motion sheet in retina obs (spec [AC] §3.4: retina salience is
+            # the deferred controller-latent L1). Public None => AC salience off.
+            self.o_motion = None
+            self.o_proprio = self._o_proprio
             # Lazy import: evo.retina pulls torch, which the torch-free foveal
             # workers must never import. Only a retina-mode encoder touches it,
             # so the default (foveal 454) path stays torch-free across all 56
@@ -560,6 +564,11 @@ class FovealEncoder:
             self._o_motion = self._o_fovea + self.n_fovea
             self._o_proprio = self._o_motion + self.n_motion
             self._o_ram = self._o_proprio + self.n_proprio
+            # Public offsets for the [AC] parent-side salience slice (spec §3.4):
+            # the motion block [o_motion:o_proprio] is the gaze-invariant frame
+            # difference already in the obs — the surprise signal, zero extra work.
+            self.o_motion = self._o_motion
+            self.o_proprio = self._o_proprio
 
         # Fovea centre clamp: keep the FxF window fully on-screen (spec §3.3).
         self._half = self.F // 2
