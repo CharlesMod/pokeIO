@@ -1233,17 +1233,23 @@ class ReflexGaze:
         py = np.asarray(pull_y, dtype=np.float64)[idx]
         mag = np.sqrt(px * px + py * py)
         ema_old = self._ema[idx]
-        first = self._steps[idx] == 0
-        # PRE-update scale (seed with this sample on step 0 so a first-frame pull is
-        # a bounded ~gain step; afterwards a pull above the env's baseline gives a
-        # stronger orienting jerk, below it a gentler one — the EMA-normalized pull).
-        scale = np.where(first, mag, ema_old)
-        inv = self.gain / (scale + self._EPS)
+        # The scale-EMA calibrates on MEANINGFUL pulls only. A zero pull (e.g. the
+        # reset frame, gaze == target) must NOT seed it — else the scale collapses to
+        # ~0 and the next real pull divides by ~EPS, saturating the reflex and drowning
+        # the learned saccade (top-down override goes inert). So emit + seed only when
+        # mag > EPS: the first meaningful pull self-scales to a bounded ~gain step;
+        # later pulls are EMA-normalized (above the env's baseline -> stronger orienting
+        # jerk, below -> gentler). ``_steps`` counts MEANINGFUL pulls (the seeded flag).
+        seeded = self._steps[idx] > 0
+        meaningful = mag > self._EPS
+        scale = np.where(seeded, ema_old, mag)            # unseeded -> self-scale
+        inv = np.where(meaningful, self.gain / (scale + self._EPS), 0.0)
         rdx[idx] = (px * inv).astype(np.float32)
         rdy[idx] = (py * inv).astype(np.float32)
         d = self.decay
-        self._ema[idx] = np.where(first, mag, d * ema_old + (1.0 - d) * mag)
-        self._steps[idx] = self._steps[idx] + 1
+        upd = np.where(seeded, d * ema_old + (1.0 - d) * mag, mag)  # decay or seed
+        self._ema[idx] = np.where(meaningful, upd, ema_old)        # zero pull -> hold
+        self._steps[idx] = self._steps[idx] + meaningful.astype(np.int64)
         return rdx, rdy
 
     def blend(self, X, o_proprio, gdx, gdy, ready_idx=None):

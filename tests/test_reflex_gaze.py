@@ -319,3 +319,20 @@ def test_reflex_target_engine_parity_solo_vs_interleaved() -> None:
         inter.update_gaze(1, 0.3, -0.2); inter.encode(1, s, None, button=3)  # same as solo
         inter.update_gaze(2, -0.5, 0.5); inter.encode(2, junk, None, button=2)
     assert inter.reflex_target(1) == solo_tgt
+
+
+def test_reflex_survives_reset_zero_pull_no_saturation():
+    """Regression: a reset-frame zero pull (gaze == target) must NOT seed the
+    scale-EMA to 0 — that made the next real pull divide by ~EPS and saturate the
+    reflex (~3000x), drowning the learned saccade so top-down override went inert.
+    After a zero pull, the first REAL pull is a bounded ~gain step, and the EMA
+    self-calibrates (a pull above the env's baseline gives a stronger jerk)."""
+    r = ReflexGaze(1, gain=1.0)
+    z = np.array([0.0])
+    d0x, d0y = r.command(z, z)                             # reset-frame zero pull
+    assert abs(float(d0x[0])) < 1e-6 and abs(float(d0y[0])) < 1e-6
+    dx, dy = r.command(np.array([0.3]), np.array([0.4]))   # first real pull, |0.5|
+    m1 = float(np.hypot(dx[0], dy[0]))
+    assert 0.5 < m1 < 2.0, f"reflex saturated after zero-pull reset (mag={m1})"
+    bx, by = r.command(np.array([0.6]), np.array([0.8]))   # 2x-baseline pull
+    assert float(np.hypot(bx[0], by[0])) > m1  # above baseline -> stronger jerk
