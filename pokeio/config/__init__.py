@@ -78,8 +78,16 @@ class VisionConfig:
     #   "fovea_static" sub-fallback: fovea fixed screen-centered, N_OUT back to 9
     #   "retina"       Phase-1: learned SPR/FSQ latent replaces the pixel blocks
     mode: str = "foveal"
-    periph_grid: int = 12  # G: periphery/fovea/motion area-resample side (G*G each)
-    fovea_native_px: int = 48  # F: native fovea crop side (resampled F->G)
+    periph_grid: int = 12  # G: periphery/motion area-resample side (G*G each)
+    fovea_native_px: int = 48  # F: native fovea crop side (resampled F->FG)
+    # FG: fovea resample side, DECOUPLED from the coarse periphery so the fovea can
+    # be native-sharp (optical-frontend-v2 §2). 0 (or == periph_grid) => FG=G, i.e.
+    # byte-identical legacy (the old F->G downsample). >0 makes the fovea FG*FG:
+    # px/cell = F/FG, so F=32,FG=32 => 1 px/cell (a GB tile is legible) vs the
+    # legacy F=48,FG=12 => 4 px/cell smudge. Periphery/motion stay coarse at G
+    # (biomimetic low-acuity periphery). n_in grows to 2*G^2 + FG^2 + 14 + n_ram
+    # (=> a fresh run / warm-started pop; the resume guard refuses cross-dim).
+    fovea_grid: int = 0  # FG (0 => = periph_grid; legacy)
     saccade_gain: float = 32.0  # px/step velocity applied to the fovea center
     saccade_every_k: int = 1  # gaze update cadence in agent-steps
     proprio: bool = True  # 14-d efference-copy block (gaze + last saccade + last buttons + step)

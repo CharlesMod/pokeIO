@@ -452,13 +452,25 @@ class ObsEncoder:
 # loop.py (the parent) imports the SAME class so the parent encode and BOTH
 # worker _emit paths call one code path and emit byte-identical vectors.
 #
-# Fixed 454-dim float32 layout (G = periph_grid = 12, F = fovea_native_px = 48,
-# n_ram = 8), all blocks contiguous:
-#     periphery [0:144]     144x160 -> area-resample to GxG                [0,1]
-#     fovea     [144:288]   native FxF crop @ gaze (gy,gx) -> resample F->G [0,1]
-#     motion    [288:432]   (periph_t - periph_{t-1} + 1)/2; 0.5 if no prev [0,1]
-#     proprio   [432:446]   14-d efference copy (see _proprio)            [-1,1]
-#     ram       [446:454]   mined tap bytes (connect-protected trailing)   [0,1]
+# DIM = 2*G^2 + FG^2 + 14 + n_ram float32 layout (G = periph_grid = 12,
+# F = fovea_native_px = 48, FG = fovea_grid, n_ram = 8), all blocks contiguous.
+# With FG = G (fovea_grid 0 or == periph_grid) this is the legacy 454-d obs; the
+# generic offsets are shown with block sizes (periph G^2, fovea FG^2, motion G^2):
+#     periphery [0 : G^2]           144x160 -> area-resample to GxG          [0,1]
+#     fovea     [G^2 : G^2+FG^2]    native FxF crop @ gaze -> resample F->FG  [0,1]
+#     motion    [G^2+FG^2 : +G^2]   (periph_t - periph_{t-1} + 1)/2; 0.5 init [0,1]
+#     proprio   [.. : +14]          14-d efference copy (see _proprio)      [-1,1]
+#     ram       [.. : +n_ram]       mined tap bytes (connect-protected)      [0,1]
+# Legacy default (G=FG=12, n_ram=8): 144|144|144|14|8 = 454, block bounds
+# 0,144,288,432,446,454.  Sharp-fovea example (G=12, FG=32): 144|1024|144|14|8
+# = 1334 (fovea now 1 px/cell over a 32px window instead of a 4 px/cell smudge).
+#
+# The fovea's F->FG resample is DECOUPLED from the periphery's ->G downsample so
+# the fovea can be native-sharp while the periphery stays biomimetically coarse
+# (low-acuity periphery); see optical-frontend-v2 §2.  Sensor seam (#15/§9a): the
+# encoder consumes an (H, W, C) frame — screen_h/screen_w are params and C is
+# ``channels`` (grayscale C=1 now via ObsBuilder.normalize_shades; C=3 RGB is the
+# future console/webcam drop-in, no layout change above C).
 #
 # Stateful PER ENV (indexed by env id): gaze (gy,gx), last saccade (dx,dy),
 # previous periphery (motion), and a per-episode step counter (step_frac).
@@ -475,8 +487,9 @@ class FovealEncoder:
         enc.update_gaze(i, dx, dy)               # §3.3 saccade dynamics + store
         vec = enc.encode(i, screen, wram, button=applied_button)
 
-    ``.dim`` is 454 for the committed foveal defaults.  ``.reset(i)`` resets one
-    env; ``.reset()`` resets all.  Gaze resets to screen centre ``(gy,gx)=(72,80)``.
+    ``.dim`` is 454 for the committed foveal defaults (G=FG=12); a sharp fovea
+    (``fovea_grid`` > 0) grows it to ``2*G^2 + FG^2 + 14 + n_ram``.  ``.reset(i)``
+    resets one env; ``.reset()`` resets all.  Gaze resets to centre ``(72,80)``.
 
     With ``mode="retina"`` (Phase-1; select via ``config.vision.mode=="retina"``
     or by requesting ``obs_dim==14134``) the encoder keeps the IDENTICAL gaze /
@@ -498,12 +511,14 @@ class FovealEncoder:
         *,
         periph_grid: int = 12,
         fovea_native_px: int = 48,
+        fovea_grid: int = 0,
         n_ram: int = 8,
         saccade_gain: float = 32.0,
         saccade_every_k: int = 1,
         screen_h: int = _SCREEN_H,
         screen_w: int = _SCREEN_W,
         shades: int = 4,
+        channels: int = 1,
         episode_steps: int = 1024,
         mode: str = "foveal",
     ) -> None:
@@ -511,6 +526,15 @@ class FovealEncoder:
         self.mode = str(mode)
         self.G = int(periph_grid)
         self.F = int(fovea_native_px)
+        # Sharp-fovea resample side (optical-frontend-v2 §2): FG decouples fovea
+        # acuity from the coarse periphery.  0 (or == G) => FG=G => byte-identical
+        # legacy; >0 makes the fovea FG*FG at F/FG px/cell.
+        self.FG = int(fovea_grid) if int(fovea_grid) > 0 else self.G
+        # Sensor seam (#15/§9a): (H,W,C) frame channels.  C=1 grayscale now (the
+        # ObsBuilder shade path assumes a single luma plane); C=3 RGB is the
+        # future console/webcam drop-in.  Kept as an attribute, not yet wired
+        # through the resample (that is the color increment, §9b task #17).
+        self.C = int(channels)
         self.n_ram = int(n_ram)
         self.gain = float(saccade_gain)
         self.every_k = max(1, int(saccade_every_k))
@@ -521,8 +545,8 @@ class FovealEncoder:
 
         g = self.G
         self.n_periph = g * g
-        self.n_fovea = g * g
-        self.n_motion = g * g
+        self.n_fovea = self.FG * self.FG   # sharp fovea: FGxFG (legacy FG==G => g*g)
+        self.n_motion = g * g              # periphery/motion stay coarse at GxG
         self.n_proprio = 14
 
         if self.mode == "retina":
@@ -578,10 +602,10 @@ class FovealEncoder:
         self._cx = self.W // 2  # 80 (col centre)
 
         # Area-resample matrices (built once).
-        self._prow = _area_matrix(self.H, g)     # (G, H) periphery rows
-        self._pcol = _area_matrix(self.W, g).T   # (W, G) periphery cols
-        self._frow = _area_matrix(self.F, g)     # (G, F) fovea rows
-        self._fcol = _area_matrix(self.F, g).T   # (F, G) fovea cols
+        self._prow = _area_matrix(self.H, g)        # (G, H) periphery rows
+        self._pcol = _area_matrix(self.W, g).T      # (W, G) periphery cols
+        self._frow = _area_matrix(self.F, self.FG)  # (FG, F) fovea rows (F->FG)
+        self._fcol = _area_matrix(self.F, self.FG).T  # (F, FG) fovea cols
 
         # Reuse the EXACT per-frame shade ranking used by the rest of the
         # pipeline (ObsBuilder.normalize_shades) so grayscale is consistent.
@@ -780,7 +804,7 @@ class FovealEncoder:
 
         periph = (self._prow @ normd @ self._pcol).astype(np.float32)   # (G,G)
         crop = self._crop(normd, self._gy[i], self._gx[i])             # (F,F)
-        fov = (self._frow @ crop @ self._fcol).astype(np.float32)      # (G,G)
+        fov = (self._frow @ crop @ self._fcol).astype(np.float32)      # (FG,FG)
 
         prev = self._prev_periph[i]
         if prev is None:
@@ -948,7 +972,8 @@ def _barrier_worker_main(
     slice_lo, slice_hi, rom_path, frame_skip, hold_frames, reset_state,
     obs_res, obs_ram, wram_stride, arch_kwargs, goexplore,
     shm_names, n_envs, obs_dim, key_len, core, state_cap,
-    periph_grid, fovea_native_px, saccade_gain, saccade_every_k, episode_steps,
+    periph_grid, fovea_native_px, fovea_grid, saccade_gain, saccade_every_k,
+    episode_steps,
 ):
     """Worker process: owns envs ``[slice_lo:slice_hi]``; hashes + encodes locally.
 
@@ -973,11 +998,13 @@ def _barrier_worker_main(
         pass
 
     # Active-vision encoder (stateful per env; §2/§3), auto-selected from obs_dim:
-    #   obs_dim == 3*G^2+14+n_ram  -> foveal 454 obs (Phase-0 pixel vectors)
-    #   obs_dim == 2*84^2+14+n_ram -> retina 14134 obs (Phase-1 pixel input)
+    #   obs_dim == 2*G^2+FG^2+14+n_ram -> foveal obs (Phase-0 pixel vectors; 454
+    #                                    when FG==G, larger for a sharp fovea)
+    #   obs_dim == 2*84^2+14+n_ram      -> retina 14134 obs (Phase-1 pixel input)
     # else fall back to the legacy flat ObsEncoder (back-compat res^2+ram obs).
     # n_envs-wide so it can be indexed by the GLOBAL env id (= shm obs rows).
-    _foveal_dim = 3 * periph_grid * periph_grid + 14 + obs_ram
+    _fg = int(fovea_grid) if int(fovea_grid) > 0 else int(periph_grid)
+    _foveal_dim = 2 * periph_grid * periph_grid + _fg * _fg + 14 + obs_ram
     _retina_dim = 2 * _RETINA_SIDE * _RETINA_SIDE + 14 + obs_ram
     use_retina = int(obs_dim) == int(_retina_dim)
     use_foveal = int(obs_dim) == int(_foveal_dim)
@@ -985,7 +1012,7 @@ def _barrier_worker_main(
     if use_active:
         encoder = FovealEncoder(
             n_envs, periph_grid=periph_grid, fovea_native_px=fovea_native_px,
-            n_ram=obs_ram, saccade_gain=saccade_gain,
+            fovea_grid=fovea_grid, n_ram=obs_ram, saccade_gain=saccade_gain,
             saccade_every_k=saccade_every_k, episode_steps=episode_steps,
             mode=("retina" if use_retina else "foveal"),
         )
@@ -1166,6 +1193,7 @@ class BarrierFleet:
         round_deadline_s: float | None = None,
         periph_grid: int = 12,
         fovea_native_px: int = 48,
+        fovea_grid: int = 0,
         saccade_gain: float = 32.0,
         saccade_every_k: int = 1,
         episode_steps: int = 1024,
@@ -1175,9 +1203,11 @@ class BarrierFleet:
         self.obs_ram = int(obs_ram)
         self.goexplore = bool(goexplore)
         self.wram_stride = int(wram_stride)
+        # Splatted (order-critical) into the worker main after the fixed args;
+        # keep in sync with the _barrier_worker_main signature.
         self._foveal = (
-            int(periph_grid), int(fovea_native_px), float(saccade_gain),
-            int(saccade_every_k), int(episode_steps),
+            int(periph_grid), int(fovea_native_px), int(fovea_grid),
+            float(saccade_gain), int(saccade_every_k), int(episode_steps),
         )
 
         # Derive the fixed cell-key length from the archive's geometry.
@@ -1543,7 +1573,8 @@ def _async_worker_main(
     slice_lo, slice_hi, rom_path, frame_skip, hold_frames, reset_state,
     obs_res, obs_ram, wram_stride, arch_kwargs, goexplore,
     shm_names, n_envs, obs_dim, key_len, core, state_cap,
-    periph_grid, fovea_native_px, saccade_gain, saccade_every_k, episode_steps,
+    periph_grid, fovea_native_px, fovea_grid, saccade_gain, saccade_every_k,
+    episode_steps,
 ):
     """Free-running worker: owns envs ``[slice_lo:slice_hi]``.
 
@@ -1566,11 +1597,13 @@ def _async_worker_main(
         pass
 
     # Active-vision encoder (stateful per env; §2/§3), auto-selected from obs_dim:
-    #   obs_dim == 3*G^2+14+n_ram  -> foveal 454 obs (Phase-0 pixel vectors)
-    #   obs_dim == 2*84^2+14+n_ram -> retina 14134 obs (Phase-1 pixel input)
+    #   obs_dim == 2*G^2+FG^2+14+n_ram -> foveal obs (454 when FG==G, larger for a
+    #                                    sharp fovea)
+    #   obs_dim == 2*84^2+14+n_ram      -> retina 14134 obs (Phase-1 pixel input)
     # else the legacy flat ObsEncoder (back-compat). Indexed by GLOBAL env id to
     # match the shm obs rows.
-    _foveal_dim = 3 * periph_grid * periph_grid + 14 + obs_ram
+    _fg = int(fovea_grid) if int(fovea_grid) > 0 else int(periph_grid)
+    _foveal_dim = 2 * periph_grid * periph_grid + _fg * _fg + 14 + obs_ram
     _retina_dim = 2 * _RETINA_SIDE * _RETINA_SIDE + 14 + obs_ram
     use_retina = int(obs_dim) == int(_retina_dim)
     use_foveal = int(obs_dim) == int(_foveal_dim)
@@ -1578,7 +1611,7 @@ def _async_worker_main(
     if use_active:
         encoder = FovealEncoder(
             n_envs, periph_grid=periph_grid, fovea_native_px=fovea_native_px,
-            n_ram=obs_ram, saccade_gain=saccade_gain,
+            fovea_grid=fovea_grid, n_ram=obs_ram, saccade_gain=saccade_gain,
             saccade_every_k=saccade_every_k, episode_steps=episode_steps,
             mode=("retina" if use_retina else "foveal"),
         )
@@ -1785,6 +1818,7 @@ class AsyncFleet:
         round_deadline_s: float | None = None,
         periph_grid: int = 12,
         fovea_native_px: int = 48,
+        fovea_grid: int = 0,
         saccade_gain: float = 32.0,
         saccade_every_k: int = 1,
         episode_steps: int = 1024,
@@ -1794,9 +1828,11 @@ class AsyncFleet:
         self.obs_ram = int(obs_ram)
         self.goexplore = bool(goexplore)
         self.wram_stride = int(wram_stride)
+        # Splatted (order-critical) into the worker main after the fixed args;
+        # keep in sync with the _async_worker_main signature.
         self._foveal = (
-            int(periph_grid), int(fovea_native_px), float(saccade_gain),
-            int(saccade_every_k), int(episode_steps),
+            int(periph_grid), int(fovea_native_px), int(fovea_grid),
+            float(saccade_gain), int(saccade_every_k), int(episode_steps),
         )
         self.key_len = _archive_key_len(archive_kwargs, wram_stride)
         # A5: probe the real save_state size to size the transport buffers.

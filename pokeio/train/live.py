@@ -118,6 +118,11 @@ def downscale_swarm(screen: np.ndarray) -> np.ndarray:
 # [2G^2:3G^2], proprio [3G^2:3G^2+14], ram trailing. These helpers pull the
 # optical views + gaze back out of a raw obs vector so the spectator can SEE
 # both the low-res periphery and the high-acuity fovea crop the agent looks at.
+# NOTE: these decoders assume the LEGACY uniform-grid layout (fovea_grid == G).
+# A sharp fovea (optical-frontend-v2 §2, fovea_grid > G) makes the fovea block
+# FG^2 wide, shifting the motion/proprio offsets — generalizing this decode to
+# read FG off the obs is the rendering increment (spec §8.7, task #12). Default
+# runs (fovea_grid=0 => FG=G) are byte-identical, so this stays correct for them.
 def _block2d(vec, grid: int, block: str) -> np.ndarray:
     """Extract a ``grid``x``grid`` optical block ('periph'|'fovea'|'motion')."""
     n = grid * grid
@@ -460,6 +465,7 @@ class ChampionShowcase:
             1,
             periph_grid=int(getattr(encoder, "G", 12)),
             fovea_native_px=int(getattr(encoder, "F", 48)),
+            fovea_grid=int(getattr(encoder, "FG", getattr(encoder, "G", 12))),
             n_ram=int(getattr(encoder, "n_ram", 8)),
             saccade_gain=float(getattr(encoder, "gain", 32.0)),
             saccade_every_k=int(getattr(encoder, "every_k", 1)),

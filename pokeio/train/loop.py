@@ -3227,8 +3227,8 @@ def train(
     # fovea + motion + proprio + connect-protected RAM taps). The parent encoder
     # is used for the solo champion/miner replay (env slot 0) and the serial
     # (non-parallel) wave path; fleet workers auto-select their own FovealEncoder
-    # when obs_dim == 3*periph_grid^2 + 14 + n_ram. Sized to `players` so the
-    # serial path can encode a whole sub-wave.
+    # when obs_dim == 2*periph_grid^2 + fovea_grid^2 + 14 + n_ram (454 legacy).
+    # Sized to `players` so the serial path can encode a whole sub-wave.
     # Phase-1 selector: retina mode ships raw pixel obs (14134-d) from the fleet
     # and feeds the controller a learned 102-d latent (built parent-side below).
     retina_mode = str(config.vision.mode) == "retina"
@@ -3240,11 +3240,12 @@ def train(
         max(1, players),
         periph_grid=config.vision.periph_grid,
         fovea_native_px=config.vision.fovea_native_px,
+        fovea_grid=config.vision.fovea_grid,  # sharp fovea (optical-frontend-v2 §2)
         n_ram=config.vision.obs_ram_bytes,
         saccade_gain=config.vision.saccade_gain,
         saccade_every_k=config.vision.saccade_every_k,
         episode_steps=episode_steps,
-        mode=config.vision.mode,  # foveal (454) | retina (14134 raw pixels)
+        mode=config.vision.mode,  # foveal (2G^2+FG^2+..) | retina (14134 raw pixels)
     )
     # TWO DIMENSIONS in retina mode (docs/specs/retina-in-loop.md): the FLEET obs
     # is encoder.dim==14134, but the GENOME/controller n_in is 102
@@ -3341,6 +3342,7 @@ def train(
     )
 
     _G = config.vision.periph_grid
+    _FG = config.vision.fovea_grid or config.vision.periph_grid  # sharp-fovea side
     if retina_mode:
         print(
             f"[train] device={device} n_in={n_in} N_OUT={N_OUT} "
@@ -3352,8 +3354,9 @@ def train(
     else:
         print(
             f"[train] device={device} n_in={n_in} N_OUT={N_OUT} "
-            f"(foveal: 3x{_G}^2 periph/fovea/motion + 14 proprio + "
-            f"{config.vision.obs_ram_bytes} ram) "
+            f"(foveal: {_G}^2 periph + {_FG}^2 fovea + {_G}^2 motion + 14 proprio "
+            f"+ {config.vision.obs_ram_bytes} ram; fovea {config.vision.fovea_native_px}"
+            f"px->{_FG} = {config.vision.fovea_native_px / _FG:.1f} px/cell) "
             f"pop={pop_size} players={players} episode_steps={episode_steps} gens={gens}"
         )
     print(f"[train] run_dir={run_dir}  reset_state={config.emu.reset_state}")
@@ -3496,10 +3499,13 @@ def train(
             wram_stride=archive.wram_stride,
             goexplore=bool(go),
             envs_per_worker=envs_per_worker,
-            # Active-vision knobs: with obs_dim=454 (=3*12^2+14+8) the workers
-            # auto-select FovealEncoder and must match the parent's geometry.
+            # Active-vision knobs: with obs_dim=2*G^2+FG^2+14+n_ram (454 legacy)
+            # the workers auto-select FovealEncoder and must match the parent's
+            # geometry (periph_grid AND fovea_grid, or the worker builds a
+            # different-dim encoder than the shm obs rows).
             periph_grid=config.vision.periph_grid,
             fovea_native_px=config.vision.fovea_native_px,
+            fovea_grid=config.vision.fovea_grid,
             saccade_gain=config.vision.saccade_gain,
             saccade_every_k=config.vision.saccade_every_k,
             episode_steps=episode_steps,
@@ -4486,6 +4492,12 @@ def build_config(args) -> Config:
     # so buttons actually take effect and the agent can move / advance dialog.
     cfg.emu.frame_skip = args.frame_skip
     cfg.emu.button_hold_frames = args.hold_frames
+    # -- Sharp fovea (docs/specs/optical-frontend-v2.md §2) -------------------
+    # Unset => config defaults (fovea_grid 0 => FG=periph_grid => legacy obs).
+    if getattr(args, "fovea_grid", None) is not None:
+        cfg.vision.fovea_grid = int(args.fovea_grid)
+    if getattr(args, "fovea_native_px", None) is not None:
+        cfg.vision.fovea_native_px = int(args.fovea_native_px)
     # -- Phase-1 retina spine (docs/specs/retina-in-loop.md) ------------------
     # CLI overrides keep foveal (Phase-0) defaults untouched when unset.
     if getattr(args, "vision_mode", None):
@@ -4631,6 +4643,19 @@ def main() -> None:
                          "wired; sparse gives each output --init-k random inputs")
     ap.add_argument("--init-k", type=int, default=32,
                     help="inputs per output for --init-connect sparse (§8)")
+    # -- Sharp fovea (docs/specs/optical-frontend-v2.md §2) --------------------
+    ap.add_argument("--fovea-grid", type=int, default=None,
+                    help="FG: fovea resample side, DECOUPLED from the coarse "
+                         "periphery so the fovea is native-sharp (default: config "
+                         "0 => FG=periph_grid => byte-identical legacy 4px/cell "
+                         "smudge). px/cell = fovea-native-px / FG; e.g. "
+                         "--fovea-native-px 32 --fovea-grid 32 => 1 px/cell (a GB "
+                         "tile is legible). Grows n_in => a fresh run (or "
+                         "warm-started pop); the resume guard refuses cross-dim.")
+    ap.add_argument("--fovea-native-px", type=int, default=None,
+                    help="F: native fovea crop side in screen px (default config "
+                         "48). Recommended successor pair with --fovea-grid 32 is "
+                         "--fovea-native-px 32 (1 px/cell over a 32px window).")
     # -- Phase-1 learned retina spine (docs/specs/retina-in-loop.md) ----------
     ap.add_argument("--vision-mode", choices=("foveal", "fovea_static", "retina"),
                     default=None,

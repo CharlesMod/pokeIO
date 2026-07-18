@@ -143,6 +143,7 @@ def _try_emulator_probe(layout, config, *, b: int, seed: int) -> np.ndarray | No
             1,
             periph_grid=vis.periph_grid,
             fovea_native_px=vis.fovea_native_px,
+            fovea_grid=getattr(vis, "fovea_grid", 0),
             n_ram=layout.n_ram,
             saccade_gain=vis.saccade_gain,
             saccade_every_k=vis.saccade_every_k,
