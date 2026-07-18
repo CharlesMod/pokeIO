@@ -63,15 +63,23 @@ class ObsLayout:
     n_ram: int
 
 
-def infer_obs_layout(n_in: int, n_out: int, n_ram: int = 8) -> ObsLayout:
+def infer_obs_layout(
+    n_in: int, n_out: int, n_ram: int = 8, n_proprio: int | None = None
+) -> ObsLayout:
     """Infer the obs block boundaries from the genome's I/O widths.
 
     The active-vision controllers (``n_out == 11``) carry a 14-d proprio block
     before the RAM tail; the legacy flat controller (``n_out == 9``) has none.
     Verified against real checkpoints: foveal 454 (opt 432), retina-latent 102
     (opt 80), legacy flat 584 @ n_out 9 (opt 576).
+
+    ``n_proprio`` overrides the heuristic — needed for reflex gaze
+    (optical-frontend-v2 §4), which grows proprio 14->16 WITHOUT changing
+    ``n_out`` (it re-purposes the saccade outputs), so the width can't be read off
+    ``n_out`` and the caller passes the config-derived value.
     """
-    n_proprio = 14 if n_out == 11 else 0
+    if n_proprio is None:
+        n_proprio = 14 if n_out == 11 else 0
     optical_hi = max(0, n_in - n_proprio - n_ram)
     return ObsLayout(n_in=n_in, optical_hi=optical_hi, n_proprio=n_proprio, n_ram=n_ram)
 

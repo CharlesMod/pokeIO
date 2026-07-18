@@ -459,7 +459,8 @@ class ObsEncoder:
 #     periphery [0 : G^2]           144x160 -> area-resample to GxG          [0,1]
 #     fovea     [G^2 : G^2+FG^2]    native FxF crop @ gaze -> resample F->FG  [0,1]
 #     motion    [G^2+FG^2 : +G^2]   (periph_t - periph_{t-1} + 1)/2; 0.5 init [0,1]
-#     proprio   [.. : +14]          14-d efference copy (see _proprio)      [-1,1]
+#     proprio   [.. : +14/16]       14-d efference copy (see _proprio); +2 = the
+#                                   reflex TARGET when reflex_gaze on (§4)       [-1,1]
 #     ram       [.. : +n_ram]       mined tap bytes (connect-protected)      [0,1]
 # Legacy default (G=FG=12, n_ram=8): 144|144|144|14|8 = 454, block bounds
 # 0,144,288,432,446,454.  Sharp-fovea example (G=12, FG=32): 144|1024|144|14|8
@@ -474,6 +475,12 @@ class ObsEncoder:
 # OFF (default) => byte-identical to the sharp-fovea obs above (no new blocks; the
 # motion block still immediately precedes proprio, so o_motion_hi == o_proprio).
 #
+# Reflex gaze + top-down modulation (optical-frontend-v2 §3/§4; reflex_gaze=True)
+# grows PROPRIO 14->16 (the trailing 2 dims carry the bottom-up reflex TARGET —
+# a soft-argmax of motion x staleness — so the controller conditions its evolved
+# additive correction on where the reflex pulls).  No new visual block, no N_OUT
+# change (it re-purposes the existing saccade outputs).  OFF => proprio stays 14.
+#
 # The fovea's F->FG resample is DECOUPLED from the periphery's ->G downsample so
 # the fovea can be native-sharp while the periphery stays biomimetically coarse
 # (low-acuity periphery); see optical-frontend-v2 §2.  Sensor seam (#15/§9a): the
@@ -482,9 +489,10 @@ class ObsEncoder:
 # future console/webcam drop-in, no layout change above C).
 #
 # Stateful PER ENV (indexed by env id): gaze (gy,gx), last saccade (dx,dy),
-# previous periphery (motion), a per-episode step counter (step_frac), and — when
+# previous periphery (motion), a per-episode step counter (step_frac), — when
 # foveal_memory=True — the persistent scene buffer + staleness map + the per-region
-# divergence EMA that self-calibrates invalidation (all reset per episode).
+# divergence EMA that self-calibrates invalidation, and — when reflex_gaze=True —
+# the per-env reflex TARGET (surfaced in proprio) (all reset per episode).
 class FovealEncoder:
     """Stateful periphery+fovea+motion+proprio+ram encoder (spec §2/§3).
 
@@ -537,6 +545,10 @@ class FovealEncoder:
         mem_ema_decay: float = 0.99,
         mem_stale_z: float = 1.5,
         mem_stale_warmup: int = 16,
+        reflex_gaze: bool = False,
+        reflex_gain: float = 1.0,
+        reflex_ema_decay: float = 0.99,
+        reflex_beta: float = 4.0,
     ) -> None:
         self.n_envs = int(n_envs)
         self.mode = str(mode)
@@ -557,6 +569,19 @@ class FovealEncoder:
         self.mem_stale_z = float(mem_stale_z)
         self.mem_stale_warmup = int(mem_stale_warmup)
         self.n_mem = self.M * self.M
+        # Reflex gaze + top-down modulation (optical-frontend-v2 §3/§4).  Foveal-
+        # only: the reflex reads the motion sheet (retina has none), so it never
+        # arms in retina mode.  ON exposes the reflex TARGET as 2 extra proprio
+        # efference dims (n_proprio 14->16 below), so the sparse genome can
+        # condition its top-down correction on where the reflex pulls (§4).  The
+        # blend (gaze_delta = reflex + learned) + the self-calibrated reflex_gain
+        # live PARENT-SIDE (loop.ReflexGaze / live.py); the encoder just computes
+        # the target here + surfaces it in proprio.  reflex_beta is the soft-argmax
+        # sharpness over a max-normalized salience map (dimensionless — §11b).
+        self.reflex_gaze = bool(reflex_gaze) and self.mode != "retina"
+        self.reflex_gain = float(reflex_gain)
+        self.reflex_ema_decay = float(reflex_ema_decay)
+        self.reflex_beta = float(reflex_beta)
         # Sensor seam (#15/§9a): (H,W,C) frame channels.  C=1 grayscale now (the
         # ObsBuilder shade path assumes a single luma plane); C=3 RGB is the
         # future console/webcam drop-in.  Kept as an attribute, not yet wired
@@ -574,7 +599,10 @@ class FovealEncoder:
         self.n_periph = g * g
         self.n_fovea = self.FG * self.FG   # sharp fovea: FGxFG (legacy FG==G => g*g)
         self.n_motion = g * g              # periphery/motion stay coarse at GxG
-        self.n_proprio = 14
+        # 14-d efference copy; +2 (=> 16) for the reflex TARGET when reflex_gaze is
+        # on (optical-frontend-v2 §4).  Grows n_in by 2 => a fresh run; OFF keeps 14
+        # so the obs is byte-identical to Increment B (retina is always reflex-off).
+        self.n_proprio = 16 if self.reflex_gaze else 14
 
         if self.mode == "retina":
             # Phase-1 retina obs: ship the retina encoder's PIXEL input, not the
@@ -679,6 +707,13 @@ class FovealEncoder:
         self._last_dy = np.zeros(self.n_envs, np.float64)
         self._nstep = np.zeros(self.n_envs, np.int64)
         self._prev_periph: list = [None] * self.n_envs
+        # Reflex-gaze target per env (§3/§4): the soft-argmax of motion x staleness
+        # in normalized screen coords [-1,1], recomputed each encode + surfaced in
+        # proprio[14:16].  Seeded to screen-centre (0,0), which is also the current
+        # gaze after reset, so the reset-frame reflex pull is exactly zero.
+        if self.reflex_gaze:
+            self._reflex_tx = np.zeros(self.n_envs, np.float64)
+            self._reflex_ty = np.zeros(self.n_envs, np.float64)
         # Trans-saccadic memory per-env state (§1a): the persistent scene buffer,
         # its staleness map, and the per-region divergence EMA that self-calibrates
         # invalidation.  PER-ENV is load-bearing for engine-parity — each env's
@@ -719,6 +754,9 @@ class FovealEncoder:
             self._last_dy[i] = 0.0
             self._nstep[i] = 0
             self._prev_periph[i] = None
+            if self.reflex_gaze:
+                self._reflex_tx[i] = 0.0   # screen-centre == gaze after reset
+                self._reflex_ty[i] = 0.0
             if self.foveal_memory:
                 self._mem[i] = 0.5      # neutral "no percept yet"
                 self._stale[i] = 1.0    # fully stale until first stamp
@@ -737,6 +775,17 @@ class FovealEncoder:
         Applied every ``saccade_every_k`` steps; the raw command ``(dx, dy)`` is
         always stored as the efference copy and the per-episode step counter is
         advanced.  Returns the new ``(gy, gx)``.
+
+        Gaze-actuator seam (#16 / §9a): this IS the gaze-actuator interface — it
+        consumes a gaze command ``(dpan, dtilt)`` (``dx, dy``; a future ``dzoom``
+        is the natural 3rd DOF for foveal scale) and returns the realized gaze.
+        The command is already a VELOCITY (``GAIN*tanh``), so it maps to a PTZ slew
+        rate directly: SOFTWARE-CROP now (the fovea can teleport, clamp is the only
+        limit); PTZ-later swaps this body for a velocity-limited, latency-bearing
+        physical pan/tilt with no change to the caller (the reflex + top-down blend
+        both emit into this same ``(dx, dy)`` command).  The incoming ``(dx, dy)``
+        is the parent-blended ``reflex_delta + learned_delta`` when reflex gaze is
+        on (§4); this integrator is agnostic to how the command was formed.
         """
         i = int(env_idx)
         self._last_dx[i] = float(dx)
@@ -783,6 +832,56 @@ class FovealEncoder:
         if not self.foveal_memory:
             return np.zeros((0, 0), bool)
         return self._mem_last_fire[int(env_idx)].copy()
+
+    # ---------------------------------------------- reflex gaze target (§3/§4)
+    def reflex_target(self, env_idx: int) -> tuple[float, float]:
+        """Current reflex gaze target ``(tx, ty)`` for an env, in normalized screen
+        coords ``[-1,1]`` (telemetry / rendering / tests) — the same value written
+        into ``proprio[14:16]``.  ``(0.0, 0.0)`` (== screen centre) when
+        ``reflex_gaze`` is off."""
+        if not self.reflex_gaze:
+            return (0.0, 0.0)
+        i = int(env_idx)
+        return (float(self._reflex_tx[i]), float(self._reflex_ty[i]))
+
+    def _reflex_target(self, i: int, motion: np.ndarray) -> tuple[float, float]:
+        """[§3] Bottom-up reflex gaze target for env ``i`` from ``motion`` (× the
+        staleness map when ``foveal_memory`` is on).
+
+        The salience map is the motion MAGNITUDE ``|motion - 0.5|`` (0.5 == no
+        motion), multiplied by the per-cell staleness when the trans-saccadic
+        memory is on (orient to what CHANGED **or** hasn't been refreshed lately —
+        §1a's ``motion x staleness``; motion alone otherwise).  A **soft-argmax**
+        (center-of-mass over a softmax of the max-normalized salience — so the
+        sharpness ``reflex_beta`` is scale-free, no fixed magnitude, §11b) gives the
+        target in grid coords, converted to normalized screen coords ``[-1,1]``.
+
+        A flat field (no motion) has an all-zero salience map => the soft-argmax is
+        undefined, so we return the CURRENT gaze (a zero pull — the harmless
+        "reflex ~ no pull" fallback, robust to any gaze position).  Zero rng,
+        per-env => engine-parity safe."""
+        sal = np.abs(motion.astype(np.float64) - 0.5)            # (G,G) motion mag
+        if self.foveal_memory:
+            # upsample motion G->M (nearest, reuse the §1a mapping) so it aligns
+            # with the M x M staleness map, then weight by staleness.
+            sal = sal[self._g2m_row][:, self._g2m_col] * self._stale[i]  # (M,M)
+            P = self.M
+        else:
+            P = self.G
+        flat = sal.ravel()
+        smax = float(flat.max())
+        if smax <= 1e-9:  # flat / no salient change: aim at current gaze (zero pull)
+            return (self._gx[i] / self.W * 2.0 - 1.0, self._gy[i] / self.H * 2.0 - 1.0)
+        # soft-argmax: softmax over the max-normalized salience, then center of mass.
+        w = np.exp(self.reflex_beta * (flat / smax - 1.0))
+        w /= w.sum()
+        wm = w.reshape(P, P)
+        idx = np.arange(P)
+        r_star = float((wm.sum(axis=1) * idx).sum())             # row centroid
+        c_star = float((wm.sum(axis=0) * idx).sum())             # col centroid
+        tgt_x = (c_star + 0.5) / P * 2.0 - 1.0
+        tgt_y = (r_star + 0.5) / P * 2.0 - 1.0
+        return (tgt_x, tgt_y)
 
     def _calibrate_invalidation(self, i: int, chg: np.ndarray) -> np.ndarray:
         """[§1a / §11b] Self-calibrated peripheral-change invalidation for env ``i``.
@@ -891,10 +990,17 @@ class FovealEncoder:
         return out
 
     def _proprio(self, i: int, button: int) -> np.ndarray:
-        """14-d efference copy (spec §2.1), all in [-1,1].
+        """14-d efference copy (spec §2.1), all in [-1,1]; 16-d with reflex gaze.
 
         [gx*2/W-1, gy*2/H-1, dx_prev, dy_prev,
-         up,down,left,right,A,B,START,SELECT,NOOP one-hot, step_frac]."""
+         up,down,left,right,A,B,START,SELECT,NOOP one-hot, step_frac
+         (, reflex_target_x, reflex_target_y)].
+
+        With ``reflex_gaze`` the trailing 2 dims carry the bottom-up reflex TARGET
+        (§4) so the controller conditions its top-down correction on where the
+        reflex pulls (the top-down/bottom-up handshake).  The parent
+        (``loop.ReflexGaze`` / live.py) reads these back to form the additive
+        reflex delta, so this is the single source of truth for the target."""
         p = np.zeros(self.n_proprio, np.float32)
         p[0] = self._gx[i] / self.W * 2.0 - 1.0
         p[1] = self._gy[i] / self.H * 2.0 - 1.0
@@ -904,6 +1010,9 @@ class FovealEncoder:
         if 0 <= b < 9:  # button ids match emu.env.ACTIONS ordering
             p[4 + b] = 1.0
         p[13] = min(float(self._nstep[i]) / float(self.episode_steps), 1.0)
+        if self.reflex_gaze:  # 2 efference dims: where the reflex is pulling (§4)
+            p[14] = np.float32(self._reflex_tx[i])
+            p[15] = np.float32(self._reflex_ty[i])
         return p
 
     def _ram(self, wram: np.ndarray | None) -> np.ndarray:
@@ -1027,6 +1136,14 @@ class FovealEncoder:
         if self.foveal_memory:
             self._mem_step(i, periph, crop)
 
+        # Reflex gaze target (§3/§4): soft-argmax of motion x staleness -> proprio.
+        # Computed AFTER _mem_step so it reads the freshly-updated staleness (a
+        # just-glimpsed region is now fresh => low salience there, so the reflex
+        # orients AWAY from what we just refreshed).  OFF => proprio stays 14-d and
+        # this is skipped (obs byte-identical to Increment B).  Zero rng, per-env.
+        if self.reflex_gaze:
+            self._reflex_tx[i], self._reflex_ty[i] = self._reflex_target(i, motion)
+
         proprio = self._proprio(i, button)
         ram = self._ram(wram)
         if self.tap_addrs and wram is not None:  # parent path: overlay from wram
@@ -1049,6 +1166,110 @@ class FovealEncoder:
         vec[self._o_proprio : self._o_ram] = proprio
         vec[self._o_ram : self.dim] = ram
         return vec
+
+
+# ==========================================================================
+# ReflexGaze — parent-side reflex-gaze blend + self-calibrated gain (§3/§4)
+# ==========================================================================
+# Lives here (not train/loop.py) so BOTH the trainer (loop.py) and the live
+# showcase (live.py) import it from one place WITHOUT a circular import
+# (loop imports live), and it sits next to the FovealEncoder it pairs with (the
+# encoder computes the reflex TARGET; this consumes it).  Torch-free (numpy only).
+class ReflexGaze:
+    """[optical-frontend-v2 §3/§4] Parent-side reflex-gaze blend + self-calibrated gain.
+
+    Closes the active-vision loop.  :class:`FovealEncoder` computes the bottom-up
+    reflex TARGET (soft-argmax of motion x staleness) and surfaces it in
+    ``proprio[14:16]`` (the single source of truth).  This latch turns the
+    ``target - current_gaze`` pull into a reflex saccade COMMAND and ADDS it to the
+    controller's learned saccade (§4)::
+
+        gaze_delta = reflex_delta + learned_delta
+
+    so the net can FOLLOW the reflex (learned≈0), NUDGE it, or OVERRIDE it (large
+    learned; the ``tanh`` in :meth:`FovealEncoder.update_gaze` saturates on the
+    learned term).  No ``N_OUT`` change — it re-purposes the existing saccade
+    outputs, so ``fast_reproduce`` / the genome are untouched.
+
+    ``reflex_gain`` is SELF-CALIBRATED per §11b — NOT a fixed pixel step.  The raw
+    pull is normalized by a per-env EMA of its OWN recent magnitude (seeded on the
+    first sample so step 0 is bounded), so the emitted command is a dimensionless
+    velocity that self-scales to the env's pull distribution and ``reflex_gain`` is
+    a pure multiplier.  Reuses the exact [AC]/MotorClock per-env EMA pattern.
+
+    **Zero rng, per-env** => engine-parity: env ``i``'s reflex depends only on its
+    own obs (its proprio target + gaze) and its own EMA, which ticks only when that
+    env is ready — identical serial-vs-furnace (mirrors ``MotorClock.decide``'s
+    ``ready_idx`` handling).
+    """
+
+    _EPS = 1e-6  # pull-scale floor (guards the seed div; foveal pulls are ~O(1))
+
+    def __init__(self, n: int, gain: float, ema_decay: float = 0.99):
+        self.n = int(n)
+        self.gain = float(gain)
+        self.decay = float(ema_decay)
+        # per-env EMA of the reflex pull magnitude + a step counter (game-level
+        # calibration, NOT per-episode; like MotorClock's salience EMA it is not
+        # cleared by reset — keeping it per-env is what preserves engine-parity).
+        self._ema = np.zeros(self.n, dtype=np.float64)
+        self._steps = np.zeros(self.n, dtype=np.int64)
+
+    def command(self, pull_x, pull_y, ready_idx=None):
+        """Self-calibrated reflex delta for the pull ``(pull_x, pull_y)`` (full-
+        length ``(n,)`` arrays).  Returns full-length ``(rdx, rdy)`` that are ZERO
+        off the ready set, so a caller can add them straight onto ``gdx``/``gdy``.
+        Only the ``ready_idx`` rows advance their EMA (a non-ready env didn't step,
+        so its calibration must not tick)."""
+        rdx = np.zeros(self.n, dtype=np.float32)
+        rdy = np.zeros(self.n, dtype=np.float32)
+        idx = (
+            np.arange(self.n) if ready_idx is None
+            else np.asarray(ready_idx, dtype=np.intp)
+        )
+        if idx.size == 0:
+            return rdx, rdy
+        px = np.asarray(pull_x, dtype=np.float64)[idx]
+        py = np.asarray(pull_y, dtype=np.float64)[idx]
+        mag = np.sqrt(px * px + py * py)
+        ema_old = self._ema[idx]
+        first = self._steps[idx] == 0
+        # PRE-update scale (seed with this sample on step 0 so a first-frame pull is
+        # a bounded ~gain step; afterwards a pull above the env's baseline gives a
+        # stronger orienting jerk, below it a gentler one — the EMA-normalized pull).
+        scale = np.where(first, mag, ema_old)
+        inv = self.gain / (scale + self._EPS)
+        rdx[idx] = (px * inv).astype(np.float32)
+        rdy[idx] = (py * inv).astype(np.float32)
+        d = self.decay
+        self._ema[idx] = np.where(first, mag, d * ema_old + (1.0 - d) * mag)
+        self._steps[idx] = self._steps[idx] + 1
+        return rdx, rdy
+
+    def blend(self, X, o_proprio, gdx, gdy, ready_idx=None):
+        """Add the self-calibrated reflex delta to the learned saccade (§4).
+
+        Reads the reflex TARGET (``proprio[o_proprio+14:+16]``) and the current
+        gaze (``proprio[o_proprio:+2]``) straight from the obs matrix ``X`` — the
+        SAME source in the parent-encoder and the worker paths, so the blend is
+        engine-agnostic.  Returns the new ``(gdx, gdy)`` (reflex + learned)."""
+        cur_x = X[:, o_proprio + 0]
+        cur_y = X[:, o_proprio + 1]
+        tgt_x = X[:, o_proprio + 14]
+        tgt_y = X[:, o_proprio + 15]
+        rdx, rdy = self.command(tgt_x - cur_x, tgt_y - cur_y, ready_idx=ready_idx)
+        return gdx + rdx, gdy + rdy
+
+    @staticmethod
+    def maybe(encoder, n: int) -> "ReflexGaze | None":
+        """Build a per-wave latch of width ``n`` when ``encoder.reflex_gaze`` is on,
+        else ``None`` (the off-switch => the blend is skipped, gaze == legacy)."""
+        if encoder is None or not getattr(encoder, "reflex_gaze", False):
+            return None
+        return ReflexGaze(
+            n, float(getattr(encoder, "reflex_gain", 1.0)),
+            float(getattr(encoder, "reflex_ema_decay", 0.99)),
+        )
 
 
 # ==========================================================================
@@ -1191,7 +1412,7 @@ def _barrier_worker_main(
     shm_names, n_envs, obs_dim, key_len, core, state_cap,
     periph_grid, fovea_native_px, fovea_grid, saccade_gain, saccade_every_k,
     episode_steps, foveal_memory, mem_grid, mem_ema_decay, mem_stale_z,
-    mem_stale_warmup,
+    mem_stale_warmup, reflex_gaze, reflex_gain, reflex_ema_decay, reflex_beta,
 ):
     """Worker process: owns envs ``[slice_lo:slice_hi]``; hashes + encodes locally.
 
@@ -1216,15 +1437,17 @@ def _barrier_worker_main(
         pass
 
     # Active-vision encoder (stateful per env; §2/§3), auto-selected from obs_dim:
-    #   obs_dim == 2*G^2+FG^2+[2*M^2]+14+n_ram -> foveal obs (Phase-0 pixel vectors;
-    #                                    454 when FG==G, larger for a sharp fovea /
-    #                                    +2*M^2 for the §1a trans-saccadic memory)
+    #   obs_dim == 2*G^2+FG^2+[2*M^2]+14/16+n_ram -> foveal obs (Phase-0 pixel
+    #                                    vectors; 454 when FG==G, larger for a sharp
+    #                                    fovea / +2*M^2 for the §1a trans-saccadic
+    #                                    memory / +2 proprio for §4 reflex gaze)
     #   obs_dim == 2*84^2+14+n_ram      -> retina 14134 obs (Phase-1 pixel input)
     # else fall back to the legacy flat ObsEncoder (back-compat res^2+ram obs).
     # n_envs-wide so it can be indexed by the GLOBAL env id (= shm obs rows).
     _fg = int(fovea_grid) if int(fovea_grid) > 0 else int(periph_grid)
     _mem_extra = (2 * int(mem_grid) * int(mem_grid)) if foveal_memory else 0
-    _foveal_dim = 2 * periph_grid * periph_grid + _fg * _fg + _mem_extra + 14 + obs_ram
+    _npro = 16 if reflex_gaze else 14  # reflex gaze adds 2 proprio dims (§4)
+    _foveal_dim = 2 * periph_grid * periph_grid + _fg * _fg + _mem_extra + _npro + obs_ram
     _retina_dim = 2 * _RETINA_SIDE * _RETINA_SIDE + 14 + obs_ram
     use_retina = int(obs_dim) == int(_retina_dim)
     use_foveal = int(obs_dim) == int(_foveal_dim)
@@ -1237,7 +1460,9 @@ def _barrier_worker_main(
             mode=("retina" if use_retina else "foveal"),
             foveal_memory=bool(foveal_memory), mem_grid=int(mem_grid),
             mem_ema_decay=float(mem_ema_decay), mem_stale_z=float(mem_stale_z),
-            mem_stale_warmup=int(mem_stale_warmup),
+            mem_stale_warmup=int(mem_stale_warmup), reflex_gaze=bool(reflex_gaze),
+            reflex_gain=float(reflex_gain), reflex_ema_decay=float(reflex_ema_decay),
+            reflex_beta=float(reflex_beta),
         )
     else:
         encoder = ObsEncoder(obs_res, obs_ram)
@@ -1425,6 +1650,10 @@ class BarrierFleet:
         mem_ema_decay: float = 0.99,
         mem_stale_z: float = 1.5,
         mem_stale_warmup: int = 16,
+        reflex_gaze: bool = False,
+        reflex_gain: float = 1.0,
+        reflex_ema_decay: float = 0.99,
+        reflex_beta: float = 4.0,
     ):
         self.n_envs = int(n_envs)
         self.obs_dim = int(obs_dim)
@@ -1438,6 +1667,8 @@ class BarrierFleet:
             float(saccade_gain), int(saccade_every_k), int(episode_steps),
             bool(foveal_memory), int(mem_grid), float(mem_ema_decay),
             float(mem_stale_z), int(mem_stale_warmup),
+            bool(reflex_gaze), float(reflex_gain), float(reflex_ema_decay),
+            float(reflex_beta),
         )
 
         # Derive the fixed cell-key length from the archive's geometry.
@@ -1805,7 +2036,7 @@ def _async_worker_main(
     shm_names, n_envs, obs_dim, key_len, core, state_cap,
     periph_grid, fovea_native_px, fovea_grid, saccade_gain, saccade_every_k,
     episode_steps, foveal_memory, mem_grid, mem_ema_decay, mem_stale_z,
-    mem_stale_warmup,
+    mem_stale_warmup, reflex_gaze, reflex_gain, reflex_ema_decay, reflex_beta,
 ):
     """Free-running worker: owns envs ``[slice_lo:slice_hi]``.
 
@@ -1828,14 +2059,16 @@ def _async_worker_main(
         pass
 
     # Active-vision encoder (stateful per env; §2/§3), auto-selected from obs_dim:
-    #   obs_dim == 2*G^2+FG^2+[2*M^2]+14+n_ram -> foveal obs (454 when FG==G, larger
-    #                                    for a sharp fovea / +2*M^2 for §1a memory)
+    #   obs_dim == 2*G^2+FG^2+[2*M^2]+14/16+n_ram -> foveal obs (454 when FG==G,
+    #                                    larger for a sharp fovea / +2*M^2 for §1a
+    #                                    memory / +2 proprio for §4 reflex gaze)
     #   obs_dim == 2*84^2+14+n_ram      -> retina 14134 obs (Phase-1 pixel input)
     # else the legacy flat ObsEncoder (back-compat). Indexed by GLOBAL env id to
     # match the shm obs rows.
     _fg = int(fovea_grid) if int(fovea_grid) > 0 else int(periph_grid)
     _mem_extra = (2 * int(mem_grid) * int(mem_grid)) if foveal_memory else 0
-    _foveal_dim = 2 * periph_grid * periph_grid + _fg * _fg + _mem_extra + 14 + obs_ram
+    _npro = 16 if reflex_gaze else 14  # reflex gaze adds 2 proprio dims (§4)
+    _foveal_dim = 2 * periph_grid * periph_grid + _fg * _fg + _mem_extra + _npro + obs_ram
     _retina_dim = 2 * _RETINA_SIDE * _RETINA_SIDE + 14 + obs_ram
     use_retina = int(obs_dim) == int(_retina_dim)
     use_foveal = int(obs_dim) == int(_foveal_dim)
@@ -1848,7 +2081,9 @@ def _async_worker_main(
             mode=("retina" if use_retina else "foveal"),
             foveal_memory=bool(foveal_memory), mem_grid=int(mem_grid),
             mem_ema_decay=float(mem_ema_decay), mem_stale_z=float(mem_stale_z),
-            mem_stale_warmup=int(mem_stale_warmup),
+            mem_stale_warmup=int(mem_stale_warmup), reflex_gaze=bool(reflex_gaze),
+            reflex_gain=float(reflex_gain), reflex_ema_decay=float(reflex_ema_decay),
+            reflex_beta=float(reflex_beta),
         )
     else:
         encoder = ObsEncoder(obs_res, obs_ram)
@@ -2062,6 +2297,10 @@ class AsyncFleet:
         mem_ema_decay: float = 0.99,
         mem_stale_z: float = 1.5,
         mem_stale_warmup: int = 16,
+        reflex_gaze: bool = False,
+        reflex_gain: float = 1.0,
+        reflex_ema_decay: float = 0.99,
+        reflex_beta: float = 4.0,
     ):
         self.n_envs = int(n_envs)
         self.obs_dim = int(obs_dim)
@@ -2075,6 +2314,8 @@ class AsyncFleet:
             float(saccade_gain), int(saccade_every_k), int(episode_steps),
             bool(foveal_memory), int(mem_grid), float(mem_ema_decay),
             float(mem_stale_z), int(mem_stale_warmup),
+            bool(reflex_gaze), float(reflex_gain), float(reflex_ema_decay),
+            float(reflex_beta),
         )
         self.key_len = _archive_key_len(archive_kwargs, wram_stride)
         # A5: probe the real save_state size to size the transport buffers.
@@ -2360,5 +2601,5 @@ def _archive_key_len(archive_kwargs: dict, wram_stride: int) -> int:
 
 __all__ = [
     "VecFleet", "BarrierFleet", "AsyncFleet",
-    "ObsEncoder", "FovealEncoder", "NUMA_NODES",
+    "ObsEncoder", "FovealEncoder", "ReflexGaze", "NUMA_NODES",
 ]

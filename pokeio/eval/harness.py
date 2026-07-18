@@ -130,7 +130,7 @@ def _try_emulator_probe(layout, config, *, b: int, seed: int) -> np.ndarray | No
         # Only the foveal active-vision controller is reconstructable here; the
         # retina latent needs the learned encoder snapshot, the legacy flat obs a
         # different encoder — both fall back to synthetic.
-        if getattr(vis, "mode", "foveal") != "foveal" or layout.n_proprio != 14:
+        if getattr(vis, "mode", "foveal") != "foveal" or layout.n_proprio not in (14, 16):
             return None
         rom = Path(config.emu.rom_path)
         state = config.emu.reset_state
@@ -156,6 +156,12 @@ def _try_emulator_probe(layout, config, *, b: int, seed: int) -> np.ndarray | No
             mem_ema_decay=float(getattr(vis, "mem_ema_decay", 0.99)),
             mem_stale_z=float(getattr(vis, "mem_stale_z", 1.5)),
             mem_stale_warmup=int(getattr(vis, "mem_stale_warmup", 16)),
+            # Reflex gaze (§4): match the run's proprio width (14/16) so enc.dim
+            # == layout.n_in (else the guard below rejects this probe encoder).
+            reflex_gaze=bool(getattr(vis, "reflex_gaze", False)),
+            reflex_gain=float(getattr(vis, "reflex_gain", 1.0)),
+            reflex_ema_decay=float(getattr(vis, "reflex_ema_decay", 0.99)),
+            reflex_beta=float(getattr(vis, "reflex_beta", 4.0)),
         )
         if enc.dim != layout.n_in:
             return None
@@ -220,7 +226,14 @@ def run_all(
         connect = str(getattr(config.evo, "init_connect", connect))
         sparse_k = int(getattr(config.evo, "init_k", sparse_k))
 
-    layout = controls.infer_obs_layout(champ.n_in, champ.n_out, n_ram=n_ram)
+    # Reflex gaze (optical-frontend-v2 §4) grows proprio 14->16 without changing
+    # n_out, so the heuristic can't read the width off n_out — pass it explicitly.
+    _npro = None
+    if config is not None and getattr(config.vision, "reflex_gaze", False):
+        _npro = 16
+    layout = controls.infer_obs_layout(
+        champ.n_in, champ.n_out, n_ram=n_ram, n_proprio=_npro
+    )
     probe, probe_source = build_probe(
         layout, run_dir=run_dir, config=config, b=probe_size,
         seed=probe_seed, use_rom=use_rom,

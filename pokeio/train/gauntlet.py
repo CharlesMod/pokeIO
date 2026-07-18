@@ -28,6 +28,7 @@ from typing import Iterable
 import numpy as np
 import torch
 
+from pokeio.emu.fleet import ReflexGaze
 from pokeio.evo.forward import population_forward_sparse
 from pokeio.evo.genome import Population
 from pokeio.reward.archive import NoveltyArchive
@@ -102,6 +103,9 @@ def run_boot_gauntlet(
     pop = Population.from_genomes([genome], max_nodes=max_nodes, max_conns=max_conns)
     cp = pop.compile(device)
     encoder.reset(0)  # gaze -> centre, motion -> 0.5 (solo gauntlet uses env slot 0)
+    # [optical-frontend-v2 §3/§4] reflex-gaze latch so the gauntlet's fovea walks
+    # the same reflex + top-down path as training (None => off).  Single env slot 0.
+    reflex = ReflexGaze.maybe(encoder, 1)
     screen = env.reset(reset_state)
     wram = env.raw_wram()
     seen_keys: set[bytes] = set()
@@ -123,6 +127,13 @@ def run_boot_gauntlet(
         button = int(outv[:9].argmax())
         dx = float(outv[9])
         dy = float(outv[10])
+        # [§4] top-down modulation: gaze_delta = reflex + learned (reflex TARGET in x).
+        if reflex is not None:
+            gdx, gdy = reflex.blend(
+                x[None, :], encoder.o_proprio,
+                np.array([dx], np.float32), np.array([dy], np.float32),
+            )
+            dx, dy = float(gdx[0]), float(gdy[0])
         # Integrate the saccade BEFORE the next step's encode builds the fovea
         # crop (one-tick efference-copy delay; matches the worker _emit order).
         encoder.update_gaze(0, dx, dy)

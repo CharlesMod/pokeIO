@@ -106,6 +106,25 @@ class VisionConfig:
     mem_ema_decay: float = 0.99  # per-region EMA decay for the divergence baseline
     mem_stale_z: float = 1.5  # z-score above the per-region baseline that invalidates
     mem_stale_warmup: int = 16  # min per-env steps before an invalidation can fire
+    # -- Reflex gaze + evolved top-down modulation (optical-frontend-v2 §3/§4) --
+    # Closes the active-vision loop.  Bottom-up REFLEX: the encoder computes, per
+    # env, a gaze target = soft-argmax (center-of-mass over a softmax) of
+    # motion x staleness — orient to what CHANGED or hasn't been refreshed lately
+    # (motion alone when foveal_memory is off).  The target is exposed as 2 EXTRA
+    # proprio dims (n_proprio 14->16) so the controller conditions on where the
+    # reflex pulls.  TOP-DOWN (evolved): the controller's EXISTING 2 saccade
+    # outputs become an ADDITIVE correction — gaze_delta = reflex_delta +
+    # learned_delta (no N_OUT change; fast_reproduce untouched).  reflex_gain is
+    # SELF-CALIBRATED (the raw pull is normalized by a per-env EMA of its own
+    # magnitude, so it is a DIMENSIONLESS multiplier, NOT a fixed pixel step — the
+    # §11b no-tuned-knobs mandate, reusing the [AC]/memory per-env EMA machinery).
+    # OFF (default) + fovea_grid == periph_grid + foveal_memory off => byte-
+    # identical legacy.  ON grows n_in by 2 (the proprio efference dims) => a fresh
+    # run / warm-started pop.  Foveal-only (retina has no motion sheet).
+    reflex_gaze: bool = False  # bottom-up reflex + top-down modulation (the loop)
+    reflex_gain: float = 1.0  # dimensionless multiplier on the EMA-normalized pull
+    reflex_ema_decay: float = 0.99  # per-env EMA decay for the reflex pull-magnitude scale
+    reflex_beta: float = 4.0  # soft-argmax sharpness over the (max-normalized) salience map
     saccade_gain: float = 32.0  # px/step velocity applied to the fovea center
     saccade_every_k: int = 1  # gaze update cadence in agent-steps
     proprio: bool = True  # 14-d efference-copy block (gaze + last saccade + last buttons + step)

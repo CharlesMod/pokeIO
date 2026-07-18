@@ -32,7 +32,7 @@ import numpy as np
 import torch
 
 from pokeio.analytics.yellow import game_is_yellow
-from pokeio.emu.fleet import FovealEncoder
+from pokeio.emu.fleet import FovealEncoder, ReflexGaze
 from pokeio.evo.forward import apply_activation
 from pokeio.evo.genome import BIAS as NODE_BIAS
 from pokeio.evo.genome import HIDDEN as NODE_HIDDEN
@@ -480,7 +480,17 @@ class ChampionShowcase:
             mem_ema_decay=float(getattr(encoder, "mem_ema_decay", 0.99)),
             mem_stale_z=float(getattr(encoder, "mem_stale_z", 1.5)),
             mem_stale_warmup=int(getattr(encoder, "mem_stale_warmup", 16)),
+            # Reflex gaze (§3/§4): mirror the parent so proprio is 14/16 to match
+            # n_in, and the showcase gaze follows the same reflex + top-down blend.
+            reflex_gaze=bool(getattr(encoder, "reflex_gaze", False)),
+            reflex_gain=float(getattr(encoder, "reflex_gain", 1.0)),
+            reflex_ema_decay=float(getattr(encoder, "reflex_ema_decay", 0.99)),
+            reflex_beta=float(getattr(encoder, "reflex_beta", 4.0)),
         )
+        # [optical-frontend-v2 §3/§4] private reflex-gaze latch for the showcase
+        # (None => off).  Applied in _forward_choose so the wall's fovea walks the
+        # same reflex + top-down path the champion trained under.
+        self._reflex = ReflexGaze.maybe(self.encoder, 1)
         self._G = int(self.encoder.G)
         self._F = int(self.encoder.F)
         # Explicit ram_addrs win; else route the UI taps through the manifest
@@ -625,6 +635,14 @@ class ChampionShowcase:
         outv = out.detach().to("cpu").numpy()
         button, dx, dy = _split_head(outv)
         self.last_action = int(button)
+        # [§4] top-down modulation: gaze_delta = reflex + learned (reflex TARGET is
+        # in this obs's proprio).  self.saccade shows the BLENDED command actually
+        # applied, so the wall's saccade/gaze matches training.
+        if self._reflex is not None:
+            gdx = np.array([dx], np.float32)
+            gdy = np.array([dy], np.float32)
+            gdx, gdy = self._reflex.blend(x[None, :], self.encoder.o_proprio, gdx, gdy)
+            dx, dy = float(gdx[0]), float(gdy[0])
         self.saccade = (dx, dy)
         # gaze that cropped THIS obs (captured before update moves it for t+1)
         self._gaze_disp = self.encoder.gaze(0)

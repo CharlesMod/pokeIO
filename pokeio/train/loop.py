@@ -40,7 +40,13 @@ import torch
 
 from pokeio.config import ACConfig, Config  # noqa: F401 (ACConfig: type hints)
 from pokeio.emu.env import PokeEnv
-from pokeio.emu.fleet import AsyncFleet, BarrierFleet, FovealEncoder, ObsEncoder
+from pokeio.emu.fleet import (
+    AsyncFleet,
+    BarrierFleet,
+    FovealEncoder,
+    ObsEncoder,
+    ReflexGaze,
+)
 from pokeio.evo.forward import TANH, population_forward_sparse
 from pokeio.evo.genome import (
     HIDDEN,
@@ -1255,6 +1261,8 @@ def evaluate_wave(
     # [AC] parent-side motor-cadence latch (spec §3.2); None => legacy every-step
     # re-decide (emitted == raw argmax).  Fresh per wave = reset dwell state.
     clock = MotorClock(n, ac) if (ac is not None and ac.enable) else None
+    # [optical-frontend-v2 §3/§4] reflex-gaze latch (None => off; gaze == legacy).
+    reflex = ReflexGaze.maybe(encoder, n)
 
     # reset each player: either restore from a promising frontier cell (go-explore)
     # or fall back to the canonical new-game state.
@@ -1323,6 +1331,10 @@ def evaluate_wave(
         outv = out[:, 0, :].detach().cpu().numpy()
         head = _split_head(outv, softmax_temp)
         actions, gdx, gdy = head[0], head[1], head[2]
+        # [§4] top-down modulation: gaze_delta = reflex_delta + learned_delta.  The
+        # reflex TARGET rides in proprio (X); the blend self-calibrates the gain.
+        if reflex is not None:
+            gdx, gdy = reflex.blend(X, encoder.o_proprio, gdx, gdy)
         # [AC] latch the emitted button: re-emit the held button until the commit
         # gate opens / an interrupt fires (spec §3.2).  Legacy path: emitted==argmax.
         if clock is not None:
@@ -1415,6 +1427,7 @@ def evaluate_wave_parallel(
     retina_pipe: "RetinaObsPipe | None" = None,
     distinct_out: np.ndarray | None = None,
     ac: "ACConfig | None" = None,
+    encoder: "FovealEncoder | None" = None,
 ) -> int:
     """Parallel-barrier equivalent of :func:`evaluate_wave`.
 
@@ -1468,6 +1481,9 @@ def evaluate_wave_parallel(
     clock = MotorClock(n, ac) if (ac is not None and ac.enable) else None
     if clock is not None:
         clock.reset()
+    # [optical-frontend-v2 §3/§4] reflex-gaze latch (built from the parent encoder's
+    # geometry; None => off => gaze command == legacy, byte-identical Increment B).
+    reflex = ReflexGaze.maybe(encoder, n)
     if streamer is not None:
         streamer.set_phase("wave")
 
@@ -1512,6 +1528,10 @@ def evaluate_wave_parallel(
         outv = out[:, 0, :].detach().cpu().numpy()
         head = _split_head(outv, softmax_temp)  # buttons + RAW saccade
         actions, gdx, gdy = head[0], head[1], head[2]
+        # [§4] top-down modulation: gaze_delta = reflex + learned (reflex TARGET is
+        # in the worker-emitted proprio block of X; the blend self-calibrates gain).
+        if reflex is not None:
+            gdx, gdy = reflex.blend(X, encoder.o_proprio, gdx, gdy)
         # [AC] latch the emitted button (spec §3.2); legacy path: emitted==argmax.
         if clock is not None:
             sal = _foveal_salience(X, _AC_MOTION_LO, _AC_MOTION_HI)
@@ -1690,6 +1710,7 @@ def evaluate_wave_async(
     retina_pipe: "RetinaObsPipe | None" = None,
     distinct_out: np.ndarray | None = None,
     ac: "ACConfig | None" = None,
+    encoder: "FovealEncoder | None" = None,
 ) -> int:
     """Free-running ("furnace") equivalent of :func:`evaluate_wave_parallel`.
 
@@ -1758,6 +1779,9 @@ def evaluate_wave_async(
     clock = MotorClock(n, ac) if (ac is not None and ac.enable) else None
     if clock is not None:
         clock.reset()
+    # [optical-frontend-v2 §3/§4] reflex-gaze latch, clocked ONLY on the ready idx
+    # subset each cycle (like the AC clock / state_t) so furnace reflex == serial.
+    reflex = ReflexGaze.maybe(encoder, n)
     if streamer is not None:
         streamer.set_phase("wave")
 
@@ -2026,6 +2050,10 @@ def evaluate_wave_async(
             # worker applies tanh inside update_gaze, so pass the raw floats.
             head = _split_head(outv, softmax_temp)
             acts, gdx, gdy = head[0], head[1], head[2]
+            # [§4] top-down modulation on the ready idx subset: gaze_delta = reflex +
+            # learned (reflex TARGET rides in X's proprio; command ticks idx only).
+            if reflex is not None:
+                gdx, gdy = reflex.blend(X, encoder.o_proprio, gdx, gdy, ready_idx=idx)
             # [AC] latch the emitted button, clocking ONLY the ready idx subset
             # (spec §3.2); legacy path: emitted==argmax.  emitted is full-width;
             # gather idx for R_resp/submit exactly like acts[idx].
@@ -2430,7 +2458,7 @@ def boot_eval_population(
                     taps=(taps if (taps and async_engine) else None),
                     recurrent_memory=recurrent_memory, softmax_temp=softmax_temp,
                     probe_sink=None, probe_quota=0, retina_pipe=None,
-                    distinct_out=d_out, ac=ac,
+                    distinct_out=d_out, ac=ac, encoder=encoder,
                 )
             else:  # serial (no fleet)
                 evaluate_wave(
@@ -2579,6 +2607,9 @@ def replay_champion(
     clock = MotorClock(1, ac) if (ac is not None and ac.enable) else None
     if clock is not None:
         clock.reset(0)
+    # [optical-frontend-v2 §3/§4] solo-replay reflex-gaze latch so the wall's gaze
+    # matches training (None => off).  Single env slot 0.
+    reflex = ReflexGaze.maybe(encoder, 1)
     if spawn_state is not None:
         env.load_state(spawn_state)
         screen = env.reset(None)  # clear held input + settle a frame
@@ -2602,6 +2633,9 @@ def replay_champion(
         outv = out[0, 0, :].detach().cpu().numpy()[None, :]  # (1, N_OUT)
         head = _split_head(outv, softmax_temp)
         acts, gdx, gdy = head[0], head[1], head[2]
+        # [§4] top-down modulation: gaze_delta = reflex + learned (reflex TARGET in x).
+        if reflex is not None:
+            gdx, gdy = reflex.blend(x[None, :], encoder.o_proprio, gdx, gdy)
         # [AC] latch the emitted button (spec §3.2); legacy path: emitted==argmax.
         if clock is not None:
             sal = _foveal_salience(x[None, :], _AC_MOTION_LO, _AC_MOTION_HI)
@@ -3253,6 +3287,12 @@ def train(
         mem_ema_decay=float(config.vision.mem_ema_decay),
         mem_stale_z=float(config.vision.mem_stale_z),
         mem_stale_warmup=int(config.vision.mem_stale_warmup),
+        # Reflex gaze + top-down modulation (optical-frontend-v2 §3/§4): +2 proprio
+        # (the reflex target).  OFF => proprio 14, byte-identical Increment B.
+        reflex_gaze=bool(config.vision.reflex_gaze),
+        reflex_gain=float(config.vision.reflex_gain),
+        reflex_ema_decay=float(config.vision.reflex_ema_decay),
+        reflex_beta=float(config.vision.reflex_beta),
     )
     # TWO DIMENSIONS in retina mode (docs/specs/retina-in-loop.md): the FLEET obs
     # is encoder.dim==14134, but the GENOME/controller n_in is 102
@@ -3382,12 +3422,14 @@ def train(
             n_in, N_OUT, tracker, rng,
             connect=init_connect, weight_scale=1.0, sparse_k=init_k,
             # Decisive TANH head (§8) + connect-protect the trailing sensory
-            # block: proprio(14) then RAM taps(obs_ram_bytes) are wired to every
-            # output at init and exempted from toggle/split, so they are never
-            # topologically dead (the measured Δoutput=0 pathology).
+            # block: proprio (14, or 16 with §4 reflex gaze) then RAM taps
+            # (obs_ram_bytes) are wired to every output at init and exempted from
+            # toggle/split, so they are never topologically dead (the measured
+            # Δoutput=0 pathology).  encoder.n_proprio == 14 in retina / reflex-off,
+            # 16 when reflex gaze is on, so the 2 reflex-target dims get protected.
             output_act=TANH,
             n_ram=int(config.vision.obs_ram_bytes),
-            n_proprio=14,
+            n_proprio=int(encoder.n_proprio),
             protect_ram_taps=bool(config.evo.protect_ram_taps),
             protect_proprio=bool(config.evo.protect_proprio),
             # Neural-native timing (spec [TC]): seed a timescale spread on the
@@ -3532,6 +3574,13 @@ def train(
             mem_ema_decay=float(config.vision.mem_ema_decay),
             mem_stale_z=float(config.vision.mem_stale_z),
             mem_stale_warmup=int(config.vision.mem_stale_warmup),
+            # Reflex gaze (§3/§4): workers auto-select the +2-proprio obs_dim, so
+            # they MUST share the reflex geometry so the shm obs rows match the
+            # parent's n_in (the reflex TARGET is written into the worker proprio).
+            reflex_gaze=bool(config.vision.reflex_gaze),
+            reflex_gain=float(config.vision.reflex_gain),
+            reflex_ema_decay=float(config.vision.reflex_ema_decay),
+            reflex_beta=float(config.vision.reflex_beta),
         )
         print(f"[train] fleet up: {fleet.n_workers} worker procs")
         # A single parent-side env for the per-generation champion replay.
@@ -3957,6 +4006,7 @@ def train(
                         probe_quota=probe_quota,
                         retina_pipe=retina_pipe,
                         ac=config.ac,
+                        encoder=encoder,  # §4 reflex-gaze latch geometry (foveal)
                     )
                 else:
                     steps_done += evaluate_wave(
@@ -4527,6 +4577,12 @@ def build_config(args) -> Config:
         cfg.vision.foveal_memory = True
     if getattr(args, "mem_grid", None) is not None:
         cfg.vision.mem_grid = int(args.mem_grid)
+    # -- Reflex gaze + top-down modulation (optical-frontend-v2 §3/§4) ---------
+    # Unset => config default (reflex_gaze False => Increment B obs/gaze, unchanged).
+    if getattr(args, "reflex_gaze", False):
+        cfg.vision.reflex_gaze = True
+    if getattr(args, "reflex_gain", None) is not None:
+        cfg.vision.reflex_gain = float(args.reflex_gain)
     # -- Phase-1 retina spine (docs/specs/retina-in-loop.md) ------------------
     # CLI overrides keep foveal (Phase-0) defaults untouched when unset.
     if getattr(args, "vision_mode", None):
@@ -4699,6 +4755,22 @@ def main() -> None:
                          "each; default config 24). Keep modest — each +1 to M grows "
                          "n_in by ~2M. The invalidation threshold self-calibrates "
                          "(per-region EMA-z), so there is no magnitude knob to tune.")
+    # -- Reflex gaze + top-down modulation (optical-frontend-v2 §3/§4) ---------
+    ap.add_argument("--reflex-gaze", dest="reflex_gaze", action="store_true",
+                    default=False,
+                    help="close the active-vision loop (spec §3/§4): a bottom-up "
+                         "REFLEX aims the gaze at the soft-argmax of motion x "
+                         "staleness (motion alone if foveal-memory off), and the "
+                         "controller's EXISTING 2 saccade outputs become an ADDITIVE "
+                         "top-down correction (gaze = reflex + learned; no N_OUT "
+                         "change). Exposes the reflex target as 2 proprio dims "
+                         "(n_proprio 14->16 => a fresh run). reflex_gain self-"
+                         "calibrates (per-env EMA-normalized pull, no fixed "
+                         "magnitude — §11b). OFF (default) => byte-identical Inc B.")
+    ap.add_argument("--reflex-gain", dest="reflex_gain", type=float, default=None,
+                    help="dimensionless multiplier on the EMA-normalized reflex pull "
+                         "(default config 1.0; NOT a pixel step — the pull is "
+                         "self-calibrated to each env's own pull distribution).")
     # -- Phase-1 learned retina spine (docs/specs/retina-in-loop.md) ----------
     ap.add_argument("--vision-mode", choices=("foveal", "fovea_static", "retina"),
                     default=None,
