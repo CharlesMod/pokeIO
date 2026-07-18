@@ -46,7 +46,7 @@ search dimension and needs no core-evolution edit at all.
 | (a) | **LEARNED (button, dwell-duration)** | *Which* button = `argmax(out[0:9])`. *How long* = how long the commit gate stays closed, governed by the gate node's evolved fan-in weights **and** its evolved `alpha`. Both halves are per-genome learned. |
 | (b) | **DECOUPLED gaze vs motor clocks** | GAZE runs on `FovealEncoder._nstep % vision.saccade_every_k` (untouched). MOTOR runs on the parent-side `MotorClock.dwell_len` counter, advanced only by the gate/interrupts. The two counters never read each other. Optional `saccade_interrupt` couples them *only at interrupt time* (eye jumps → re-decide the hand). |
 | (c) | **REFLEX FLOOR (k=1)** | The batched forward runs **every** agent-step for every ready env (required anyway for gaze + gate + salience), so the gate is re-evaluated at the finest grain. A closed gate is a *preference, never a lock*: two learned override paths force a re-decide mid-dwell — (i) **reflex margin** `logit[argmax] − logit[held] > ac.reflex_margin`, (ii) **salience** force-open. `ac.min_dwell=1` keeps single-step re-decision reachable. |
-| (d) | **SALIENCE-INTERRUPTIBLE dwell** | A parent-side surprise scalar force-opens the gate when `surprise > ac.salience_thresh`. Foveal: reuse the encoder's existing gaze-invariant **motion sheet** (zero extra work). Retina: controller-latent L1 (deferred). Swaps to the real magno channel when the retinal-channels branch lands, with no other change. |
+| (d) | **SALIENCE-INTERRUPTIBLE dwell** | A parent-side surprise scalar force-opens the gate when this frame's motion is `ac.salience_z` std above the env's own recent motion (per-env EMA-z; §3.4/§11b — self-calibrated, no fixed magnitude). Foveal: reuse the encoder's existing gaze-invariant **motion sheet** (zero extra work). Retina: controller-latent L1 (deferred). Swaps to the real magno channel when the retinal-channels branch lands, with no other change. |
 
 ---
 
@@ -84,8 +84,8 @@ state per env i:  held_btn[i] : int32   (init NOOP = 8)
 decide(argmax_btn, gate_raw, logits, salience, saccade_moved, ready_idx) -> emitted_btn:
     gap  = logits[argmax_btn] - logits[held_btn]                      # reflex margin
     open = (gate_raw   >= ac.commit_thresh)                           # learned commit
-         | (ac.salience_interrupt  & (salience     > ac.salience_thresh))
-         | (ac.reflex_margin > 0   & (gap          > ac.reflex_margin))
+         | (ac.salience_interrupt  & (s − μ_i)     > ac.salience_z·√var_i)  # §11b self-calibrated (warmup+var gated)
+         | (ac.reflex_margin > 0   & (gap          > ac.reflex_margin))     # §11b default OFF
          | (ac.saccade_interrupt   & saccade_moved)                   # optional gaze->motor
          | (ac.max_dwell > 0       & (dwell_len    >= ac.max_dwell))  # liveness cap
     # min_dwell only forces a hold when > 1 (default 1 = no forcing, reflex floor intact)
@@ -112,10 +112,19 @@ closed-loop, natively interruptible, reflex-floored for free, reusing the commit
 - **Foveal (Phase-0, shipping for [RUN]):** reuse the encoder's existing **motion block**. Verified
   layout in `fleet.py`: foveal obs = `periph[0:144] | fovea[144:288] | motion[288:432] | proprio | ram`;
   the motion sheet is `((periph_t − periph_{t−1}) + 1)/2` — a **gaze-invariant, whole-screen 12×12
-  frame-difference** already written into the obs the parent holds. So
-  `surprise = mean(|X[:, 288:432] − 0.5|)` (`_o_motion:_o_proprio`). **Zero extra emulator/GPU work,
+  frame-difference** already written into the obs the parent holds. So the raw motion scalar is
+  `s = mean(|X[:, 288:432] − 0.5|)` (`_o_motion:_o_proprio`). **Zero extra emulator/GPU work,
   no `prev_periph` state to keep or reset.** Do **not** recompute a separate periphery diff parent-side
   (Commit-Gate's redundant path — the motion block already *is* that signal).
+- **Self-calibrating reflex (§11b, implemented).** The reflex does **not** compare `s` to a fixed
+  magnitude. `MotorClock` keeps a **per-env** running EMA of the motion mean `μ_i` and variance `var_i`
+  (Welford-style, decay `ac.salience_ema_decay`, μ seeded with the first sample) and fires the salience
+  break when `(s − μ_i) > ac.salience_z · sqrt(var_i)` — "this frame's motion is `z` std above THIS
+  env's recent motion" — gated on a warmup (`sal_steps_i ≥ ac.salience_warmup`) and a live variance
+  (`var_i > 0`). Dimensionless `z`, game-agnostic, no magic constant. **Per-env is load-bearing for
+  engine-parity:** each env's EMA depends only on its own salience sequence (identical serial-vs-furnace);
+  a global/cross-env EMA would read the batch order and break parity. The EMA is **not** reset by
+  `reset(i)` (μ/σ are a game-level estimate, not per-episode state).
 - **Retina (deferred):** no motion sheet in the 14134-d obs / 102-d controller latent. Fallback =
   `surprise = ||z_t − z_{t−1}||_1` over the controller latent (keep `prev_lat[i]`, n×102 — cheaper
   than an n×7056 periph84 diff). On the first post-reset step `prev_lat` is unset → `surprise = 0`
@@ -202,16 +211,30 @@ class ACConfig:
     commit_thresh: float = 0.0      # gate_raw >= thresh -> re-decide (open)
     min_dwell: int = 1              # reflex floor reachable; >1 forces a minimum hold
     max_dwell: int = 64             # hard liveness cap (0 = uncapped) — no-stall guarantee
-    salience_interrupt: bool = True
-    salience_thresh: float = 0.08   # foveal motion mean-abs-dev threshold (game-agnostic)
-    reflex_margin: float = 0.5      # logit[argmax]-logit[held] > margin -> force re-decide (0 = off)
+    salience_interrupt: bool = True  # master switch for the self-calibrating reflex
+    # §11b self-calibrating salience: fire when this frame's motion is salience_z std
+    # ABOVE this env's OWN recent motion (per-env EMA-z) — dimensionless, no fixed
+    # game-specific magnitude.  Replaces the deprecated fixed salience_thresh=0.08.
+    salience_z: float = 1.5         # z-score (std above the per-env motion baseline)
+    salience_ema_decay: float = 0.99  # per-env EMA decay for the motion mean/var baseline
+    salience_warmup: int = 16       # min per-env steps before a salience break can fire
+    reflex_margin: float = 0.0      # §11b: default OFF (gate learns "a better button appeared"); logit[argmax]-logit[held] > margin -> re-decide
     saccade_interrupt: bool = False # optional gaze->motor coupling (eye jump -> re-decide hand)
     saccade_deadband: float = 0.05  # |saccade| beyond this counts as "moved"
-    seed_gate_slow: bool = False    # rng-free: overwrite gen-0 gate alpha into the slow band
+    seed_gate_slow: bool = True     # §11b: seed gen-0 gate alpha into the slow band so the LEARNED α is the primary dwell driver (rng-free, AC-gated)
     gate_seed_alpha: float = 0.3
 ```
 Add `ac: ACConfig = field(default_factory=ACConfig)` to `Config` and to `__all__`. **`evo.n_out`
 stays 11**; the effective `N_OUT` is derived in `train()`.
+
+> **Self-tuning form (§11b, implemented).** The behavior scalars above are the
+> self-calibrated / default-off resolution of the §11b mandate, **not** hand-tuned
+> magnitudes: `salience_z` / `salience_ema_decay` / `salience_warmup` parameterize a
+> per-env EMA-z of the motion signal itself (surprise = "more motion than THIS env's
+> context recently showed"), `reflex_margin` defaults **off** (the gate learns the
+> "better button appeared" signal from the same inputs), and `R_resp` is reformulated
+> to the salience↔commit correlation (see §11b) so `reward.w_resp` is a fitness-mix
+> weight, never a per-frame dwell knob.
 
 ### `pokeio/train/loop.py` — **edit** (the whole feature lives here + config)
 1. **`train()` N_OUT derivation** (replace `loop.py:2826`):
@@ -346,10 +369,14 @@ Measure dwell separately and confirm `w_resp` is not suppressing genuine holds; 
 3. **Engine divergence.** All of serial / barrier / furnace / boot-eval / showcase **must** route through
    the same `MotorClock`, or dwell behavior differs across engines — the single biggest implementation
    hazard. The engine-parity smoke (task 7) guards it.
-4. **`salience_thresh` tuning.** Too low → perpetual interrupts → degrades to legacy (harmless); too high
-   → relies on gate + cap. It is game-agnostic as a fraction of the motion channel's own `[0,1]` range;
-   an EMA-normalized adaptive threshold is a future refinement.
-5. **`R_resp` entropy reward fights long holds** (§8 note) — measure dwell separately; retune `w_resp` if
+4. **~~`salience_thresh` tuning~~ (RESOLVED, §11b).** No fixed magnitude ships: the reflex fires on a
+   per-env EMA-z of the motion signal itself (`salience_z`/`salience_ema_decay`/`salience_warmup`), so it
+   self-calibrates to each scene's own motion statistics. `salience_z` too low → perpetual interrupts →
+   degrades to legacy (harmless); too high → relies on gate + cap. Dimensionless, game-agnostic.
+5. **~~`R_resp` entropy reward fights long holds~~ (RESOLVED, §11b).** R_resp is reformulated to the
+   salience↔commit correlation for foveal+AC envs (§3/§11b), so a legitimate low-salience holder is
+   rewarded as correct conditioning; `w_resp` is a fitness-mix weight, not a per-frame dwell knob. (Legacy
+   §8 note) — measure dwell separately; retune `w_resp` if
    it suppresses legitimate menu/dialogue holds.
 6. **TC-off weakens the mechanism** (§1) — run AC with `time_constants=True` (the default).
 7. **Retina surprise proxy** (latent L1) is weaker than true magno — only bites the deferred retina spine;

@@ -244,12 +244,18 @@ class ACConfig:
     commit_thresh: float = 0.0      # gate_raw >= thresh -> re-decide (open)
     min_dwell: int = 1              # reflex floor reachable; >1 forces a minimum hold
     max_dwell: int = 64             # hard liveness cap (0 = uncapped) — no-stall guarantee
-    salience_interrupt: bool = True
-    salience_thresh: float = 0.08   # foveal motion mean-abs-dev threshold (game-agnostic)
-    reflex_margin: float = 0.5      # logit[argmax]-logit[held] > margin -> force re-decide (0 = off)
+    salience_interrupt: bool = True  # master switch for the self-calibrating reflex
+    # [AC §11b] self-calibrating salience reflex (no fixed game-specific magnitude):
+    # fire when this frame's motion is ``salience_z`` std ABOVE THIS env's OWN recent
+    # motion — a per-env EMA-z of the motion signal itself (dimensionless z + EMA
+    # decay + warmup), mirroring the WRAM-churn / novelty-rarity EMA machinery.
+    salience_z: float = 1.5         # z-score (std above the per-env motion baseline)
+    salience_ema_decay: float = 0.99  # per-env EMA decay for the motion mean/var baseline
+    salience_warmup: int = 16       # min per-env steps before a salience break can fire
+    reflex_margin: float = 0.0      # logit[argmax]-logit[held] > margin -> re-decide (§11b: default OFF; the gate learns "a better button appeared")
     saccade_interrupt: bool = False  # optional gaze->motor coupling (eye jump -> re-decide hand)
     saccade_deadband: float = 0.05  # |saccade| beyond this counts as "moved"
-    seed_gate_slow: bool = False    # rng-free: overwrite gen-0 gate alpha into the slow band
+    seed_gate_slow: bool = True     # rng-free: seed gen-0 gate alpha into the slow band so the LEARNED α (not interrupts) is the primary dwell driver (§11b)
     gate_seed_alpha: float = 0.3
 
 

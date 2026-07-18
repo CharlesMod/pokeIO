@@ -155,6 +155,7 @@ class MotorClock:
     # break-cause labels (telemetry only), in force-open priority order.
     _CAUSES = ("gate", "salience", "reflex_margin", "saccade", "cap")
     _NOOP = 8  # released button (init hold)
+    _SAL_EPS = 1e-6  # "salience meaningfully non-zero" floor (foveal vs retina)
 
     def __init__(self, n: int, ac):
         self.n = int(n)
@@ -162,6 +163,29 @@ class MotorClock:
         self.held_btn = np.full(self.n, self._NOOP, dtype=np.int32)
         self.dwell_len = np.zeros(self.n, dtype=np.int32)
         self.prev_lat: np.ndarray | None = None  # retina L1 surprise (deferred)
+        # [AC §11b] self-calibrating salience: per-env running EMA of the motion
+        # mean/var + a per-env step counter, so the reflex fires on a z-score above
+        # THIS env's OWN recent motion (no fixed magnitude).  PER-ENV is load-bearing
+        # for engine-parity: each env's EMA depends only on its own salience
+        # sequence — identical serial-vs-furnace — whereas a global/cross-env EMA
+        # would read the batch order and break parity.  NOT cleared by reset(): μ/σ
+        # are a game-level estimate, not per-episode state.
+        self.sal_mu = np.zeros(self.n, dtype=np.float64)
+        self.sal_var = np.zeros(self.n, dtype=np.float64)
+        self.sal_steps = np.zeros(self.n, dtype=np.int64)
+        # [AC §11b] R_resp reformulation: per-env streaming sums of (salience s,
+        # commit indicator c = 1.0 iff opened) over every ready step, for the
+        # salience<->commit Pearson correlation (resp_correlation()).  sal_seen
+        # flags foveal envs (salience ever non-zero) vs retina (all-zero -> NaN
+        # sentinel -> caller falls back to legacy R_resp).  Whole-wave window,
+        # like the legacy btn_hist/o_sum accumulators — NOT cleared by reset().
+        self.rc_n = np.zeros(self.n, dtype=np.int64)
+        self.rc_s = np.zeros(self.n, dtype=np.float64)
+        self.rc_s2 = np.zeros(self.n, dtype=np.float64)
+        self.rc_c = np.zeros(self.n, dtype=np.float64)
+        self.rc_c2 = np.zeros(self.n, dtype=np.float64)
+        self.rc_sc = np.zeros(self.n, dtype=np.float64)
+        self.rc_sal_seen = np.zeros(self.n, dtype=bool)
         # telemetry accumulators (committed hold lengths + salience + break cause)
         self.break_cause: dict[str, int] = {c: 0 for c in self._CAUSES}
         self.dwells: list[int] = []
@@ -169,7 +193,11 @@ class MotorClock:
 
     def reset(self, i: int | None = None) -> None:
         """Clear env ``i`` (or all) to the released-NOOP hold — called at every
-        per-episode-state boundary alongside ``encoder.reset`` (§6.6)."""
+        per-episode-state boundary alongside ``encoder.reset`` (§6.6).  The salience
+        EMA (μ/σ) and the R_resp streaming sums are deliberately NOT reset: they are
+        game-level estimates over the whole wave, and keeping them per-env preserves
+        engine-parity (a reset gated on episode boundaries would still be per-env,
+        but there is no reason to discard the calibration mid-wave)."""
         if i is None:
             self.held_btn[:] = self._NOOP
             self.dwell_len[:] = 0
@@ -220,7 +248,30 @@ class MotorClock:
         )
         z = np.zeros(m, dtype=bool)
         open_gate = gr >= ac.commit_thresh
-        open_sal = (sal > ac.salience_thresh) if ac.salience_interrupt else z
+        # [AC §11b] self-calibrating salience reflex: fire when this frame's motion
+        # is ``salience_z`` std ABOVE this env's own recent motion (per-env EMA-z),
+        # gated on warmup + a live variance — dimensionless, no fixed magnitude.
+        # Compare against the PRE-update baseline, then fold this sample into the EMA.
+        s64 = sal.astype(np.float64)
+        if ac.salience_interrupt:
+            mu_old = self.sal_mu[idx]
+            var_old = self.sal_var[idx]
+            steps_old = self.sal_steps[idx]
+            warm = (steps_old >= ac.salience_warmup) & (var_old > 0.0)
+            open_sal = warm & ((s64 - mu_old) > ac.salience_z * np.sqrt(var_old))
+            # Welford-style EMA (seed μ with the first sample so the baseline does
+            # not lag up from 0 through warmup and spuriously fire on constant motion).
+            d = float(ac.salience_ema_decay)
+            first = steps_old == 0
+            mu_new = np.where(first, s64, mu_old + (1.0 - d) * (s64 - mu_old))
+            var_new = np.where(
+                first, 0.0, d * var_old + (1.0 - d) * (s64 - mu_old) * (s64 - mu_new)
+            )
+            self.sal_mu[idx] = mu_new
+            self.sal_var[idx] = var_new
+            self.sal_steps[idx] = steps_old + 1
+        else:
+            open_sal = z
         open_reflex = (gap > ac.reflex_margin) if ac.reflex_margin > 0 else z
         open_sacc = sacc if ac.saccade_interrupt else z
         open_cap = (dl >= ac.max_dwell) if ac.max_dwell > 0 else z
@@ -228,6 +279,19 @@ class MotorClock:
         # min_dwell only forces a hold when > 1 (default 1 = reflex floor intact).
         if ac.min_dwell > 1:
             opened &= dl >= ac.min_dwell
+
+        # [AC §11b] R_resp reformulation streaming sums: correlate per-step salience
+        # ``s`` with the commit indicator ``c`` (1.0 iff opened) over every ready
+        # step (whole-wave window).  sal_seen distinguishes foveal (salience present)
+        # from retina (all-zero -> NaN sentinel in resp_correlation -> legacy).
+        c = opened.astype(np.float64)
+        self.rc_n[idx] += 1
+        self.rc_s[idx] += s64
+        self.rc_s2[idx] += s64 * s64
+        self.rc_c[idx] += c
+        self.rc_c2[idx] += c * c
+        self.rc_sc[idx] += s64 * c
+        self.rc_sal_seen[idx] |= s64 > self._SAL_EPS
 
         # Telemetry: on each commit, record the just-ended hold length (dl closed
         # steps + the step it was first emitted) + its salience + the break cause.
@@ -258,6 +322,29 @@ class MotorClock:
         if sacc:
             return "saccade"
         return "cap"
+
+    def resp_correlation(self) -> np.ndarray:
+        """[AC §11b] Per-env Pearson ``r`` between per-step salience and the commit
+        indicator over the wave — responsiveness reformulated as RESPONSE-TO-CHANGE
+        (dissolves the R_resp<->dwell antagonism: a legitimate low-salience holder is
+        rewarded as correct conditioning, not penalized for low button-entropy).
+
+        ``r = (n·Σsc − Σs·Σc) / sqrt((n·Σs² − (Σs)²)·(n·Σc² − (Σc)²))``.  The
+        degenerate zero-variance cases have a zero denominator and return 0.0
+        (guarded): a masher (``c≡1``), a freezer (``c≡0``), and constant/no motion
+        (``s≡const``).  Envs that never saw meaningful salience (retina, all-zero
+        motion sheet) return a ``NaN`` sentinel so the caller falls back to the
+        legacy R_resp for those rows."""
+        n = self.rc_n.astype(np.float64)
+        num = n * self.rc_sc - self.rc_s * self.rc_c
+        den_s = n * self.rc_s2 - self.rc_s ** 2
+        den_c = n * self.rc_c2 - self.rc_c ** 2
+        den = np.sqrt(np.clip(den_s, 0.0, None) * np.clip(den_c, 0.0, None))
+        pos = den > 0.0
+        r = np.where(pos, num / np.where(pos, den, 1.0), 0.0)
+        r = np.clip(r, -1.0, 1.0)
+        r[~self.rc_sal_seen] = np.nan  # retina / no motion -> legacy R_resp fallback
+        return r
 
 
 def _resp_scores(btn_hist, o_sum, o_sq, o_cnt, w_resp_var):
@@ -1278,7 +1365,18 @@ def evaluate_wave(
                 obs=X, actions=emitted, round_t=t,
             )
 
+    # [AC §11b] R_resp: legacy button-entropy+variance by default, but when AC is on
+    # AND the foveal motion sheet is present, swap in the per-env salience<->commit
+    # correlation (rewards response-to-change, so long holds aren't penalized).
+    # clock is None (AC off) => byte-identical legacy; retina (no salience => NaN)
+    # falls back to legacy per-env.  w_resp is UNCHANGED — it is a fitness-mix weight
+    # (like w_prog/w_emp), not a per-frame behavior knob; the reformulation removes
+    # the CONFLICT with dwell, the weight just sets how much responsiveness matters.
     resp = _resp_scores(btn_hist, o_sum, o_sq, o_cnt, w_resp_var)
+    if clock is not None:
+        corr = clock.resp_correlation()
+        use = np.isfinite(corr)
+        resp[use] = corr[use]
     for i, g in enumerate(genomes):
         g.fitness = float(wave.fitness[i])
         g._resp = float(resp[i])
@@ -1510,7 +1608,14 @@ def evaluate_wave_parallel(
               f"book={_t_book/episode_steps*1000:.2f}ms/round")
     _mark("rounds", _t)
 
+    # [AC §11b] R_resp: legacy entropy+var, or the salience<->commit correlation for
+    # AC+foveal envs (see evaluate_wave); AC-off == byte-identical legacy, retina =>
+    # legacy per-env.  w_resp unchanged (fitness-mix weight, not a per-frame knob).
     resp = _resp_scores(btn_hist, o_sum, o_sq, o_cnt, w_resp_var)
+    if clock is not None:
+        corr = clock.resp_correlation()
+        use = np.isfinite(corr)
+        resp[use] = corr[use]
     for i, g in enumerate(genomes):
         g.fitness = float(wave.fitness[i])
         g._resp = float(resp[i])
@@ -1993,7 +2098,14 @@ def evaluate_wave_async(
     fleet.end_wave()
     _mark("rounds", _t)
 
+    # [AC §11b] R_resp: legacy entropy+var, or the salience<->commit correlation for
+    # AC+foveal envs (see evaluate_wave); AC-off == byte-identical legacy, retina =>
+    # legacy per-env.  w_resp unchanged (fitness-mix weight, not a per-frame knob).
     resp = _resp_scores(btn_hist, o_sum, o_sq, o_cnt, w_resp_var)
+    if clock is not None:
+        corr = clock.resp_correlation()
+        use = np.isfinite(corr)
+        resp[use] = corr[use]
     for i, g in enumerate(genomes):
         g.fitness = float(wave.fitness[i])
         g.progress = float(progress[i])  # mined-counter advancement (0 w/o taps)
@@ -4404,12 +4516,16 @@ def build_config(args) -> Config:
         cfg.ac.max_dwell = int(args.ac_max_dwell)
     if getattr(args, "ac_commit_thresh", None) is not None:
         cfg.ac.commit_thresh = float(args.ac_commit_thresh)
-    if getattr(args, "ac_salience_thresh", None) is not None:
-        cfg.ac.salience_thresh = float(args.ac_salience_thresh)
+    if getattr(args, "ac_salience_z", None) is not None:
+        cfg.ac.salience_z = float(args.ac_salience_z)
+    if getattr(args, "ac_salience_ema_decay", None) is not None:
+        cfg.ac.salience_ema_decay = float(args.ac_salience_ema_decay)
+    if getattr(args, "ac_salience_warmup", None) is not None:
+        cfg.ac.salience_warmup = int(args.ac_salience_warmup)
     if getattr(args, "ac_reflex_margin", None) is not None:
         cfg.ac.reflex_margin = float(args.ac_reflex_margin)
-    if getattr(args, "ac_seed_gate_slow", False):
-        cfg.ac.seed_gate_slow = True
+    if getattr(args, "ac_seed_gate_slow", None) is not None:
+        cfg.ac.seed_gate_slow = bool(args.ac_seed_gate_slow)
     return cfg
 
 
@@ -4546,18 +4662,34 @@ def main() -> None:
     ap.add_argument("--ac-commit-thresh", dest="ac_commit_thresh", type=float,
                     default=None,
                     help="gate_raw >= thresh re-opens the gate (default config 0.0).")
-    ap.add_argument("--ac-salience-thresh", dest="ac_salience_thresh", type=float,
+    ap.add_argument("--ac-salience-z", dest="ac_salience_z", type=float,
                     default=None,
-                    help="foveal motion mean-abs-dev above which a salience spike "
-                         "force-commits mid-dwell (default config 0.08).")
+                    help="[AC §11b] self-calibrating salience reflex: fire a "
+                         "mid-dwell re-decide when this frame's foveal motion is this "
+                         "many std ABOVE the env's own recent motion (per-env EMA-z; "
+                         "dimensionless, no fixed magnitude; default config 1.5).")
+    ap.add_argument("--ac-salience-ema-decay", dest="ac_salience_ema_decay",
+                    type=float, default=None,
+                    help="per-env EMA decay for the salience mean/var baseline "
+                         "(default config 0.99).")
+    ap.add_argument("--ac-salience-warmup", dest="ac_salience_warmup", type=int,
+                    default=None,
+                    help="per-env steps before a salience break can fire (lets the "
+                         "EMA baseline settle; default config 16).")
     ap.add_argument("--ac-reflex-margin", dest="ac_reflex_margin", type=float,
                     default=None,
                     help="logit[argmax]-logit[held] gap that force-commits "
-                         "mid-dwell (0 = off; default config 0.5).")
+                         "mid-dwell (§11b: default config 0.0 = OFF; the gate learns "
+                         "'a better button appeared' from the same inputs).")
     ap.add_argument("--ac-seed-gate-slow", dest="ac_seed_gate_slow",
-                    action="store_true", default=False,
-                    help="rng-free: bias the gen-0 commit-gate alpha into the slow "
-                         "band (config.ac.gate_seed_alpha) so early dwell emerges.")
+                    action="store_true", default=None,
+                    help="rng-free: seed the gen-0 commit-gate alpha into the slow "
+                         "band (config.ac.gate_seed_alpha) so the LEARNED α is the "
+                         "primary dwell driver (§11b; default ON via config).")
+    ap.add_argument("--no-ac-seed-gate-slow", dest="ac_seed_gate_slow",
+                    action="store_false", default=None,
+                    help="disable the gen-0 gate slow-seed (gate alpha keeps its "
+                         "standard fast/slow _seed_alpha draw).")
     args = ap.parse_args()
 
     cfg = build_config(args)
