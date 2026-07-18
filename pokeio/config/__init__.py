@@ -88,6 +88,24 @@ class VisionConfig:
     # (biomimetic low-acuity periphery). n_in grows to 2*G^2 + FG^2 + 14 + n_ram
     # (=> a fresh run / warm-started pop; the resume guard refuses cross-dim).
     fovea_grid: int = 0  # FG (0 => = periph_grid; legacy)
+    # -- Trans-saccadic foveal memory (optical-frontend-v2 §1a; the keystone) --
+    # A persistent per-env scene buffer at a controller-readable medium resolution
+    # M=mem_grid: each step stamps the sharp fovea into its screen footprint, ages
+    # every cell, and re-invalidates a region (decays it toward the live low-res
+    # periphery) when the periphery diverges from the stamped content past a
+    # SELF-CALIBRATED per-region EMA-z threshold (dimensionless surprise, no fixed
+    # magnitude — the §11b no-tuned-knobs mandate, mirroring the [AC] salience EMA).
+    # OFF => obs is byte-identical to Increment A (sharp fovea only). ON adds two
+    # M^2 blocks (buffer + staleness) => n_in grows to 2*G^2 + FG^2 + 2*M^2 + 14 +
+    # n_ram (=> a fresh run / warm-started pop; the resume guard refuses cross-dim).
+    foveal_memory: bool = False  # trans-saccadic stamp buffer + staleness map
+    mem_grid: int = 24  # M: scene-buffer side (buffer + staleness are M*M each)
+    # Self-calibration knobs (dimensionless, like ac.salience_*; NEVER a fixed
+    # change magnitude): a region invalidates when its live-vs-stamped divergence
+    # is mem_stale_z std ABOVE that env's OWN recent divergence for that region.
+    mem_ema_decay: float = 0.99  # per-region EMA decay for the divergence baseline
+    mem_stale_z: float = 1.5  # z-score above the per-region baseline that invalidates
+    mem_stale_warmup: int = 16  # min per-env steps before an invalidation can fire
     saccade_gain: float = 32.0  # px/step velocity applied to the fovea center
     saccade_every_k: int = 1  # gaze update cadence in agent-steps
     proprio: bool = True  # 14-d efference-copy block (gaze + last saccade + last buttons + step)

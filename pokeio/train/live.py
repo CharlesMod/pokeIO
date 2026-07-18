@@ -473,6 +473,13 @@ class ChampionShowcase:
             screen_w=int(getattr(encoder, "W", _SCREEN_W)),
             shades=int(getattr(encoder, "shades", 4)),
             episode_steps=int(getattr(encoder, "episode_steps", 1024)),
+            # Trans-saccadic foveal memory (§1a): mirror the parent's geometry +
+            # self-calibration so the showcase obs matches the controller's n_in.
+            foveal_memory=bool(getattr(encoder, "foveal_memory", False)),
+            mem_grid=int(getattr(encoder, "M", 24)),
+            mem_ema_decay=float(getattr(encoder, "mem_ema_decay", 0.99)),
+            mem_stale_z=float(getattr(encoder, "mem_stale_z", 1.5)),
+            mem_stale_warmup=int(getattr(encoder, "mem_stale_warmup", 16)),
         )
         self._G = int(self.encoder.G)
         self._F = int(self.encoder.F)

@@ -149,6 +149,13 @@ def _try_emulator_probe(layout, config, *, b: int, seed: int) -> np.ndarray | No
             saccade_every_k=vis.saccade_every_k,
             episode_steps=max(b, 256),
             mode="foveal",
+            # Trans-saccadic foveal memory (§1a): match the run's obs geometry so
+            # enc.dim == layout.n_in (else the guard below rejects this encoder).
+            foveal_memory=bool(getattr(vis, "foveal_memory", False)),
+            mem_grid=int(getattr(vis, "mem_grid", 24)),
+            mem_ema_decay=float(getattr(vis, "mem_ema_decay", 0.99)),
+            mem_stale_z=float(getattr(vis, "mem_stale_z", 1.5)),
+            mem_stale_warmup=int(getattr(vis, "mem_stale_warmup", 16)),
         )
         if enc.dim != layout.n_in:
             return None

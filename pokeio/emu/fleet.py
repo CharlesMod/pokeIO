@@ -465,6 +465,15 @@ class ObsEncoder:
 # 0,144,288,432,446,454.  Sharp-fovea example (G=12, FG=32): 144|1024|144|14|8
 # = 1334 (fovea now 1 px/cell over a 32px window instead of a 4 px/cell smudge).
 #
+# Trans-saccadic foveal memory (optical-frontend-v2 §1a; foveal_memory=True) adds
+# TWO M^2 blocks (M = mem_grid) AFTER motion, so the layout becomes
+#     .. motion [.. : +G^2]   | buffer [.. : +M^2] | staleness [.. : +M^2] | proprio ..
+# and DIM grows to 2*G^2 + FG^2 + 2*M^2 + 14 + n_ram (e.g. G=12,FG=32,M=24,n_ram=8:
+# 144|1024|144|576|576|14|8 = 2486).  The buffer is a persistent per-env scene the
+# fovea stamps into; staleness is its per-cell confidence (0 fresh .. 1 stale).
+# OFF (default) => byte-identical to the sharp-fovea obs above (no new blocks; the
+# motion block still immediately precedes proprio, so o_motion_hi == o_proprio).
+#
 # The fovea's F->FG resample is DECOUPLED from the periphery's ->G downsample so
 # the fovea can be native-sharp while the periphery stays biomimetically coarse
 # (low-acuity periphery); see optical-frontend-v2 §2.  Sensor seam (#15/§9a): the
@@ -473,7 +482,9 @@ class ObsEncoder:
 # future console/webcam drop-in, no layout change above C).
 #
 # Stateful PER ENV (indexed by env id): gaze (gy,gx), last saccade (dx,dy),
-# previous periphery (motion), and a per-episode step counter (step_frac).
+# previous periphery (motion), a per-episode step counter (step_frac), and — when
+# foveal_memory=True — the persistent scene buffer + staleness map + the per-region
+# divergence EMA that self-calibrates invalidation (all reset per episode).
 class FovealEncoder:
     """Stateful periphery+fovea+motion+proprio+ram encoder (spec §2/§3).
 
@@ -521,6 +532,11 @@ class FovealEncoder:
         channels: int = 1,
         episode_steps: int = 1024,
         mode: str = "foveal",
+        foveal_memory: bool = False,
+        mem_grid: int = 24,
+        mem_ema_decay: float = 0.99,
+        mem_stale_z: float = 1.5,
+        mem_stale_warmup: int = 16,
     ) -> None:
         self.n_envs = int(n_envs)
         self.mode = str(mode)
@@ -530,6 +546,17 @@ class FovealEncoder:
         # acuity from the coarse periphery.  0 (or == G) => FG=G => byte-identical
         # legacy; >0 makes the fovea FG*FG at F/FG px/cell.
         self.FG = int(fovea_grid) if int(fovea_grid) > 0 else self.G
+        # Trans-saccadic foveal memory (optical-frontend-v2 §1a).  Foveal-only:
+        # retina mode has no periphery/motion vectors to stamp against, so the
+        # keystone is a foveal feature (§1a).  M = mem_grid is the buffer side;
+        # mem_ema_decay/mem_stale_z/mem_stale_warmup self-calibrate invalidation
+        # (dimensionless, mirror ac.salience_*; no fixed change magnitude — §11b).
+        self.foveal_memory = bool(foveal_memory) and self.mode != "retina"
+        self.M = int(mem_grid) if int(mem_grid) > 0 else 24
+        self.mem_ema_decay = float(mem_ema_decay)
+        self.mem_stale_z = float(mem_stale_z)
+        self.mem_stale_warmup = int(mem_stale_warmup)
+        self.n_mem = self.M * self.M
         # Sensor seam (#15/§9a): (H,W,C) frame channels.  C=1 grayscale now (the
         # ObsBuilder shade path assumes a single luma plane); C=3 RGB is the
         # future console/webcam drop-in.  Kept as an attribute, not yet wired
@@ -568,7 +595,9 @@ class FovealEncoder:
             # No motion sheet in retina obs (spec [AC] §3.4: retina salience is
             # the deferred controller-latent L1). Public None => AC salience off.
             self.o_motion = None
+            self.o_motion_hi = None       # no motion block (§1a memory is foveal-only)
             self.o_proprio = self._o_proprio
+            self.foveal_memory = False    # keystone is foveal-only; never on in retina
             # Lazy import: evo.retina pulls torch, which the torch-free foveal
             # workers must never import. Only a retina-mode encoder touches it,
             # so the default (foveal 454) path stays torch-free across all 56
@@ -580,16 +609,31 @@ class FovealEncoder:
                 f"retina.IN_SIDE={_retina.IN_SIDE} != fleet _RETINA_SIDE={self._side}"
             )
         else:
-            self.dim = (self.n_periph + self.n_fovea + self.n_motion
-                        + self.n_proprio + self.n_ram)
-            # Block offsets (contiguous).
+            # Block offsets (contiguous).  Trans-saccadic memory (§1a) inserts the
+            # buffer + staleness blocks AFTER motion, BEFORE proprio — both are
+            # visual channels, so the E3 blind-ablation gate ([0:o_proprio]) zeroes
+            # them along with periph/fovea/motion.  OFF => no blocks, and the motion
+            # block still immediately precedes proprio (o_motion_hi == o_proprio),
+            # so the obs is byte-identical to the sharp-fovea (Increment A) layout.
             self._o_periph = 0
             self._o_fovea = self.n_periph
             self._o_motion = self._o_fovea + self.n_fovea
-            self._o_proprio = self._o_motion + self.n_motion
+            o = self._o_motion + self.n_motion
+            # [AC] salience slice HI: END of the motion block (NOT o_proprio, which
+            # now moves past the memory blocks).  == o_proprio when memory is off.
+            self.o_motion_hi = o
+            if self.foveal_memory:
+                self._o_buffer = o
+                self._o_stale = self._o_buffer + self.n_mem
+                o = self._o_stale + self.n_mem
+            else:
+                self._o_buffer = None
+                self._o_stale = None
+            self._o_proprio = o
             self._o_ram = self._o_proprio + self.n_proprio
+            self.dim = self._o_ram + self.n_ram
             # Public offsets for the [AC] parent-side salience slice (spec §3.4):
-            # the motion block [o_motion:o_proprio] is the gaze-invariant frame
+            # the motion block [o_motion:o_motion_hi] is the gaze-invariant frame
             # difference already in the obs — the surprise signal, zero extra work.
             self.o_motion = self._o_motion
             self.o_proprio = self._o_proprio
@@ -607,6 +651,21 @@ class FovealEncoder:
         self._frow = _area_matrix(self.F, self.FG)  # (FG, F) fovea rows (F->FG)
         self._fcol = _area_matrix(self.F, self.FG).T  # (F, FG) fovea cols
 
+        # Trans-saccadic memory geometry (§1a; built once, foveal_memory only).
+        if self.foveal_memory:
+            M = self.M
+            # Fixed-size sharp-fovea stamp: the FxF native crop warps to an
+            # (mf_rows, mf_cols) buffer block that SLIDES with gaze (gaze is clamped
+            # so the FxF window is fully on-screen, so the block always fits).
+            self._mf_rows = min(M, max(1, int(round(self.F * M / self.H))))
+            self._mf_cols = min(M, max(1, int(round(self.F * M / self.W))))
+            self._sfrow = _area_matrix(self.F, self._mf_rows)      # (mf_rows, F)
+            self._sfcol = _area_matrix(self.F, self._mf_cols).T    # (F, mf_cols)
+            # Nearest-cell upsample G->M (each buffer cell -> its periphery region),
+            # for spreading a per-region invalidation over the covered buffer cells.
+            self._g2m_row = np.minimum((np.arange(M) * g) // M, g - 1)
+            self._g2m_col = np.minimum((np.arange(M) * g) // M, g - 1)
+
         # Reuse the EXACT per-frame shade ranking used by the rest of the
         # pipeline (ObsBuilder.normalize_shades) so grayscale is consistent.
         self._shade = ObsBuilder(
@@ -620,12 +679,38 @@ class FovealEncoder:
         self._last_dy = np.zeros(self.n_envs, np.float64)
         self._nstep = np.zeros(self.n_envs, np.int64)
         self._prev_periph: list = [None] * self.n_envs
+        # Trans-saccadic memory per-env state (§1a): the persistent scene buffer,
+        # its staleness map, and the per-region divergence EMA that self-calibrates
+        # invalidation.  PER-ENV is load-bearing for engine-parity — each env's
+        # buffer/EMA depend ONLY on its own frame sequence, so serial and furnace
+        # produce bit-identical state.  All reset per episode (buffer is a
+        # per-episode percept; its change baseline resets WITH it, or a post-reset
+        # buffer of 0.5 would spuriously fire against the pre-reset baseline).
+        if self.foveal_memory:
+            self._mem = np.empty((self.n_envs, self.M, self.M), np.float32)
+            self._stale = np.empty((self.n_envs, self.M, self.M), np.float32)
+            # _periph_ref: the low-res periphery per G-region AT THE TIME that region
+            # was last refreshed (stamped/invalidated) — the change signal is
+            # |periph_now - _periph_ref| (has the periphery moved since we committed
+            # this region), NOT sharp-buffer-vs-coarse-periph (which always carries a
+            # resample residual and would spuriously fire on a static screen).
+            self._periph_ref = np.zeros((self.n_envs, g, g), np.float32)
+            self._chg_mu = np.zeros((self.n_envs, g, g), np.float64)
+            self._chg_var = np.zeros((self.n_envs, g, g), np.float64)
+            self._mem_steps = np.zeros(self.n_envs, np.int64)
+            self._mem_last_fire = np.zeros((self.n_envs, g, g), bool)
         self.tap_addrs: list[int] = []  # parent-path mined taps (see set_taps)
         self.reset()
 
     # ------------------------------------------------------------------ reset
     def reset(self, env_idx: int | None = None) -> None:
-        """Reset gaze to centre + clear motion/efference for one env (or all)."""
+        """Reset gaze to centre + clear motion/efference for one env (or all).
+
+        With ``foveal_memory`` the persistent scene buffer + staleness map + the
+        per-region divergence EMA are ALSO cleared here (§1a: the buffer is a
+        per-episode percept — 0.5 neutral, maximally stale until the fovea stamps
+        it in; clearing the EMA with it keeps a post-reset buffer from firing
+        invalidations against a pre-reset change baseline)."""
         idxs = range(self.n_envs) if env_idx is None else (int(env_idx),)
         for i in idxs:
             self._gy[i] = float(self._cy)
@@ -634,6 +719,14 @@ class FovealEncoder:
             self._last_dy[i] = 0.0
             self._nstep[i] = 0
             self._prev_periph[i] = None
+            if self.foveal_memory:
+                self._mem[i] = 0.5      # neutral "no percept yet"
+                self._stale[i] = 1.0    # fully stale until first stamp
+                self._periph_ref[i] = 0.0  # seeded to the first frame's periphery
+                self._chg_mu[i] = 0.0
+                self._chg_var[i] = 0.0
+                self._mem_steps[i] = 0
+                self._mem_last_fire[i] = False
 
     # -------------------------------------------------------------- saccade
     def update_gaze(self, env_idx: int, dx: float, dy: float) -> tuple[float, float]:
@@ -669,6 +762,119 @@ class FovealEncoder:
         Workers leave this empty and overlay from live emulator memory in
         ``_emit`` instead (they only hold a strided wram slice)."""
         self.tap_addrs = list(addrs) if addrs else []
+
+    # ------------------------------------------------ trans-saccadic memory (§1a)
+    def mem_buffer(self, env_idx: int) -> np.ndarray:
+        """Current persistent scene buffer ``(M,M)`` for an env (copy; telemetry
+        / rendering / tests).  Empty ``(0,0)`` when ``foveal_memory`` is off."""
+        if not self.foveal_memory:
+            return np.zeros((0, 0), np.float32)
+        return self._mem[int(env_idx)].copy()
+
+    def mem_staleness(self, env_idx: int) -> np.ndarray:
+        """Current staleness map ``(M,M)`` for an env (0 fresh .. 1 stale; copy)."""
+        if not self.foveal_memory:
+            return np.zeros((0, 0), np.float32)
+        return self._stale[int(env_idx)].copy()
+
+    def mem_last_invalidated(self, env_idx: int) -> np.ndarray:
+        """The ``(G,G)`` boolean regions invalidated on this env's LAST encode
+        (telemetry / tests; the change-blindness witness)."""
+        if not self.foveal_memory:
+            return np.zeros((0, 0), bool)
+        return self._mem_last_fire[int(env_idx)].copy()
+
+    def _calibrate_invalidation(self, i: int, chg: np.ndarray) -> np.ndarray:
+        """[§1a / §11b] Self-calibrated peripheral-change invalidation for env ``i``.
+
+        Fire (mark stale) a region when its peripheral change ``chg`` (G,G — how
+        far the live periphery has moved from its last-refreshed reference) is
+        ``mem_stale_z`` std ABOVE THIS env's OWN recent change for that region —
+        a per-region EMA-z, a dimensionless surprise with NO fixed change
+        magnitude (the no-tuned-knobs mandate), mirroring the [AC] MotorClock
+        salience reflex.  Compares against the PRE-update baseline,
+        then folds this sample into the per-region EMA (Welford-style, μ seeded on
+        the first sample so a constant divergence never spuriously fires through
+        warm-up).  Zero rng, per-env => engine-parity safe.  Returns the (G,G)
+        boolean fire mask (also stored for :meth:`mem_last_invalidated`)."""
+        c64 = np.asarray(chg, dtype=np.float64)
+        mu = self._chg_mu[i]
+        var = self._chg_var[i]
+        steps = int(self._mem_steps[i])
+        # warm: enough per-env history AND a live per-region variance to scale by.
+        warm = steps >= self.mem_stale_warmup
+        fire = warm & (var > 0.0) & ((c64 - mu) > self.mem_stale_z * np.sqrt(var))
+        d = self.mem_ema_decay
+        if steps == 0:  # seed μ with the first sample (baseline never lags up from 0)
+            mu_new = c64.copy()
+            var_new = np.zeros_like(var)
+        else:
+            mu_new = mu + (1.0 - d) * (c64 - mu)
+            var_new = d * var + (1.0 - d) * (c64 - mu) * (c64 - mu_new)
+        self._chg_mu[i] = mu_new
+        self._chg_var[i] = var_new
+        self._mem_steps[i] = steps + 1
+        self._mem_last_fire[i] = fire
+        return fire
+
+    def _stamp_origin(self, i: int) -> tuple[int, int]:
+        """Top-left ``(r0,c0)`` buffer cell of the fovea's screen footprint, so the
+        fixed ``mf_rows x mf_cols`` stamp lands under the current gaze (clamped
+        into ``[0, M-mf]`` — gaze clamping keeps the FxF window on-screen)."""
+        r0 = int(round((self._gy[i] - self._half) * self.M / self.H))
+        c0 = int(round((self._gx[i] - self._half) * self.M / self.W))
+        r0 = min(max(r0, 0), self.M - self._mf_rows)
+        c0 = min(max(c0, 0), self.M - self._mf_cols)
+        return r0, c0
+
+    def _mem_step(self, i: int, periph: np.ndarray, crop: np.ndarray) -> None:
+        """One trans-saccadic memory update for env ``i`` (§1a); mutates the
+        buffer + staleness in place.
+
+        Order: (1) change signal = |live periphery - the periphery each region
+        showed when last refreshed|; (2) self-calibrated per-region invalidation;
+        (3) age every cell; (4) decay invalidated regions toward the live low-res
+        value + mark them stale + re-reference; (5) stamp the sharp fovea into its
+        footprint (fresh) + re-reference its G-footprint — stamp LAST so a
+        freshly-glimpsed region always wins over ageing/invalidation.
+        """
+        g = self.G
+        # 1. change signal: has the low-res periphery MOVED since we last committed
+        #    each region?  On the episode's first frame, seed the reference to the
+        #    current periphery so the scene starts un-surprising (chg == 0).
+        if int(self._mem_steps[i]) == 0:
+            self._periph_ref[i] = periph
+        chg = np.abs(periph.astype(np.float64) - self._periph_ref[i])          # (G,G)
+        # 2. self-calibrated invalidation (per-region EMA-z; no fixed magnitude).
+        fire = self._calibrate_invalidation(i, chg)                            # (G,G)
+        # 3. age every cell (steps-since-refresh confidence decay, horizon-
+        #    normalized like proprio's step_frac; read live so the async
+        #    episode_steps override tracks — NOT a hand-tuned magnitude).
+        self._stale[i] += 1.0 / float(self.episode_steps)
+        np.clip(self._stale[i], 0.0, 1.0, out=self._stale[i])
+        # 4. invalidate fired regions: decay the buffer toward the live low-res
+        #    periphery (fall back to what the periphery now shows), mark stale, and
+        #    re-reference (we've accepted the new low-res state; watch for the NEXT
+        #    change from here).
+        if fire.any():
+            fire_m = fire[self._g2m_row][:, self._g2m_col]        # (M,M) bool
+            live_m = periph[self._g2m_row][:, self._g2m_col]      # (M,M) live low-res
+            self._mem[i][fire_m] = live_m[fire_m].astype(np.float32)
+            self._stale[i][fire_m] = 1.0
+            self._periph_ref[i][fire] = periph[fire]
+        # 5. stamp the sharp fovea crop into its footprint (fresh) + re-reference
+        #    the G-regions the fovea now covers (they match the live periphery).
+        r0, c0 = self._stamp_origin(i)
+        mr, mc = self._mf_rows, self._mf_cols
+        block = (self._sfrow @ crop @ self._sfcol).astype(np.float32)  # (mf_rows,mf_cols)
+        self._mem[i][r0 : r0 + mr, c0 : c0 + mc] = block
+        self._stale[i][r0 : r0 + mr, c0 : c0 + mc] = 0.0
+        half = self._half
+        gr0 = max(0, int(np.floor((self._gy[i] - half) * g / self.H)))
+        gr1 = min(g, int(np.ceil((self._gy[i] + half) * g / self.H)))
+        gc0 = max(0, int(np.floor((self._gx[i] - half) * g / self.W)))
+        gc1 = min(g, int(np.ceil((self._gx[i] + half) * g / self.W)))
+        self._periph_ref[i][gr0:gr1, gc0:gc1] = periph[gr0:gr1, gc0:gc1]
 
     # --------------------------------------------------------------- helpers
     def _crop(self, norm: np.ndarray, gy: float, gx: float) -> np.ndarray:
@@ -813,6 +1019,14 @@ class FovealEncoder:
             motion = (((periph - prev) + 1.0) * 0.5).astype(np.float32)
         self._prev_periph[i] = periph
 
+        # Trans-saccadic foveal memory (§1a): stamp the sharp fovea into the
+        # persistent scene buffer, age it, and self-calibrate peripheral-change
+        # invalidation.  Mutates _mem/_stale in place; both enter the obs below.
+        # OFF => this block + the buffer/staleness writes are skipped and the obs
+        # is byte-identical to Increment A (o_motion_hi == o_proprio).
+        if self.foveal_memory:
+            self._mem_step(i, periph, crop)
+
         proprio = self._proprio(i, button)
         ram = self._ram(wram)
         if self.tap_addrs and wram is not None:  # parent path: overlay from wram
@@ -828,7 +1042,10 @@ class FovealEncoder:
         vec = np.empty(self.dim, np.float32)
         vec[self._o_periph : self._o_fovea] = periph.ravel()
         vec[self._o_fovea : self._o_motion] = fov.ravel()
-        vec[self._o_motion : self._o_proprio] = motion.ravel()
+        vec[self._o_motion : self.o_motion_hi] = motion.ravel()
+        if self.foveal_memory:  # buffer + staleness blocks (§1a)
+            vec[self._o_buffer : self._o_stale] = self._mem[i].ravel()
+            vec[self._o_stale : self._o_proprio] = self._stale[i].ravel()
         vec[self._o_proprio : self._o_ram] = proprio
         vec[self._o_ram : self.dim] = ram
         return vec
@@ -973,7 +1190,8 @@ def _barrier_worker_main(
     obs_res, obs_ram, wram_stride, arch_kwargs, goexplore,
     shm_names, n_envs, obs_dim, key_len, core, state_cap,
     periph_grid, fovea_native_px, fovea_grid, saccade_gain, saccade_every_k,
-    episode_steps,
+    episode_steps, foveal_memory, mem_grid, mem_ema_decay, mem_stale_z,
+    mem_stale_warmup,
 ):
     """Worker process: owns envs ``[slice_lo:slice_hi]``; hashes + encodes locally.
 
@@ -998,13 +1216,15 @@ def _barrier_worker_main(
         pass
 
     # Active-vision encoder (stateful per env; §2/§3), auto-selected from obs_dim:
-    #   obs_dim == 2*G^2+FG^2+14+n_ram -> foveal obs (Phase-0 pixel vectors; 454
-    #                                    when FG==G, larger for a sharp fovea)
+    #   obs_dim == 2*G^2+FG^2+[2*M^2]+14+n_ram -> foveal obs (Phase-0 pixel vectors;
+    #                                    454 when FG==G, larger for a sharp fovea /
+    #                                    +2*M^2 for the §1a trans-saccadic memory)
     #   obs_dim == 2*84^2+14+n_ram      -> retina 14134 obs (Phase-1 pixel input)
     # else fall back to the legacy flat ObsEncoder (back-compat res^2+ram obs).
     # n_envs-wide so it can be indexed by the GLOBAL env id (= shm obs rows).
     _fg = int(fovea_grid) if int(fovea_grid) > 0 else int(periph_grid)
-    _foveal_dim = 2 * periph_grid * periph_grid + _fg * _fg + 14 + obs_ram
+    _mem_extra = (2 * int(mem_grid) * int(mem_grid)) if foveal_memory else 0
+    _foveal_dim = 2 * periph_grid * periph_grid + _fg * _fg + _mem_extra + 14 + obs_ram
     _retina_dim = 2 * _RETINA_SIDE * _RETINA_SIDE + 14 + obs_ram
     use_retina = int(obs_dim) == int(_retina_dim)
     use_foveal = int(obs_dim) == int(_foveal_dim)
@@ -1015,6 +1235,9 @@ def _barrier_worker_main(
             fovea_grid=fovea_grid, n_ram=obs_ram, saccade_gain=saccade_gain,
             saccade_every_k=saccade_every_k, episode_steps=episode_steps,
             mode=("retina" if use_retina else "foveal"),
+            foveal_memory=bool(foveal_memory), mem_grid=int(mem_grid),
+            mem_ema_decay=float(mem_ema_decay), mem_stale_z=float(mem_stale_z),
+            mem_stale_warmup=int(mem_stale_warmup),
         )
     else:
         encoder = ObsEncoder(obs_res, obs_ram)
@@ -1197,6 +1420,11 @@ class BarrierFleet:
         saccade_gain: float = 32.0,
         saccade_every_k: int = 1,
         episode_steps: int = 1024,
+        foveal_memory: bool = False,
+        mem_grid: int = 24,
+        mem_ema_decay: float = 0.99,
+        mem_stale_z: float = 1.5,
+        mem_stale_warmup: int = 16,
     ):
         self.n_envs = int(n_envs)
         self.obs_dim = int(obs_dim)
@@ -1208,6 +1436,8 @@ class BarrierFleet:
         self._foveal = (
             int(periph_grid), int(fovea_native_px), int(fovea_grid),
             float(saccade_gain), int(saccade_every_k), int(episode_steps),
+            bool(foveal_memory), int(mem_grid), float(mem_ema_decay),
+            float(mem_stale_z), int(mem_stale_warmup),
         )
 
         # Derive the fixed cell-key length from the archive's geometry.
@@ -1574,7 +1804,8 @@ def _async_worker_main(
     obs_res, obs_ram, wram_stride, arch_kwargs, goexplore,
     shm_names, n_envs, obs_dim, key_len, core, state_cap,
     periph_grid, fovea_native_px, fovea_grid, saccade_gain, saccade_every_k,
-    episode_steps,
+    episode_steps, foveal_memory, mem_grid, mem_ema_decay, mem_stale_z,
+    mem_stale_warmup,
 ):
     """Free-running worker: owns envs ``[slice_lo:slice_hi]``.
 
@@ -1597,13 +1828,14 @@ def _async_worker_main(
         pass
 
     # Active-vision encoder (stateful per env; §2/§3), auto-selected from obs_dim:
-    #   obs_dim == 2*G^2+FG^2+14+n_ram -> foveal obs (454 when FG==G, larger for a
-    #                                    sharp fovea)
+    #   obs_dim == 2*G^2+FG^2+[2*M^2]+14+n_ram -> foveal obs (454 when FG==G, larger
+    #                                    for a sharp fovea / +2*M^2 for §1a memory)
     #   obs_dim == 2*84^2+14+n_ram      -> retina 14134 obs (Phase-1 pixel input)
     # else the legacy flat ObsEncoder (back-compat). Indexed by GLOBAL env id to
     # match the shm obs rows.
     _fg = int(fovea_grid) if int(fovea_grid) > 0 else int(periph_grid)
-    _foveal_dim = 2 * periph_grid * periph_grid + _fg * _fg + 14 + obs_ram
+    _mem_extra = (2 * int(mem_grid) * int(mem_grid)) if foveal_memory else 0
+    _foveal_dim = 2 * periph_grid * periph_grid + _fg * _fg + _mem_extra + 14 + obs_ram
     _retina_dim = 2 * _RETINA_SIDE * _RETINA_SIDE + 14 + obs_ram
     use_retina = int(obs_dim) == int(_retina_dim)
     use_foveal = int(obs_dim) == int(_foveal_dim)
@@ -1614,6 +1846,9 @@ def _async_worker_main(
             fovea_grid=fovea_grid, n_ram=obs_ram, saccade_gain=saccade_gain,
             saccade_every_k=saccade_every_k, episode_steps=episode_steps,
             mode=("retina" if use_retina else "foveal"),
+            foveal_memory=bool(foveal_memory), mem_grid=int(mem_grid),
+            mem_ema_decay=float(mem_ema_decay), mem_stale_z=float(mem_stale_z),
+            mem_stale_warmup=int(mem_stale_warmup),
         )
     else:
         encoder = ObsEncoder(obs_res, obs_ram)
@@ -1822,6 +2057,11 @@ class AsyncFleet:
         saccade_gain: float = 32.0,
         saccade_every_k: int = 1,
         episode_steps: int = 1024,
+        foveal_memory: bool = False,
+        mem_grid: int = 24,
+        mem_ema_decay: float = 0.99,
+        mem_stale_z: float = 1.5,
+        mem_stale_warmup: int = 16,
     ):
         self.n_envs = int(n_envs)
         self.obs_dim = int(obs_dim)
@@ -1833,6 +2073,8 @@ class AsyncFleet:
         self._foveal = (
             int(periph_grid), int(fovea_native_px), int(fovea_grid),
             float(saccade_gain), int(saccade_every_k), int(episode_steps),
+            bool(foveal_memory), int(mem_grid), float(mem_ema_decay),
+            float(mem_stale_z), int(mem_stale_warmup),
         )
         self.key_len = _archive_key_len(archive_kwargs, wram_stride)
         # A5: probe the real save_state size to size the transport buffers.

@@ -3246,6 +3246,13 @@ def train(
         saccade_every_k=config.vision.saccade_every_k,
         episode_steps=episode_steps,
         mode=config.vision.mode,  # foveal (2G^2+FG^2+..) | retina (14134 raw pixels)
+        # Trans-saccadic foveal memory (optical-frontend-v2 §1a): +2*M^2 buffer +
+        # staleness blocks. OFF => byte-identical to the sharp-fovea (Inc-A) obs.
+        foveal_memory=bool(config.vision.foveal_memory),
+        mem_grid=int(config.vision.mem_grid),
+        mem_ema_decay=float(config.vision.mem_ema_decay),
+        mem_stale_z=float(config.vision.mem_stale_z),
+        mem_stale_warmup=int(config.vision.mem_stale_warmup),
     )
     # TWO DIMENSIONS in retina mode (docs/specs/retina-in-loop.md): the FLEET obs
     # is encoder.dim==14134, but the GENOME/controller n_in is 102
@@ -3255,8 +3262,11 @@ def train(
     z_dim_ctrl = int(config.retina.z_periph) + int(config.retina.z_fovea)  # 80
     # [AC] parent-side salience slice (spec §3.4): the foveal motion block offsets,
     # or None (retina/fovea_static -> salience off; retina L1 surprise is deferred).
+    # HI is the END of the motion block (o_motion_hi) — with trans-saccadic memory
+    # (§1a) the buffer/staleness blocks sit between motion and proprio, so o_proprio
+    # would over-read; o_motion_hi == o_proprio when memory is off (byte-identical).
     _AC_MOTION_LO = getattr(encoder, "o_motion", None)
-    _AC_MOTION_HI = getattr(encoder, "o_proprio", None)
+    _AC_MOTION_HI = getattr(encoder, "o_motion_hi", getattr(encoder, "o_proprio", None))
     if retina_mode:
         n_in = z_dim_ctrl + 14 + int(config.vision.obs_ram_bytes)  # 102
         # [AC] §6.2: relax the retina assert to {11,12} (mode-aware) so a future
@@ -3352,11 +3362,16 @@ def train(
             f"pop={pop_size} players={players} episode_steps={episode_steps} gens={gens}"
         )
     else:
+        _mem_desc = (
+            f" + 2*{config.vision.mem_grid}^2 mem(buffer+staleness §1a)"
+            if config.vision.foveal_memory else ""
+        )
         print(
             f"[train] device={device} n_in={n_in} N_OUT={N_OUT} "
-            f"(foveal: {_G}^2 periph + {_FG}^2 fovea + {_G}^2 motion + 14 proprio "
-            f"+ {config.vision.obs_ram_bytes} ram; fovea {config.vision.fovea_native_px}"
-            f"px->{_FG} = {config.vision.fovea_native_px / _FG:.1f} px/cell) "
+            f"(foveal: {_G}^2 periph + {_FG}^2 fovea + {_G}^2 motion{_mem_desc} "
+            f"+ 14 proprio + {config.vision.obs_ram_bytes} ram; fovea "
+            f"{config.vision.fovea_native_px}px->{_FG} = "
+            f"{config.vision.fovea_native_px / _FG:.1f} px/cell) "
             f"pop={pop_size} players={players} episode_steps={episode_steps} gens={gens}"
         )
     print(f"[train] run_dir={run_dir}  reset_state={config.emu.reset_state}")
@@ -3509,6 +3524,14 @@ def train(
             saccade_gain=config.vision.saccade_gain,
             saccade_every_k=config.vision.saccade_every_k,
             episode_steps=episode_steps,
+            # Trans-saccadic foveal memory (§1a): workers auto-select the matching
+            # obs_dim (2*G^2+FG^2+2*M^2+14+n_ram), so they MUST share the memory
+            # geometry + self-calibration knobs with the parent encoder.
+            foveal_memory=bool(config.vision.foveal_memory),
+            mem_grid=int(config.vision.mem_grid),
+            mem_ema_decay=float(config.vision.mem_ema_decay),
+            mem_stale_z=float(config.vision.mem_stale_z),
+            mem_stale_warmup=int(config.vision.mem_stale_warmup),
         )
         print(f"[train] fleet up: {fleet.n_workers} worker procs")
         # A single parent-side env for the per-generation champion replay.
@@ -4498,6 +4521,12 @@ def build_config(args) -> Config:
         cfg.vision.fovea_grid = int(args.fovea_grid)
     if getattr(args, "fovea_native_px", None) is not None:
         cfg.vision.fovea_native_px = int(args.fovea_native_px)
+    # -- Trans-saccadic foveal memory (docs/specs/optical-frontend-v2.md §1a) --
+    # Unset => config default (foveal_memory False => Increment A obs, unchanged).
+    if getattr(args, "foveal_memory", False):
+        cfg.vision.foveal_memory = True
+    if getattr(args, "mem_grid", None) is not None:
+        cfg.vision.mem_grid = int(args.mem_grid)
     # -- Phase-1 retina spine (docs/specs/retina-in-loop.md) ------------------
     # CLI overrides keep foveal (Phase-0) defaults untouched when unset.
     if getattr(args, "vision_mode", None):
@@ -4656,6 +4685,20 @@ def main() -> None:
                     help="F: native fovea crop side in screen px (default config "
                          "48). Recommended successor pair with --fovea-grid 32 is "
                          "--fovea-native-px 32 (1 px/cell over a 32px window).")
+    # -- Trans-saccadic foveal memory (docs/specs/optical-frontend-v2.md §1a) ---
+    ap.add_argument("--foveal-memory", dest="foveal_memory", action="store_true",
+                    default=False,
+                    help="trans-saccadic foveal memory (spec §1a, the keystone): a "
+                         "persistent per-env scene buffer the sharp fovea stamps "
+                         "into + a self-calibrated peripheral-change invalidation / "
+                         "staleness map. Adds two mem-grid^2 obs blocks (buffer + "
+                         "staleness) => n_in grows to 2*G^2+FG^2+2*M^2+14+n_ram (a "
+                         "fresh run). OFF (default) => byte-identical Increment A.")
+    ap.add_argument("--mem-grid", dest="mem_grid", type=int, default=None,
+                    help="M: foveal-memory buffer side (buffer + staleness are M*M "
+                         "each; default config 24). Keep modest — each +1 to M grows "
+                         "n_in by ~2M. The invalidation threshold self-calibrates "
+                         "(per-region EMA-z), so there is no magnitude knob to tune.")
     # -- Phase-1 learned retina spine (docs/specs/retina-in-loop.md) ----------
     ap.add_argument("--vision-mode", choices=("foveal", "fovea_static", "retina"),
                     default=None,
