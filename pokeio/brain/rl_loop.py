@@ -55,10 +55,10 @@ class BrainConfig:
     max_grad_norm: float = 0.5
     horizon_margin: int = 96      # steps beyond (len - frontier) to allow reaching goal
     horizon_min: int = 48
-    horizon_max: int = 1536       # compute cap; at boot this is the EXPLORE horizon
-                                  # (long enough to progress PAST the demo's endpoint)
+    horizon_max: int = 896        # compute cap; at boot this is the EXPLORE horizon
+                                  # (past the demo endpoint; bounded by the bigger canvas obs)
     eval_every: int = 20          # iterations between from-boot gate evals
-    eval_horizon: int = 1536
+    eval_horizon: int = 896
     seed: int = 0
 
 
@@ -83,7 +83,7 @@ class BrainTrainer:
     ``goexplore=True``. Call :meth:`train(iterations)`."""
 
     def __init__(self, fleet, *, grid: int = 12, fovea_grid: int | None = None,
-                 reflex_gaze: bool = True, device="cuda:1",
+                 mem_grid: int = 0, reflex_gaze: bool = True, device="cuda:1",
                  demo: DemoTrajectory | None = None, cfg: BrainConfig | None = None):
         self.fleet = fleet
         self.cfg = cfg or BrainConfig()
@@ -92,23 +92,26 @@ class BrainTrainer:
         self.obs_dim = int(fleet.obs_dim)
         self.grid = int(grid)
         self.fovea_grid = int(fovea_grid) if fovea_grid is not None else int(grid)
+        self.mem_grid = int(mem_grid)   # >0 => the AI acts on the persisted-vision CANVAS
         torch.manual_seed(self.cfg.seed)
 
-        # Reflex saccade (bottom-up, motion x staleness, self-calibrated): a reference
-        # encoder gives the proprio offset + reflex params; ReflexGaze turns the target
-        # (surfaced in the obs proprio by the worker encoders) into the per-step gaze
-        # delta we submit, so the SHARP fovea follows motion. None => centered fovea.
+        # Reflex saccade (bottom-up, motion x staleness, self-calibrated) fills the
+        # canvas over saccades. A reference encoder (matching the fleet's layout — the
+        # memory buffer shifts the proprio offset) gives o_proprio + reflex params;
+        # ReflexGaze turns the target (in the obs proprio) into the per-step gaze delta.
         self._reflex = None
         self._o_proprio = 0
         if reflex_gaze:
             from pokeio.emu.fleet import FovealEncoder, ReflexGaze
             ref = FovealEncoder(1, periph_grid=grid, fovea_native_px=48,
-                                fovea_grid=self.fovea_grid, n_ram=8, reflex_gaze=True)
+                                fovea_grid=self.fovea_grid, n_ram=8, reflex_gaze=True,
+                                foveal_memory=self.mem_grid > 0, mem_grid=max(1, self.mem_grid))
             self._reflex = ReflexGaze.maybe(ref, self.n_envs)
             self._o_proprio = int(ref.o_proprio)
 
         self.policy = ActorCritic(self.obs_dim, periph_grid=grid,
-                                  fovea_grid=self.fovea_grid).to(self.device)
+                                  fovea_grid=self.fovea_grid,
+                                  canvas_grid=self.mem_grid).to(self.device)
         self.opt = torch.optim.Adam(self.policy.parameters(), lr=self.cfg.lr)
         self.reward = ProgressReward(self.n_envs)
         self.demo = demo if demo is not None else DemoTrajectory()

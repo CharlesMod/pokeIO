@@ -33,24 +33,31 @@ _ROM = "roms/pokemon_yellow.gb"
 _STATE = "roms/yellow_newgame.state"
 
 
+CANVAS_GRID = 96  # M: trans-saccadic memory buffer side (the persisted-vision canvas)
+
+
 def build_fleet(n_envs: int, *, rom=_ROM, state=_STATE, obs_ram=8,
                 frame_skip=24, hold_frames=8, periph_grid=12,
-                fovea_native_px=48, fovea_grid=48, reflex_gaze=True) -> BarrierFleet:
+                fovea_native_px=48, fovea_grid=0, reflex_gaze=True,
+                foveal_memory=True, mem_grid=CANVAS_GRID) -> BarrierFleet:
     """A BarrierFleet sized to a matching FovealEncoder, with the reward WRAM
     channel + Go-Explore restore both ON (backward-robustification needs restore).
 
-    ``fovea_grid=48`` = a SHARP native fovea (the 48px active region at 1 px/cell,
-    legible) vs the coarse G=12 periphery — the biomimetic acuity gradient. With
-    ``reflex_gaze`` the fovea SACCADES toward motion (bottom-up, self-calibrated),
-    so the sharp active region follows the action (proprio 14->16 => obs +2)."""
+    BIOMIMETIC PERSISTED-VISION CANVAS (foveal_memory): the encoder maintains an MxM
+    buffer that is blurry (low-res periphery) everywhere EXCEPT where the reflex
+    saccade recently stamped the sharp native fovea; those clear patches age/decay and
+    are invalidated by peripheral change (motion/contrast) — self-calibrated. The
+    reflex gaze fills it in over saccades. The AI acts on this CANVAS alone (see
+    ActorCritic canvas mode), so the raw fovea block is redundant (fovea_grid=0)."""
     enc = FovealEncoder(n_envs, periph_grid=periph_grid,
                         fovea_native_px=fovea_native_px, fovea_grid=fovea_grid,
-                        n_ram=obs_ram, reflex_gaze=reflex_gaze)
+                        n_ram=obs_ram, reflex_gaze=reflex_gaze,
+                        foveal_memory=foveal_memory, mem_grid=mem_grid)
     fleet = BarrierFleet(
         n_envs, enc.dim, periph_grid, obs_ram, rom, frame_skip, hold_frames, state, {},
         wram_stride=64, goexplore=True, expose_wram=True,
         periph_grid=periph_grid, fovea_native_px=fovea_native_px, fovea_grid=fovea_grid,
-        reflex_gaze=reflex_gaze,
+        reflex_gaze=reflex_gaze, foveal_memory=foveal_memory, mem_grid=mem_grid,
     )
     return fleet
 
@@ -102,7 +109,8 @@ def main(argv=None) -> None:
     cfg = BrainConfig(n_envs=args.n_envs, lr=args.lr, gamma=args.gamma,
                       horizon_max=args.horizon_max, eval_every=args.eval_every,
                       seed=args.seed)
-    tr = BrainTrainer(fleet, device=device, fovea_grid=48, demo=DemoTrajectory(), cfg=cfg)
+    tr = BrainTrainer(fleet, device=device, mem_grid=CANVAS_GRID,
+                      demo=DemoTrajectory(), cfg=cfg)
     if args.warmstart:
         state = torch.load(args.warmstart, map_location=device, weights_only=False)
         sd = state.get("state_dict", state.get("policy", state))
@@ -125,7 +133,7 @@ def main(argv=None) -> None:
         from pokeio.brain.showcase import BrainStreamer
         streamer = BrainStreamer(run_dir, fleet, rom_path=_ROM, reset_state=_STATE,
                                  obs_dim=tr.obs_dim, fovea_grid=tr.fovea_grid,
-                                 run_id=args.run_id)
+                                 mem_grid=tr.mem_grid, run_id=args.run_id)
         print(f"[brain] dashboard live -> runs/{args.run_id}/live.json "
               f"(serve :8600, view /brain?run={args.run_id})")
 

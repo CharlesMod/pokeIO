@@ -49,7 +49,8 @@ class ActorCritic(nn.Module):
     """
 
     def __init__(self, obs_dim: int, periph_grid: int = 12, fovea_grid: int | None = None,
-                 hidden: int = 256, n_buttons: int = N_BUTTONS, grid: int | None = None) -> None:
+                 canvas_grid: int = 0, hidden: int = 256, n_buttons: int = N_BUTTONS,
+                 grid: int | None = None) -> None:
         super().__init__()
         if grid is not None:            # back-compat alias for periph_grid
             periph_grid = grid
@@ -58,16 +59,37 @@ class ActorCritic(nn.Module):
         self.obs_dim = int(obs_dim)
         self.G = int(periph_grid)
         self.FG = int(fovea_grid)
+        self.M = int(canvas_grid)
         self.grid = self.G              # legacy attr
         self.n_buttons = int(n_buttons)
 
-        G, FG = self.G, self.FG
+        G, FG, M = self.G, self.FG, self.M
+        self.canvas = M > 0             # AI sees ONLY the persisted-vision canvas
         self.sharp = FG > G
-        n_spatial = (2 * G * G + FG * FG) if self.sharp else (3 * G * G)
+        # obs layout w/ foveal memory: periph|fovea|motion|buffer(M^2)|staleness(M^2)|extra
+        self._o_buffer = 2 * G * G + FG * FG
+        if self.canvas:
+            n_spatial = self._o_buffer + 2 * M * M
+        elif self.sharp:
+            n_spatial = 2 * G * G + FG * FG
+        else:
+            n_spatial = 3 * G * G
         self.n_extra = self.obs_dim - n_spatial
-        self.use_conv = self.n_extra >= 0 and G > 0 and FG > 0
+        self.use_conv = self.n_extra >= 0 and G > 0
 
-        if self.use_conv and self.sharp:
+        if self.use_conv and self.canvas:
+            # THE CANVAS: buffer + staleness as a 2-channel MxM image (blurry
+            # periphery + sharp saccade-stamped regions that decay/invalidate).
+            # Strided conv 3x -> ~M/8 features; this is the SOLE spatial percept.
+            self.canvas_conv = nn.Sequential(
+                _orthogonal(nn.Conv2d(2, 16, 3, stride=2, padding=1), np.sqrt(2)), nn.ReLU(),
+                _orthogonal(nn.Conv2d(16, 32, 3, stride=2, padding=1), np.sqrt(2)), nn.ReLU(),
+                _orthogonal(nn.Conv2d(32, 32, 3, stride=2, padding=1), np.sqrt(2)), nn.ReLU())
+            cs = M
+            for _ in range(3):
+                cs = (cs + 1) // 2
+            trunk_in = 32 * cs * cs + self.n_extra
+        elif self.use_conv and self.sharp:
             # periphery + motion: shared 2-channel GxG conv
             self.pm_conv = nn.Sequential(
                 _orthogonal(nn.Conv2d(2, 16, 3, padding=1), np.sqrt(2)), nn.ReLU(),
@@ -99,6 +121,16 @@ class ActorCritic(nn.Module):
         if not self.use_conv:
             return self.trunk(obs)
         G, FG = self.G, self.FG
+        if self.canvas:
+            M, o = self.M, self._o_buffer
+            m2 = M * M
+            buf = obs[:, o:o + m2]
+            stale = obs[:, o + m2:o + 2 * m2]
+            extra = obs[:, o + 2 * m2:]
+            cv = torch.stack([buf, stale], dim=1).reshape(-1, 2, M, M)
+            h = self.canvas_conv(cv).flatten(1)
+            h = torch.cat([h, extra], dim=1) if extra.shape[1] else h
+            return self.trunk(h)
         if self.sharp:
             g2, f2 = G * G, FG * FG
             periph = obs[:, :g2]

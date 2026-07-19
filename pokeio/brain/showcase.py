@@ -57,16 +57,18 @@ class BrainShowcase:
     """A private env replaying the current System-1 policy from a cold boot."""
 
     def __init__(self, rom_path: str, reset_state: str, *, grid: int = 12,
-                 fovea_grid: int = 48, obs_dim: int = 454, greedy: bool = False) -> None:
+                 fovea_grid: int = 12, mem_grid: int = 96, obs_dim: int = 454,
+                 greedy: bool = False) -> None:
         from pokeio.emu.env import PokeEnv
 
         self.env = PokeEnv(rom_path=rom_path, frame_skip=24)
         self.reset_state = reset_state
         self.enc = FovealEncoder(1, periph_grid=grid, fovea_native_px=48,
-                                 fovea_grid=fovea_grid, n_ram=8, reflex_gaze=True)
+                                 fovea_grid=fovea_grid, n_ram=8, reflex_gaze=True,
+                                 foveal_memory=mem_grid > 0, mem_grid=max(1, mem_grid))
         self._reflex = ReflexGaze.maybe(self.enc, 1)  # bottom-up saccade for the showcase
-        self.policy = ActorCritic(obs_dim, periph_grid=grid,
-                                  fovea_grid=fovea_grid).eval()  # cpu copy, synced by the trainer
+        self.policy = ActorCritic(obs_dim, periph_grid=grid, fovea_grid=fovea_grid,
+                                  canvas_grid=mem_grid).eval()  # cpu copy, synced by the trainer
         self.greedy = bool(greedy)
         self._lock = threading.Lock()
         self.last_action = 8
@@ -117,7 +119,7 @@ class BrainShowcase:
         m = measure_progress(self.wram)
         gs = decode_gamestate(self.wram)
         periph = np.clip(blocks["periph"], 0, 1) * 255.0
-        return {
+        pay = {
             "frame_w": _W, "frame_h": _H,
             "frame_b64": b64_gray(self.screen),
             "obs_res": int(self.enc.G), "obs_b64": b64_gray(periph),
@@ -130,6 +132,13 @@ class BrainShowcase:
                          "level": m["party_level"], "events": m["events"],
                          "badges": m["badges"], "maps": m["maps"], "started": m["started"]},
         }
+        # THE CANVAS — the persisted-vision buffer the AI actually acts on (blurry
+        # periphery + decaying sharp saccade stamps) + its staleness map.
+        if getattr(self.enc, "foveal_memory", False):
+            pay["canvas_res"] = int(self.enc.M)
+            pay["canvas_b64"] = _b64_block(self.enc.mem_buffer(0))
+            pay["stale_b64"] = _b64_block(self.enc.mem_staleness(0))
+        return pay
 
     def close(self) -> None:
         self.env.close()
@@ -143,13 +152,14 @@ class BrainStreamer:
     """
 
     def __init__(self, run_dir, fleet, *, rom_path: str, reset_state: str,
-                 grid: int = 12, fovea_grid: int = 48, obs_dim: int = 454,
-                 hz: float = 4.0, swarm_cap: int = 24, run_id: str = "brain") -> None:
+                 grid: int = 12, fovea_grid: int = 12, mem_grid: int = 96,
+                 obs_dim: int = 454, hz: float = 4.0, swarm_cap: int = 24,
+                 run_id: str = "brain") -> None:
         self.fleet = fleet
         self.run_id = str(run_id)
         self.swarm_cap = int(swarm_cap)
         self.show = BrainShowcase(rom_path, reset_state, grid=grid,
-                                  fovea_grid=fovea_grid, obs_dim=obs_dim)
+                                  fovea_grid=fovea_grid, mem_grid=mem_grid, obs_dim=obs_dim)
         self.writer = LiveWriter(run_dir, hz=hz)
         self._select_path = Path(run_dir) / "select.json"   # focus-agent selection (/api/select)
         self._sel_sig = None
@@ -228,6 +238,10 @@ class BrainStreamer:
                 "gaze": _gaze_payload(gy, gx, _H, _W, int(enc.F)),
                 "action": action, "buttons": buttons,
             }
+            if "buffer" in blocks:   # the canvas this training agent acts on
+                pay["canvas_res"] = int(enc.M)
+                pay["canvas_b64"] = _b64_block(blocks["buffer"])
+                pay["stale_b64"] = _b64_block(blocks["stale"])
             if "wram" in arr:
                 w = np.asarray(arr["wram"][idx])
                 m = measure_progress(w)
