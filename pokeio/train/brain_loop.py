@@ -35,9 +35,13 @@ _STATE = "roms/yellow_newgame.state"
 
 def build_fleet(n_envs: int, *, rom=_ROM, state=_STATE, obs_ram=8,
                 frame_skip=24, hold_frames=8, periph_grid=12,
-                fovea_native_px=48, fovea_grid=0) -> BarrierFleet:
+                fovea_native_px=48, fovea_grid=48) -> BarrierFleet:
     """A BarrierFleet sized to a matching FovealEncoder, with the reward WRAM
-    channel + Go-Explore restore both ON (backward-robustification needs restore)."""
+    channel + Go-Explore restore both ON (backward-robustification needs restore).
+
+    ``fovea_grid=48`` = a SHARP native fovea (the 48px active region at 1 px/cell,
+    legible) vs the coarse G=12 periphery — the biomimetic acuity gradient (the old
+    fovea_grid=0 collapsed the fovea to a 12x12 blur)."""
     enc = FovealEncoder(n_envs, periph_grid=periph_grid,
                         fovea_native_px=fovea_native_px, fovea_grid=fovea_grid,
                         n_ram=obs_ram)
@@ -93,7 +97,7 @@ def main(argv=None) -> None:
     cfg = BrainConfig(n_envs=args.n_envs, lr=args.lr, gamma=args.gamma,
                       horizon_max=args.horizon_max, eval_every=args.eval_every,
                       seed=args.seed)
-    tr = BrainTrainer(fleet, device=device, demo=DemoTrajectory(), cfg=cfg)
+    tr = BrainTrainer(fleet, device=device, fovea_grid=48, demo=DemoTrajectory(), cfg=cfg)
     # Start the backward-robustification frontier AT the demo's milestone depth
     # (game-agnostic: found by replaying the demo), so the run begins where real
     # learning is — not wasting iterations restoring past an already-won milestone.
@@ -107,7 +111,8 @@ def main(argv=None) -> None:
     if args.dashboard:
         from pokeio.brain.showcase import BrainStreamer
         streamer = BrainStreamer(run_dir, fleet, rom_path=_ROM, reset_state=_STATE,
-                                 obs_dim=tr.obs_dim, run_id=args.run_id)
+                                 obs_dim=tr.obs_dim, fovea_grid=tr.fovea_grid,
+                                 run_id=args.run_id)
         print(f"[brain] dashboard live -> runs/{args.run_id}/live.json "
               f"(serve :8600, view /brain?run={args.run_id})")
 

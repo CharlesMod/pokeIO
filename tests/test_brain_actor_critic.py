@@ -11,10 +11,20 @@ OBS_DIM = 454  # foveal default (periph144+fovea144+motion144+proprio14+ram8)
 
 
 def test_conv_trunk_used_for_default_foveal():
-    ac = ActorCritic(OBS_DIM, grid=12)
-    assert ac.use_conv is True
-    assert ac.n_spatial == 3 * 12 * 12  # 432
-    assert ac.n_extra == OBS_DIM - 432   # 22
+    ac = ActorCritic(OBS_DIM, grid=12)          # FG==G legacy uniform path
+    assert ac.use_conv is True and ac.sharp is False
+    assert ac.n_extra == OBS_DIM - 3 * 12 * 12   # 22
+
+
+def test_sharp_fovea_multires_path():
+    dim = 2 * 144 + 48 * 48 + 22                 # periph+motion(2*12^2) + fovea(48^2) + extra
+    ac = ActorCritic(dim, periph_grid=12, fovea_grid=48)
+    assert ac.sharp is True and ac.use_conv is True and ac.n_extra == 22
+    obs = torch.rand(4, dim)
+    logits, value = ac(obs)
+    assert logits.shape == (4, N_BUTTONS) and value.shape == (4,)
+    logits.sum().backward()                       # sharp fovea reaches the gradient
+    assert ac.fov_conv[0].weight.grad.abs().sum().item() > 0
 
 
 def test_forward_shapes():

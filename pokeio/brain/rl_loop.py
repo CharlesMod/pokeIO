@@ -81,16 +81,20 @@ class BrainTrainer:
     (already-constructed) BarrierFleet that was created with ``expose_wram=True`` and
     ``goexplore=True``. Call :meth:`train(iterations)`."""
 
-    def __init__(self, fleet, *, grid: int = 12, device="cuda:1",
-                 demo: DemoTrajectory | None = None, cfg: BrainConfig | None = None):
+    def __init__(self, fleet, *, grid: int = 12, fovea_grid: int | None = None,
+                 device="cuda:1", demo: DemoTrajectory | None = None,
+                 cfg: BrainConfig | None = None):
         self.fleet = fleet
         self.cfg = cfg or BrainConfig()
         self.device = torch.device(device)
         self.n_envs = int(fleet.n_envs)
         self.obs_dim = int(fleet.obs_dim)
+        self.grid = int(grid)
+        self.fovea_grid = int(fovea_grid) if fovea_grid is not None else int(grid)
         torch.manual_seed(self.cfg.seed)
 
-        self.policy = ActorCritic(self.obs_dim, grid=grid).to(self.device)
+        self.policy = ActorCritic(self.obs_dim, periph_grid=grid,
+                                  fovea_grid=self.fovea_grid).to(self.device)
         self.opt = torch.optim.Adam(self.policy.parameters(), lr=self.cfg.lr)
         self.reward = ProgressReward(self.n_envs)
         self.demo = demo if demo is not None else DemoTrajectory()

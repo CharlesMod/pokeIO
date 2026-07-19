@@ -57,14 +57,15 @@ class BrainShowcase:
     """A private env replaying the current System-1 policy from a cold boot."""
 
     def __init__(self, rom_path: str, reset_state: str, *, grid: int = 12,
-                 obs_dim: int = 454, greedy: bool = False) -> None:
+                 fovea_grid: int = 48, obs_dim: int = 454, greedy: bool = False) -> None:
         from pokeio.emu.env import PokeEnv
 
         self.env = PokeEnv(rom_path=rom_path, frame_skip=24)
         self.reset_state = reset_state
         self.enc = FovealEncoder(1, periph_grid=grid, fovea_native_px=48,
-                                 fovea_grid=0, n_ram=8)
-        self.policy = ActorCritic(obs_dim, grid=grid).eval()  # cpu copy, synced by the trainer
+                                 fovea_grid=fovea_grid, n_ram=8)
+        self.policy = ActorCritic(obs_dim, periph_grid=grid,
+                                  fovea_grid=fovea_grid).eval()  # cpu copy, synced by the trainer
         self.greedy = bool(greedy)
         self._lock = threading.Lock()
         self.last_action = 8
@@ -135,12 +136,13 @@ class BrainStreamer:
     """
 
     def __init__(self, run_dir, fleet, *, rom_path: str, reset_state: str,
-                 grid: int = 12, obs_dim: int = 454, hz: float = 4.0,
-                 swarm_cap: int = 24, run_id: str = "brain") -> None:
+                 grid: int = 12, fovea_grid: int = 48, obs_dim: int = 454,
+                 hz: float = 4.0, swarm_cap: int = 24, run_id: str = "brain") -> None:
         self.fleet = fleet
         self.run_id = str(run_id)
         self.swarm_cap = int(swarm_cap)
-        self.show = BrainShowcase(rom_path, reset_state, grid=grid, obs_dim=obs_dim)
+        self.show = BrainShowcase(rom_path, reset_state, grid=grid,
+                                  fovea_grid=fovea_grid, obs_dim=obs_dim)
         self.writer = LiveWriter(run_dir, hz=hz)
         self._select_path = Path(run_dir) / "select.json"   # focus-agent selection (/api/select)
         self._sel_sig = None

@@ -30,7 +30,6 @@ import torch
 from pokeio.brain.actor_critic import ActorCritic
 
 FORMAT = "pokeio.brain.champion/v1"
-_ARCH_KEYS = ("obs_dim", "grid", "hidden", "n_buttons")
 
 
 # --------------------------------------------------------------------------- meta
@@ -49,12 +48,15 @@ def _now() -> str:
 
 def arch_of(policy: ActorCritic) -> dict:
     """The ActorCritic constructor args needed to rebuild it."""
-    return {"obs_dim": int(policy.obs_dim), "grid": int(policy.grid),
-            "hidden": int(policy.trunk[0].out_features), "n_buttons": int(policy.n_buttons)}
+    return {"obs_dim": int(policy.obs_dim), "grid": int(policy.G),
+            "fovea_grid": int(policy.FG), "hidden": int(policy.trunk[0].out_features),
+            "n_buttons": int(policy.n_buttons)}
 
 
 def _build(arch: dict) -> ActorCritic:
-    return ActorCritic(**{k: int(arch[k]) for k in _ARCH_KEYS})
+    return ActorCritic(int(arch["obs_dim"]), periph_grid=int(arch["grid"]),
+                       fovea_grid=int(arch.get("fovea_grid", arch["grid"])),
+                       hidden=int(arch["hidden"]), n_buttons=int(arch["n_buttons"]))
 
 
 # ------------------------------------------------------------------------- brain io

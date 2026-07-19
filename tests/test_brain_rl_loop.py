@@ -116,11 +116,14 @@ def test_update_runs_gradient_step_and_changes_params():
 
 def test_entropy_coef_neuromodulation_scales_with_success():
     tr = _trainer(milestone=2)
-    # after successful rollouts the success EMA rises -> ent_coef shrinks (exploit)
+    # success EMA rises -> ent_coef drops from a bonus toward a decisiveness PENALTY:
+    # base*(1-ema) - decisiveness*ema, in [-decisiveness, base], negative when winning.
     tr.rollout(); tr.rollout()
     s = tr.update(tr.rollout())
-    assert 0.0 <= s["ent_coef"] <= tr.cfg.ent_coef_base
+    assert -tr.cfg.decisiveness <= s["ent_coef"] <= tr.cfg.ent_coef_base
     assert tr.curriculum.success_ema > 0.0
+    # at saturated success the coef is a (commit-pressure) penalty
+    assert s["ent_coef"] < tr.cfg.ent_coef_base
 
 
 # ---------------------------------------------------------------- gate eval
