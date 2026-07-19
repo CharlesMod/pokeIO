@@ -120,10 +120,30 @@ def main(argv=None) -> None:
     try:
         tr.train(args.iterations, on_log=_log)
         _checkpoint(ckpt_path, tr)
+        _export_champion(run_dir, tr, args)
     finally:
         fleet.close()
     dt = time.monotonic() - t0
     print(f"[brain] done: {args.iterations} iters in {dt:.0f}s -> {ckpt_path}")
+
+
+def _export_champion(run_dir: Path, tr, args) -> None:
+    """Export the trained champion as separate brain (phenotype) + genome (genotype)
+    files for replay / breeding / cross-game seeding (pokeio.brain.champion)."""
+    from pokeio.brain.champion import export_champion
+
+    best = max((r["eval"]["gate_reached_frac"] for r in tr.history if "eval" in r),
+               default=0.0)
+    cdir = run_dir / "champions"
+    cdir.mkdir(parents=True, exist_ok=True)
+    obs_spec = {"encoder": "FovealEncoder", "dim": tr.obs_dim, "grid": 12,
+                "periph_grid": 12, "fovea_native_px": 48, "fovea_grid": 0, "n_ram": 8}
+    meta = {"game": "Pokemon Yellow", "console": "gb", "backend": "pyboy",
+            "run_id": args.run_id, "iter": tr.iter, "gate_stochastic": best,
+            "id": f"{args.run_id}:{tr.iter}"}
+    export_champion(tr.policy, str(cdir / "champion_brain.pt"),
+                    str(cdir / "champion_genome.npz"), obs_spec=obs_spec, meta=meta)
+    print(f"[brain] champion exported -> {cdir}/ (brain + genome; gate={best:.2f})")
 
 
 if __name__ == "__main__":
