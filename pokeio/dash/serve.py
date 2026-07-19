@@ -20,7 +20,9 @@ this module); this server never fabricates a judge/co-evolution signal.
 
 Endpoints
 ---------
-* ``GET /``                      → wall.html
+* ``GET /``                      → index.html (unified tab shell: Training + Brain walls)
+* ``GET /wall.html``             → wall.html (NEAT training wall, embedded by the shell)
+* ``GET /brain``                 → brain_wall.html (System-1 brain wall, embedded by the shell)
 * ``GET /api/runs``              → {"runs": [{"id","generations","mtime"}, ...]}  newest first
 * ``GET /api/telemetry?run=ID``  → {"run", "records":[...], "host":{cpu,gpu}}  (tail of records)
 * ``GET /api/live?run=ID``       → parsed runs/<run-or-newest>/live.json (real frames + champion net) or {}
@@ -51,6 +53,7 @@ from pokeio.telemetry.schema import TELEMETRY_FILENAME, read_generations
 DASH_DIR = Path(__file__).resolve().parent
 REPO_ROOT = DASH_DIR.parents[1]
 RUNS_DIR = REPO_ROOT / "runs"
+INDEX_HTML = DASH_DIR / "index.html"       # unified tab shell (training + brain)
 WALL_HTML = DASH_DIR / "wall.html"
 BRAIN_HTML = DASH_DIR / "brain_wall.html"  # System-1 (gradient-RL) dashboard
 LIVE_FILENAME = "live.json"  # real live-frame payload (frames + champion net), written ~3 Hz
@@ -317,7 +320,9 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         path = u.path
         try:
-            if path in ("/", "/index.html", "/wall.html"):
+            if path in ("/", "/index.html", "/dash", "/dashboard"):
+                self._send(200, INDEX_HTML.read_bytes(), "text/html; charset=utf-8")
+            elif path in ("/wall", "/wall.html", "/training"):
                 self._send(200, WALL_HTML.read_bytes(), "text/html; charset=utf-8")
             elif path in ("/brain", "/brain.html", "/brain_wall.html"):
                 self._send(200, BRAIN_HTML.read_bytes(), "text/html; charset=utf-8")
