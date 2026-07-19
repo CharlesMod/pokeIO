@@ -131,6 +131,30 @@
   .percept.cyan .cap{color:var(--cyan)} .percept.green .cap{color:var(--accent)} .percept.violet .cap{color:var(--violet)}
   .percept.empty canvas{opacity:.28} .percept.empty .cap{opacity:.5}
 
+  /* THE CANVAS — the persisted-vision composite the AI actually acts on */
+  .aivision{display:flex; gap:18px; margin-top:16px; flex-wrap:wrap; align-items:flex-start}
+  .canvas-block{display:flex; flex-direction:column; gap:8px}
+  .canvas-head{display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+  .canvas-head .t{font-family:var(--mono); font-size:11px; font-weight:700; letter-spacing:.16em; color:var(--accent); text-transform:uppercase}
+  .canvas-head .sub{font-family:var(--mono); font-size:9px; letter-spacing:.04em; color:var(--ink-mute)}
+  .stale-toggle{display:inline-flex; align-items:center; gap:6px; cursor:pointer; user-select:none; margin-left:auto;
+    font-family:var(--mono); font-size:9px; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-mute);
+    padding:3px 9px; border:1px solid var(--line-2); border-radius:20px; background:#0e1413; transition:.12s}
+  .stale-toggle:hover{color:var(--ink-dim)}
+  .stale-toggle.on{color:var(--amber); border-color:rgba(230,178,62,.5); background:rgba(230,178,62,.08)}
+  .stale-toggle .sw{width:7px;height:7px;border-radius:50%;background:var(--ink-mute)}
+  .stale-toggle.on .sw{background:var(--amber);box-shadow:0 0 7px var(--amber)}
+  .canvas-wrap{position:relative; line-height:0; align-self:flex-start}
+  #p-canvas{display:block; width:216px; height:216px; image-rendering:pixelated; border-radius:5px; background:#050807;
+    box-shadow:0 0 0 1px rgba(55,224,139,.55), 0 0 24px rgba(55,224,139,.14), inset 0 0 30px rgba(0,0,0,.45)}
+  .canvas-wrap.empty #p-canvas{opacity:.22; box-shadow:0 0 0 1px var(--line)}
+  .canvas-wrap .cnote{position:absolute; left:8px; bottom:7px; font-family:var(--mono); font-size:8.5px; letter-spacing:.1em;
+    color:rgba(55,224,139,.72); text-transform:uppercase; text-shadow:0 1px 3px #000}
+  .canvas-wrap.empty .cnote{color:var(--ink-mute)}
+  .glimpses{display:flex; flex-direction:column; gap:8px; flex:1; min-width:0}
+  .glimpses .gh{font-family:var(--mono); font-size:9px; letter-spacing:.1em; color:var(--ink-mute); text-transform:uppercase}
+  .glimpses .percepts{margin-top:0}
+
   /* ---------------- swarm ---------------- */
   .swarm-grid{display:grid; gap:6px; grid-template-columns:repeat(auto-fill,minmax(66px,1fr))}
   .cell{position:relative; background:#050807; border-radius:4px; overflow:hidden; border:1px solid #0c1211; aspect-ratio:40/36;
@@ -290,10 +314,26 @@
               </div>
             </div>
           </div>
-          <div class="percepts">
-            <div class="percept cyan" id="pc-periph"><canvas id="p-periph" width="96" height="96"></canvas><div class="cap">periphery</div></div>
-            <div class="percept green" id="pc-fovea"><canvas id="p-fovea" width="96" height="96"></canvas><div class="cap">fovea</div></div>
-            <div class="percept violet" id="pc-motion"><canvas id="p-motion" width="96" height="96"></canvas><div class="cap">motion</div></div>
+          <div class="aivision">
+            <div class="canvas-block">
+              <div class="canvas-head">
+                <span class="t">◉ Canvas</span>
+                <span class="sub">what the AI sees — persisted vision</span>
+                <span class="stale-toggle" id="stale-toggle" title="overlay the staleness map: green = freshly saccaded, cool/dim = decaying back to blur"><span class="sw"></span>staleness</span>
+              </div>
+              <div class="canvas-wrap" id="pc-canvas">
+                <canvas id="p-canvas" width="96" height="96"></canvas>
+                <div class="cnote" id="canvas-note">◎ blurry periphery + sharp fovea stamps</div>
+              </div>
+            </div>
+            <div class="glimpses">
+              <div class="gh">raw glimpses ▸ composited into the canvas</div>
+              <div class="percepts">
+                <div class="percept cyan" id="pc-periph"><canvas id="p-periph" width="96" height="96"></canvas><div class="cap">periphery</div></div>
+                <div class="percept green" id="pc-fovea"><canvas id="p-fovea" width="96" height="96"></canvas><div class="cap">fovea</div></div>
+                <div class="percept violet" id="pc-motion"><canvas id="p-motion" width="96" height="96"></canvas><div class="cap">motion</div></div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -373,6 +413,48 @@ function drawGray(canvasEl,b64,w,h){
   return true;
 }
 
+/* ---------- THE CANVAS: persisted-vision buffer (what the AI sees) ----------
+   Default = the grayscale buffer verbatim (blurry periphery + sharp saccade
+   stamps). Staleness overlay ON = tint by freshness (green = just saccaded,
+   cool/dim = decaying back to blur) so the change-blindness decay is visible.
+   Draws the fovea box where the current sharp stamp lands. */
+let showStale=false;
+function drawCanvasView(cv, bufB64, staleB64, res, g){
+  if(!cv) return false;
+  const ctx=cv.getContext("2d");
+  res=res||96;
+  if(!bufB64){ ctx.clearRect(0,0,cv.width,cv.height); return false; }
+  let bin; try{ bin=atob(bufB64); }catch(e){ return false; }
+  const n=res*res;
+  if(bin.length<n) return false;                 // partial/mid-write -> keep last
+  let sbin=null;
+  if(showStale && staleB64){ try{ const s=atob(staleB64); if(s.length>=n) sbin=s; }catch(e){} }
+  const off=offscreen(res,res), octx=off.getContext("2d");
+  const img=octx.createImageData(res,res), d=img.data;
+  for(let i=0;i<n;i++){
+    const v=bin.charCodeAt(i)&255, o=i*4;
+    if(sbin){
+      const f=1-(sbin.charCodeAt(i)&255)/255;    // freshness: 1 just saccaded .. 0 stale
+      const k=0.45+0.55*f;                        // fresher = brighter
+      d[o]  =v*k*(0.65-0.35*f);                   // fresh -> green, stale -> cool blue-gray
+      d[o+1]=v*k*(0.55+0.45*f);
+      d[o+2]=v*k*(0.80-0.55*f);
+    }else{ d[o]=v; d[o+1]=v; d[o+2]=v; }
+    d[o+3]=255;
+  }
+  octx.putImageData(img,0,0);
+  ctx.imageSmoothingEnabled=false;
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.drawImage(off,0,0,res,res,0,0,cv.width,cv.height);
+  if(g&&isNum(g.x01)&&isNum(g.y01)){             // fovea box: where the sharp stamp lands
+    const W=cv.width,H=cv.height, bw=(g.w01||0.3)*W, bh=(g.h01||0.3)*H;
+    ctx.save(); ctx.lineWidth=1.5; ctx.strokeStyle="rgba(55,224,139,.9)";
+    ctx.shadowColor="rgba(55,224,139,.55)"; ctx.shadowBlur=6;
+    ctx.strokeRect(g.x01*W-bw/2, g.y01*H-bh/2, bw, bh); ctx.restore();
+  }
+  return true;
+}
+
 /* ---------- setters that keep last-good on missing ---------- */
 function setTxt(el,v){ if(el&&v!=null) el.textContent=v; }
 const pct=v=>Math.round(v*100)+"%";
@@ -410,6 +492,13 @@ function renderChampion(c,focused){
   drawGray($("p-fovea"), c.fovea_b64, fR, fR);
   const hasMotion=drawGray($("p-motion"), c.motion_b64, oR, oR);
   pcM.classList.toggle("empty", !hasMotion);
+
+  // THE CANVAS — the composite the AI actually acts on (champion + focused agent both carry it)
+  const hasCanvas=drawCanvasView($("p-canvas"), c.canvas_b64, c.stale_b64, c.canvas_res||96, c.gaze);
+  $("pc-canvas").classList.toggle("empty", !hasCanvas);
+  setTxt($("canvas-note"), hasCanvas
+    ? (showStale ? "◎ freshness — green=just saccaded · dim=decaying" : "◎ blurry periphery + sharp fovea stamps")
+    : "no canvas — pre-persisted-vision run");
 
   // update the map-name text node without clobbering the <small> child
   const mn=$("mapname");
@@ -711,6 +800,12 @@ setInterval(thumbTick,500);
 
 /* ---------- return-to-champion button ---------- */
 $("to-champ").addEventListener("click", returnToChampion);
+
+/* ---------- staleness overlay toggle (re-renders the canvas from the last frame) ---------- */
+$("stale-toggle").addEventListener("click", function(){
+  showStale=!showStale; this.classList.toggle("on", showStale);
+  if(last) render(last);   // immediate redraw, no wait for next poll
+});
 
 /* ---------- STOP (two-click confirm) — targets the ACTIVE run ---------- */
 const stopBtn=$("stopbtn"); let armed=false, armT=null;
