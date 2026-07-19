@@ -1435,7 +1435,7 @@ def _paced_wait(pred, nap: float = 2e-3) -> None:
 
 def _barrier_worker_main(
     slice_lo, slice_hi, rom_path, frame_skip, hold_frames, reset_state,
-    obs_res, obs_ram, wram_stride, arch_kwargs, goexplore,
+    obs_res, obs_ram, wram_stride, arch_kwargs, goexplore, expose_wram,
     shm_names, n_envs, obs_dim, key_len, core, state_cap,
     periph_grid, fovea_native_px, fovea_grid, saccade_gain, saccade_every_k,
     episode_steps, foveal_memory, mem_grid, mem_ema_decay, mem_stale_z,
@@ -1525,6 +1525,11 @@ def _barrier_worker_main(
     ctl = reg("ctl", (3 + n_envs,), np.int64)
     # mined progress-counter taps: [0]=version, [1:]=GB addresses (0=unset).
     tapcfg = reg("tapcfg", (1 + obs_ram,), np.int64)
+    # OPT-IN full-WRAM export (default OFF): when set, the parent allocated a
+    # (n_envs, 8192) uint8 block so an out-of-band reward loop can read raw game
+    # state. Only attach it when the flag is set — the NEAT/furnace path never
+    # allocates it, so this stays byte-identical when disabled.
+    wram_full = reg("wram", (n_envs, WRAM_END_LEN), np.uint8) if expose_wram else None
 
     envs = [
         PokeEnv(rom_path, frame_skip=frame_skip, hold_frames=hold_frames)
@@ -1548,6 +1553,9 @@ def _barrier_worker_main(
             mem = env.pyboy.memory
             for col, a in taps:
                 obs[global_i, col] = mem[a] / 255.0
+        # Opt-in: publish the full 8 KB WRAM snapshot for the parent reward loop.
+        if expose_wram:
+            wram_full[global_i] = env.raw_wram()
         k = archive.cell_key_compact(screen, w64)
         keys[global_i] = np.frombuffer(k, dtype=np.uint8)
 
@@ -1664,6 +1672,7 @@ class BarrierFleet:
         archive_kwargs: dict,
         wram_stride: int = 64,
         goexplore: bool = False,
+        expose_wram: bool = False,
         envs_per_worker: int = 1,
         round_deadline_s: float | None = None,
         periph_grid: int = 12,
@@ -1686,6 +1695,9 @@ class BarrierFleet:
         self.obs_dim = int(obs_dim)
         self.obs_ram = int(obs_ram)
         self.goexplore = bool(goexplore)
+        # OPT-IN: expose full per-env WRAM (8 KB) to the parent (default OFF, so
+        # the NEAT/furnace path is byte-identical — no extra alloc/reg/read).
+        self.expose_wram = bool(expose_wram)
         self.wram_stride = int(wram_stride)
         # Splatted (order-critical) into the worker main after the fixed args;
         # keep in sync with the _barrier_worker_main signature.
@@ -1744,6 +1756,11 @@ class BarrierFleet:
         alloc("ctl", (3 + n,), np.int64)
         # mined progress-counter taps: [0]=version, [1:]=GB addresses (0=unset).
         alloc("tapcfg", (1 + self.obs_ram,), np.int64)
+        # OPT-IN full-WRAM export (default OFF): only alloc'd when requested, so
+        # the production NEAT/furnace path never pays for it (no shm block, and
+        # its name never enters _shm_names -> workers never attach it).
+        if self.expose_wram:
+            alloc("wram", (n, WRAM_END_LEN), np.uint8)
 
         self._ctl = self.arr["ctl"]
         self._ctl[:] = 0
@@ -1771,8 +1788,8 @@ class BarrierFleet:
                 args=(
                     lo, hi, rom_path, frame_skip, hold_frames, reset_state,
                     obs_res, obs_ram, self.wram_stride, dict(archive_kwargs),
-                    self.goexplore, self._shm_names, n, self.obs_dim,
-                    self.key_len, core, self.state_cap,
+                    self.goexplore, self.expose_wram, self._shm_names, n,
+                    self.obs_dim, self.key_len, core, self.state_cap,
                     *self._foveal,
                 ),
                 daemon=True,
@@ -2059,7 +2076,7 @@ _OP_RUN = 3  # barrier ops: 0=step 1=reset 2=shutdown (shared numbering)
 
 def _async_worker_main(
     slice_lo, slice_hi, rom_path, frame_skip, hold_frames, reset_state,
-    obs_res, obs_ram, wram_stride, arch_kwargs, goexplore,
+    obs_res, obs_ram, wram_stride, arch_kwargs, goexplore, expose_wram,
     shm_names, n_envs, obs_dim, key_len, core, state_cap,
     periph_grid, fovea_native_px, fovea_grid, saccade_gain, saccade_every_k,
     episode_steps, foveal_memory, mem_grid, mem_ema_decay, mem_stale_z,
@@ -2144,6 +2161,10 @@ def _async_worker_main(
     ctl = reg("ctl", (4 + n_envs,), np.int64)
     # mined progress-counter taps: [0]=version, [1:]=GB addresses (0=unset)
     tapcfg = reg("tapcfg", (1 + obs_ram,), np.int64)
+    # OPT-IN full-WRAM export (default OFF): only attach when the parent asked
+    # for it (and hence allocated the (n_envs, 8192) uint8 block). Disabled ->
+    # this reg never runs, keeping the furnace path byte-identical.
+    wram_full = reg("wram", (n_envs, WRAM_END_LEN), np.uint8) if expose_wram else None
 
     envs = [
         PokeEnv(rom_path, frame_skip=frame_skip, hold_frames=hold_frames)
@@ -2168,6 +2189,9 @@ def _async_worker_main(
             mem = env.pyboy.memory
             for col, a in taps:
                 obs[gi, col] = mem[a] / 255.0
+        # Opt-in: publish the full 8 KB WRAM snapshot for the parent reward loop.
+        if expose_wram:
+            wram_full[gi] = env.raw_wram()
         k = archive.cell_key_compact(screen, w64)
         keys[gi] = np.frombuffer(k, dtype=np.uint8)
 
@@ -2311,6 +2335,7 @@ class AsyncFleet:
         archive_kwargs: dict,
         wram_stride: int = 64,
         goexplore: bool = False,
+        expose_wram: bool = False,
         envs_per_worker: int = 1,
         round_deadline_s: float | None = None,
         periph_grid: int = 12,
@@ -2333,6 +2358,9 @@ class AsyncFleet:
         self.obs_dim = int(obs_dim)
         self.obs_ram = int(obs_ram)
         self.goexplore = bool(goexplore)
+        # OPT-IN: expose full per-env WRAM (8 KB) to the parent (default OFF, so
+        # the furnace/NEAT path is byte-identical — no extra alloc/reg/read).
+        self.expose_wram = bool(expose_wram)
         self.wram_stride = int(wram_stride)
         # Splatted (order-critical) into the worker main after the fixed args;
         # keep in sync with the _async_worker_main signature.
@@ -2386,6 +2414,11 @@ class AsyncFleet:
         # When set, workers overwrite the obs RAM tail with these bytes instead
         # of the blind stride sample (see _async_worker_main / set_tap_addrs).
         alloc("tapcfg", (1 + self.obs_ram,), np.int64)
+        # OPT-IN full-WRAM export (default OFF): only alloc'd when requested, so
+        # the production furnace path never pays for it (no shm block, and its
+        # name never enters _shm_names -> workers never attach it).
+        if self.expose_wram:
+            alloc("wram", (n, WRAM_END_LEN), np.uint8)
 
         self._ctl = self.arr["ctl"]
         self._ctl[:] = 0
@@ -2412,8 +2445,8 @@ class AsyncFleet:
                 args=(
                     lo, hi, rom_path, frame_skip, hold_frames, reset_state,
                     obs_res, obs_ram, self.wram_stride, dict(archive_kwargs),
-                    self.goexplore, self._shm_names, n, self.obs_dim,
-                    self.key_len, core, self.state_cap,
+                    self.goexplore, self.expose_wram, self._shm_names, n,
+                    self.obs_dim, self.key_len, core, self.state_cap,
                     *self._foveal,
                 ),
                 daemon=True,
