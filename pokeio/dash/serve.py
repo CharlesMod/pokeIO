@@ -118,6 +118,36 @@ def _run_dirs() -> list[Path]:
     return sorted(dirs, key=lambda d: (d / TELEMETRY_FILENAME).stat().st_mtime, reverse=True)
 
 
+def _brain_runs() -> dict:
+    """System-1 runs (dirs with a ``kind:"system1"`` live.json) + a light summary for
+    the dashboard run-rail — id, iter, phase, gate, reach, and whether it's live
+    (live.json touched recently). No frames (the rail fetches those via /api/live)."""
+    import time
+
+    out = []
+    if not RUNS_DIR.is_dir():
+        return {"runs": []}
+    dirs = sorted(RUNS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+    for d in dirs:
+        lj = d / LIVE_FILENAME
+        if not d.is_dir() or not lj.is_file():
+            continue
+        try:
+            live = json.loads(lj.read_text())
+        except Exception:
+            continue
+        if live.get("kind") != "system1":
+            continue
+        m = live.get("metrics", {}) or {}
+        mtime = lj.stat().st_mtime
+        out.append({
+            "id": d.name, "iter": live.get("iter", 0), "phase": live.get("phase", ""),
+            "gate_stochastic": m.get("gate_stochastic"), "gate_greedy": m.get("gate_greedy"),
+            "reach": m.get("reach"), "running": (time.time() - mtime) < 15, "mtime": mtime,
+        })
+    return {"runs": out}
+
+
 def _list_runs() -> dict:
     runs = []
     for d in _run_dirs():
@@ -293,6 +323,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, BRAIN_HTML.read_bytes(), "text/html; charset=utf-8")
             elif path == "/api/runs":
                 self._json(_list_runs())
+            elif path == "/api/brain_runs":
+                self._json(_brain_runs())
             elif path == "/api/telemetry":
                 run = (parse_qs(u.query).get("run") or [None])[0]
                 self._json(_telemetry(run))

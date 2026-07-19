@@ -20,7 +20,7 @@
     color:var(--ink); font-family:var(--sans); font-size:13px; line-height:1.4;
     -webkit-font-smoothing:antialiased; overflow-x:hidden;
   }
-  .wall{min-height:100vh; display:grid; grid-template-rows:auto 1fr; gap:11px; padding:11px}
+  .wall{min-height:100vh; display:grid; grid-template-rows:auto auto 1fr; gap:11px; padding:11px}
 
   /* ---------------- header strip ---------------- */
   .strip{
@@ -167,6 +167,31 @@
 
   .foot{padding:7px 13px; font-family:var(--mono); font-size:8.5px; letter-spacing:.1em; color:var(--ink-mute); text-align:center}
 
+  /* ---------------- run rail ---------------- */
+  .railbar{display:flex; align-items:center; gap:12px; overflow:hidden;
+    background:linear-gradient(180deg,var(--panel-2),var(--panel)); border:1px solid var(--line); border-radius:var(--r); padding:9px 12px}
+  .raillbl{flex:none; display:flex; flex-direction:column; gap:2px; padding-right:12px; border-right:1px solid var(--line)}
+  .raillbl .t{font-family:var(--mono); font-size:10px; font-weight:600; letter-spacing:.22em; color:var(--ink-dim); text-transform:uppercase}
+  .raillbl .s{font-family:var(--mono); font-size:8px; letter-spacing:.14em; color:var(--ink-mute); text-transform:uppercase}
+  .rail{display:flex; gap:9px; overflow-x:auto; overflow-y:hidden; padding:1px 1px 4px; flex:1; min-width:0}
+  .rail::-webkit-scrollbar{height:7px}
+  .rail::-webkit-scrollbar-thumb{background:var(--line-2); border-radius:4px}
+  .rail::-webkit-scrollbar-track{background:transparent}
+  .rail-empty{font-family:var(--mono); font-size:10px; letter-spacing:.06em; color:var(--ink-mute); padding:16px 6px}
+  .rcard{flex:none; width:132px; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden;
+    cursor:pointer; transition:border-color .15s, box-shadow .15s; display:flex; flex-direction:column}
+  .rcard:hover{border-color:var(--line-2)}
+  .rcard.active{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent), 0 0 16px rgba(55,224,139,.28)}
+  .rthumb{position:relative; line-height:0; background:#050807}
+  .rthumb canvas{display:block; width:100%; height:auto; image-rendering:pixelated}
+  .rdot{position:absolute; right:6px; top:6px; width:9px; height:9px; border-radius:50%; background:var(--ink-mute); box-shadow:0 0 0 2px rgba(6,10,9,.65)}
+  .rdot.run{background:var(--accent); box-shadow:0 0 0 2px rgba(6,10,9,.65), 0 0 8px rgba(55,224,139,.7); animation:pulse 2s infinite}
+  .rmeta{padding:6px 8px 7px; display:flex; flex-direction:column; gap:2px}
+  .rid{font-family:var(--mono); font-size:11px; font-weight:600; letter-spacing:.01em; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .rcard.active .rid{color:var(--accent)}
+  .rsub{display:flex; justify-content:space-between; gap:6px; font-family:var(--mono); font-size:9px; letter-spacing:.03em; color:var(--ink-mute)}
+  .rsub .rmetric{color:var(--ink-dim); white-space:nowrap}
+
   @media (max-width:940px){
     .body{grid-template-columns:1fr}
     .status{border-left:none}
@@ -194,6 +219,12 @@
     </div>
     <div class="live warn" id="live-badge"><span class="dot"></span><span id="live-text">connecting…</span></div>
     <button class="stopbtn" id="stopbtn" title="request a graceful checkpoint + stop">■ STOP</button>
+  </div>
+
+  <!-- ============ RUN RAIL ============ -->
+  <div class="railbar">
+    <div class="raillbl"><span class="t">Runs</span><span class="s">click to focus</span></div>
+    <div class="rail" id="rail"><div class="rail-empty">loading system-1 runs…</div></div>
   </div>
 
   <!-- ============ BODY ============ -->
@@ -296,9 +327,12 @@ const clamp=(v,a,b)=>v<a?a:v>b?b:v;
 const $=id=>document.getElementById(id);
 const isNum=v=>typeof v==="number"&&isFinite(v);
 
-/* run id from ?run=NAME (omitted -> server picks newest) */
-const RUN=new URLSearchParams(location.search).get("run")||"";
-const liveURL=()=>"/api/live"+(RUN?"?run="+encodeURIComponent(RUN):"");
+/* active run: ?run=NAME pins it; else auto-picked from /api/brain_runs (first running, else newest).
+   null = not chosen yet -> the server serves its newest run until the rail resolves. */
+const _params=new URLSearchParams(location.search);
+let activeRun=_params.get("run")||null;
+let userPinned=!!_params.get("run");
+const liveURL=()=>"/api/live"+(activeRun?"?run="+encodeURIComponent(activeRun):"");
 
 /* ---------- grayscale b64 -> crisp canvas ---------- */
 const _off={};                     // cached offscreen canvases keyed by "wxh"
@@ -331,7 +365,7 @@ const fx=(v,d)=>v.toFixed(d);
 
 /* ---------- header status ---------- */
 function renderHeader(p){
-  setTxt($("s-run"), p.run_id!=null?p.run_id:(RUN||"newest"));
+  setTxt($("s-run"), p.run_id!=null?p.run_id:(activeRun||"newest"));
   if(isNum(p.iter)) setTxt($("s-iter"), p.iter.toLocaleString());
   if(p.phase){
     const el=$("s-phase"); el.textContent=p.phase;
@@ -483,6 +517,96 @@ function renderSwarm(sw){
   setTxt($("swarm-count"), sw.length+" envs");
 }
 
+/* ---------- RUN RAIL ---------- */
+const railEl=$("rail");
+const railCard={};       // id -> {card,dot,iter,metric}
+const railCanvas={};     // id -> thumbnail canvas
+const thumbLast={};      // id -> ms of last thumbnail fetch (for staggering)
+
+function pickDefault(list){ const run=list.find(r=>r.running); return (run||list[0]).id; }
+function onRuns(list){
+  if(activeRun==null && list.length){                 // no ?run= and nothing chosen yet
+    activeRun=pickDefault(list);
+  }else if(!userPinned && list.length && !list.some(r=>r.id===activeRun)){
+    activeRun=pickDefault(list);                       // auto-active run vanished -> re-pick
+  }
+  renderRail(list);
+  highlightCards();
+}
+function renderRail(list){
+  const empty=railEl.querySelector(".rail-empty"); if(list.length&&empty) empty.remove();
+  const seen={};
+  list.forEach(function(r){
+    seen[r.id]=1;
+    let h=railCard[r.id];
+    if(!h){
+      const c=document.createElement("div"); c.className="rcard"; c.setAttribute("data-run",r.id);
+      const thumb=document.createElement("div"); thumb.className="rthumb";
+      const cv=document.createElement("canvas"); cv.width=96; cv.height=86;
+      const dot=document.createElement("span"); dot.className="rdot";
+      thumb.appendChild(cv); thumb.appendChild(dot);
+      const meta=document.createElement("div"); meta.className="rmeta";
+      const rid=document.createElement("div"); rid.className="rid"; rid.textContent=r.id; rid.title=r.id;
+      const sub=document.createElement("div"); sub.className="rsub";
+      const it=document.createElement("span"); it.className="riter";
+      const mt=document.createElement("span"); mt.className="rmetric";
+      sub.appendChild(it); sub.appendChild(mt); meta.appendChild(rid); meta.appendChild(sub);
+      c.appendChild(thumb); c.appendChild(meta);
+      c.addEventListener("click", function(){ setActive(r.id,true); });
+      railEl.appendChild(c);
+      h=railCard[r.id]={card:c,dot:dot,iter:it,metric:mt}; railCanvas[r.id]=cv;
+    }
+    h.iter.textContent=isNum(r.iter)?("it "+r.iter):"it —";
+    h.metric.textContent=(isNum(r.gate_stochastic)&&r.gate_stochastic>0)?("gate "+pct(r.gate_stochastic))
+      :isNum(r.reach)?("reach "+pct(r.reach)):"—";
+    h.dot.className="rdot"+(r.running?" run":"");
+  });
+  Object.keys(railCard).forEach(function(id){
+    if(!seen[id]){ railCard[id].card.remove(); delete railCard[id]; delete railCanvas[id]; delete thumbLast[id]; }
+  });
+  if(!list.length && !railEl.querySelector(".rail-empty")){
+    const e=document.createElement("div"); e.className="rail-empty"; e.textContent="no system-1 runs yet"; railEl.appendChild(e);
+  }
+}
+function highlightCards(){
+  Object.keys(railCard).forEach(function(id){ railCard[id].card.classList.toggle("active", id===activeRun); });
+}
+function setActive(id,fromUser){
+  if(id===activeRun && !fromUser){ highlightCards(); return; }
+  activeRun=id;
+  if(fromUser){
+    userPinned=true;
+    try{ const u=new URL(location.href); u.searchParams.set("run",id); history.replaceState(null,"",u.toString()); }catch(e){}
+  }
+  highlightCards();
+  poll();   // snap the whole detail view to the new run immediately
+}
+/* thumbnails: refresh one stalest, non-active run per tick (~1.5s each, staggered) */
+async function fetchThumb(id){
+  try{
+    const r=await fetch("/api/live?run="+encodeURIComponent(id),{cache:"no-store"});
+    const p=await r.json();
+    const cv=railCanvas[id];
+    if(cv && p && p.champion && p.champion.frame_b64)
+      drawGray(cv, p.champion.frame_b64, p.champion.frame_w||160, p.champion.frame_h||144);
+  }catch(e){}
+}
+function thumbTick(){
+  const ids=Object.keys(railCanvas).filter(id=>id!==activeRun); // active stays fresh via the main poll
+  if(!ids.length) return;
+  let pick=null, oldest=Infinity;
+  ids.forEach(function(id){ const t=thumbLast[id]||0; if(t<oldest){ oldest=t; pick=id; } });
+  const now=Date.now();
+  if(pick!=null && now-(thumbLast[pick]||0)>1200){ thumbLast[pick]=now; fetchThumb(pick); }
+}
+async function pollRuns(){
+  try{
+    const r=await fetch("/api/brain_runs",{cache:"no-store"});
+    const d=await r.json();
+    onRuns(Array.isArray(d&&d.runs)?d.runs:[]);
+  }catch(e){}
+}
+
 /* ---------- connection state ---------- */
 function setLive(cls,txt){ const b=$("live-badge"); b.className="live "+cls; $("live-text").textContent=txt; }
 
@@ -496,6 +620,12 @@ function render(p){
   renderMetrics(p.metrics);
   renderHistory(p.history);
   renderSwarm(p.swarm);
+  // keep the focused run's rail thumbnail fresh from the same frame (no extra fetch)
+  const rid=activeRun||p.run_id;
+  if(rid && railCanvas[rid] && p.champion && p.champion.frame_b64){
+    drawGray(railCanvas[rid], p.champion.frame_b64, p.champion.frame_w||160, p.champion.frame_h||144);
+    thumbLast[rid]=Date.now();
+  }
 }
 
 /* ---------- poll ---------- */
@@ -514,11 +644,13 @@ async function poll(){
   }
 }
 setInterval(poll,250); poll();
+setInterval(pollRuns,2000); pollRuns();
+setInterval(thumbTick,500);
 
-/* ---------- STOP (two-click confirm) ---------- */
+/* ---------- STOP (two-click confirm) — targets the ACTIVE run ---------- */
 const stopBtn=$("stopbtn"); let armed=false, armT=null;
 stopBtn.addEventListener("click", async function(){
-  const run=RUN || (last&&last.run_id) || "";
+  const run=activeRun || (last&&last.run_id) || "";
   if(!run){ stopBtn.textContent="■ NO RUN"; return; }
   if(!armed){
     armed=true; stopBtn.classList.add("armed"); stopBtn.textContent="■ CONFIRM STOP?";
