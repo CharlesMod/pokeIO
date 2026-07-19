@@ -31,6 +31,26 @@ def test_success_recedes_frontier_failure_stalls():
     assert win.frontier < lose.frontier
 
 
+def test_report_many_recession_is_nenvs_independent():
+    """The bug that skipped the whole curriculum at 64 envs: recession must be
+    per-ITERATION (gated by the batch success rate), not per-env — else 64 envs
+    recede 64x faster than 4 and jump straight to boot in one iteration."""
+    big = BackwardCurriculum(length=657, advance_gain=8.0)
+    small = BackwardCurriculum(length=657, advance_gain=8.0)
+    f0 = big.frontier
+    big.report_many([True] * 64)    # 64 successes, one iteration
+    small.report_many([True] * 4)   # 4 successes, one iteration
+    assert (f0 - big.frontier) == pytest.approx(8.0)      # recede by rate(1.0)*gain
+    assert big.frontier == pytest.approx(small.frontier)  # n_envs-independent
+
+
+def test_report_many_recedes_by_batch_rate():
+    c = BackwardCurriculum(length=657, advance_gain=8.0)
+    f0 = c.frontier
+    c.report_many([True, True, False, False])   # 50% success this iteration
+    assert (f0 - c.frontier) == pytest.approx(4.0)  # 0.5 * 8
+
+
 def test_frontier_reaches_boot_under_sustained_success():
     c = BackwardCurriculum(length=657, advance_gain=8.0, seed=2)
     for _ in range(2000):

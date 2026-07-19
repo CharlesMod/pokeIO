@@ -53,38 +53,90 @@ class DemoTrajectory:
         self.rom_path = str(rom_path)
         self.newgame_state = str(newgame_state)
         self._blobs: dict[int, bytes] = {}
+        self._milestone_depth: int | None = None
 
     def __len__(self) -> int:
         return int(self.actions.size)
 
-    def blob_at(self, depth: int) -> bytes:
-        """Emulator save-state blob after the first ``depth`` demo actions (cached)."""
-        d = int(max(0, min(depth, len(self))))
-        if d in self._blobs:
-            return self._blobs[d]
-        from pokeio.emu.env import PokeEnv
+    def milestone_depth(self, spec=None) -> int:
+        """First demo depth at which the milestone fires (party>0 / a badge).
 
+        Replays the demo once (cached) and returns the step index where the
+        from-boot ``started`` condition first holds — the point BEFORE which the
+        curriculum has real work to do. Game-agnostic: derived from the demo, not
+        hardcoded. Starting the frontier just past this avoids wasting the first
+        iterations restoring into already-completed (post-milestone) states.
+        """
+        if self._milestone_depth is not None:
+            return self._milestone_depth
+        from pokeio.emu.env import PokeEnv
+        from pokeio.reward.from_boot import YELLOW, decode_state
+
+        spec = spec or YELLOW
         env = PokeEnv(rom_path=self.rom_path, frame_skip=24)
+        depth = len(self)
         try:
             env.reset(self.newgame_state)
-            for a in self.actions[:d]:
+            for k, a in enumerate(self.actions):
                 env.step(int(a))
-            self._blobs[d] = env.save_state()
+                d = decode_state(env.raw_wram(), spec)
+                if d["party_count"] > 0 or d["badges"] > 0:
+                    depth = k + 1
+                    break
         finally:
             env.close()
-        return self._blobs[d]
+        self._milestone_depth = int(depth)
+        return self._milestone_depth
+
+    def _clamp(self, depth) -> int:
+        return int(max(0, min(int(depth), len(self))))
 
     def capture_ladder(self, depths) -> dict[int, bytes]:
-        """Blobs for a set of depths (replays once per distinct depth, sorted)."""
-        return {int(d): self.blob_at(int(d)) for d in sorted(set(int(x) for x in depths))}
+        """Blobs for a set of depths captured in ONE demo replay (ascending order).
+
+        O(max_depth), not O(sum of depths): a rollout that restores 64 envs to 64
+        distinct depths replays the demo once, not 64 times. Uses a RAW
+        ``pyboy.save_state`` (not ``env.save_state``, whose input-flush ticks a frame
+        and would corrupt the ongoing trajectory) — the mid-trajectory snapshot keeps
+        the exact sticky-input state, which is the faithful restore point. Cached.
+        """
+        import io
+
+        want = sorted({self._clamp(d) for d in depths})
+        missing = [d for d in want if d not in self._blobs]
+        if missing:
+            from pokeio.emu.env import PokeEnv
+
+            env = PokeEnv(rom_path=self.rom_path, frame_skip=24)
+            try:
+                env.reset(self.newgame_state)
+                k = 0
+                for d in sorted(missing):
+                    while k < d:
+                        env.step(int(self.actions[k]))
+                        k += 1
+                    buf = io.BytesIO()
+                    env.pyboy.save_state(buf)  # raw: does NOT advance the emulator
+                    self._blobs[d] = buf.getvalue()
+            finally:
+                env.close()
+        return {d: self._blobs[d] for d in want}
+
+    def blob_at(self, depth: int) -> bytes:
+        """Emulator save-state blob after the first ``depth`` demo actions (cached)."""
+        d = self._clamp(depth)
+        return self.capture_ladder([d])[d]
 
     def restore_map(self, env_depths: dict[int, int]) -> dict[int, bytes]:
         """``{env_idx: depth}`` -> ``{env_idx: blob}`` for ``fleet.reset_all(restore=)``.
 
-        A depth of 0 is dropped (boot from the fleet's reset_state, no restore),
-        so a curriculum that has fully receded issues an empty restore = pure boot.
+        All depths are captured in a single replay. Depth 0 is dropped (boot from
+        the fleet's reset_state, no restore), so a fully-receded curriculum issues an
+        empty restore = pure cold boot.
         """
-        return {int(i): self.blob_at(int(d)) for i, d in env_depths.items() if int(d) > 0}
+        pos = {int(i): self._clamp(d) for i, d in env_depths.items() if self._clamp(d) > 0}
+        ladder = self.capture_ladder(pos.values())
+        return {i: ladder[d] for i, d in pos.items()}
 
 
 class BackwardCurriculum:
@@ -120,20 +172,33 @@ class BackwardCurriculum:
         raw = self._rng.normal(f, spread, size=int(n))
         return [int(np.clip(round(x), 0, self.length)) for x in raw]
 
-    def report(self, reached_goal: bool) -> None:
-        """Fold one episode outcome into the success EMA and recede the frontier."""
-        s = 1.0 if reached_goal else 0.0
-        # EMA warm-started on the first observation so early reports have weight
+    def _observe(self, ok: bool) -> None:
+        """Fold one episode outcome into the success EMA (no recession)."""
+        s = 1.0 if ok else 0.0
         self.success_ema = (
             s if self._seen == 0
             else self.ema_decay * self.success_ema + (1.0 - self.ema_decay) * s
         )
         self._seen += 1
+
+    def report(self, reached_goal: bool) -> None:
+        """Single-env report: observe + recede once by ``advance_gain * success_ema``."""
+        self._observe(bool(reached_goal))
         self.frontier = max(0.0, self.frontier - self.advance_gain * self.success_ema)
 
     def report_many(self, outcomes) -> None:
-        for ok in outcomes:
-            self.report(bool(ok))
+        """One iteration's batch of per-env outcomes: recede ONCE by the batch
+        success RATE — so the recession speed is independent of n_envs (a per-env
+        recession would make 64 envs recede 64x faster and skip the whole
+        curriculum). The EMA still absorbs every outcome (it drives the entropy
+        neuromodulation)."""
+        outs = [bool(o) for o in outcomes]
+        if not outs:
+            return
+        for ok in outs:
+            self._observe(ok)
+        batch_rate = sum(outs) / len(outs)
+        self.frontier = max(0.0, self.frontier - self.advance_gain * batch_rate)
 
     @property
     def at_boot(self) -> bool:
