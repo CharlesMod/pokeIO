@@ -82,8 +82,8 @@ class BrainTrainer:
     ``goexplore=True``. Call :meth:`train(iterations)`."""
 
     def __init__(self, fleet, *, grid: int = 12, fovea_grid: int | None = None,
-                 device="cuda:1", demo: DemoTrajectory | None = None,
-                 cfg: BrainConfig | None = None):
+                 reflex_gaze: bool = True, device="cuda:1",
+                 demo: DemoTrajectory | None = None, cfg: BrainConfig | None = None):
         self.fleet = fleet
         self.cfg = cfg or BrainConfig()
         self.device = torch.device(device)
@@ -92,6 +92,19 @@ class BrainTrainer:
         self.grid = int(grid)
         self.fovea_grid = int(fovea_grid) if fovea_grid is not None else int(grid)
         torch.manual_seed(self.cfg.seed)
+
+        # Reflex saccade (bottom-up, motion x staleness, self-calibrated): a reference
+        # encoder gives the proprio offset + reflex params; ReflexGaze turns the target
+        # (surfaced in the obs proprio by the worker encoders) into the per-step gaze
+        # delta we submit, so the SHARP fovea follows motion. None => centered fovea.
+        self._reflex = None
+        self._o_proprio = 0
+        if reflex_gaze:
+            from pokeio.emu.fleet import FovealEncoder, ReflexGaze
+            ref = FovealEncoder(1, periph_grid=grid, fovea_native_px=48,
+                                fovea_grid=self.fovea_grid, n_ram=8, reflex_gaze=True)
+            self._reflex = ReflexGaze.maybe(ref, self.n_envs)
+            self._o_proprio = int(ref.o_proprio)
 
         self.policy = ActorCritic(self.obs_dim, periph_grid=grid,
                                   fovea_grid=self.fovea_grid).to(self.device)
@@ -121,6 +134,17 @@ class BrainTrainer:
         return (out["buttons"].cpu().numpy().astype(np.int32),
                 out["logp"].cpu().numpy(), out["value"].cpu().numpy())
 
+    def _gaze(self, obs, n: int):
+        """Per-env saccade to submit: the self-calibrated REFLEX command (bottom-up,
+        toward motion x staleness, read from the obs proprio target), or zeros when
+        reflex is off (centered fovea). Learned top-down gaze (#11) blends in here."""
+        z = np.zeros(n, np.float32)
+        if self._reflex is None:
+            return z, z
+        gdx, gdy = self._reflex.blend(np.asarray(obs, np.float32), self._o_proprio,
+                                      z.copy(), z.copy())
+        return gdx.astype(np.float32), gdy.astype(np.float32)
+
     # -- one backward-robustification rollout ------------------------------
     def rollout(self) -> dict:
         cfg, N = self.cfg, self.n_envs
@@ -143,8 +167,8 @@ class BrainTrainer:
             act_buf[t] = buttons
             logp_buf[t] = logp
             val_buf[t] = value
-            zero = np.zeros(N, np.float32)
-            obs2, _keys, _dones, _cap = self.fleet.step_all(buttons, gaze_dx=zero, gaze_dy=zero)
+            gdx, gdy = self._gaze(obs, N)
+            obs2, _keys, _dones, _cap = self.fleet.step_all(buttons, gaze_dx=gdx, gaze_dy=gdy)
             rew_buf[t] = self.reward.step_many(range(N), self._wram_rows())
             obs = obs2.copy()
             reached |= np.array([self.reward.started(i) for i in range(N)])
@@ -233,8 +257,8 @@ class BrainTrainer:
         for _ in range(H):
             t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
             buttons = self.policy.act(t, greedy=greedy)["buttons"].cpu().numpy().astype(np.int32)
-            zero = np.zeros(N, np.float32)
-            obs, _k, _d, _c = self.fleet.step_all(buttons, gaze_dx=zero, gaze_dy=zero)
+            gdx, gdy = self._gaze(obs, N)
+            obs, _k, _d, _c = self.fleet.step_all(buttons, gaze_dx=gdx, gaze_dy=gdy)
             obs = obs.copy()
             self.reward.step_many(range(N), self._wram_rows())
             reached |= np.array([self.reward.started(i) for i in range(N)])

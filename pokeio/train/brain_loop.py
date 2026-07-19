@@ -35,20 +35,22 @@ _STATE = "roms/yellow_newgame.state"
 
 def build_fleet(n_envs: int, *, rom=_ROM, state=_STATE, obs_ram=8,
                 frame_skip=24, hold_frames=8, periph_grid=12,
-                fovea_native_px=48, fovea_grid=48) -> BarrierFleet:
+                fovea_native_px=48, fovea_grid=48, reflex_gaze=True) -> BarrierFleet:
     """A BarrierFleet sized to a matching FovealEncoder, with the reward WRAM
     channel + Go-Explore restore both ON (backward-robustification needs restore).
 
     ``fovea_grid=48`` = a SHARP native fovea (the 48px active region at 1 px/cell,
-    legible) vs the coarse G=12 periphery — the biomimetic acuity gradient (the old
-    fovea_grid=0 collapsed the fovea to a 12x12 blur)."""
+    legible) vs the coarse G=12 periphery — the biomimetic acuity gradient. With
+    ``reflex_gaze`` the fovea SACCADES toward motion (bottom-up, self-calibrated),
+    so the sharp active region follows the action (proprio 14->16 => obs +2)."""
     enc = FovealEncoder(n_envs, periph_grid=periph_grid,
                         fovea_native_px=fovea_native_px, fovea_grid=fovea_grid,
-                        n_ram=obs_ram)
+                        n_ram=obs_ram, reflex_gaze=reflex_gaze)
     fleet = BarrierFleet(
         n_envs, enc.dim, periph_grid, obs_ram, rom, frame_skip, hold_frames, state, {},
         wram_stride=64, goexplore=True, expose_wram=True,
         periph_grid=periph_grid, fovea_native_px=fovea_native_px, fovea_grid=fovea_grid,
+        reflex_gaze=reflex_gaze,
     )
     return fleet
 

@@ -37,7 +37,7 @@ import torch
 from pokeio.analytics.yellow import decode as decode_gamestate
 from pokeio.brain.actor_critic import ActorCritic
 from pokeio.emu.env import ACTIONS
-from pokeio.emu.fleet import FovealEncoder
+from pokeio.emu.fleet import FovealEncoder, ReflexGaze
 from pokeio.reward.from_boot import measure as measure_progress
 from pokeio.train.live import (
     LiveWriter,
@@ -63,7 +63,8 @@ class BrainShowcase:
         self.env = PokeEnv(rom_path=rom_path, frame_skip=24)
         self.reset_state = reset_state
         self.enc = FovealEncoder(1, periph_grid=grid, fovea_native_px=48,
-                                 fovea_grid=fovea_grid, n_ram=8)
+                                 fovea_grid=fovea_grid, n_ram=8, reflex_gaze=True)
+        self._reflex = ReflexGaze.maybe(self.enc, 1)  # bottom-up saccade for the showcase
         self.policy = ActorCritic(obs_dim, periph_grid=grid,
                                   fovea_grid=fovea_grid).eval()  # cpu copy, synced by the trainer
         self.greedy = bool(greedy)
@@ -90,6 +91,12 @@ class BrainShowcase:
         with self._lock:
             out = self.policy.act(torch.from_numpy(obs[None, :]).float(), greedy=self.greedy)
         self.last_action = int(out["buttons"][0])
+        # reflex saccade: steer the sharp fovea toward motion for the NEXT encode
+        # (one-step efference delay, same as the fleet). Learned gaze would blend here.
+        if self._reflex is not None:
+            z = np.zeros(1, np.float32)
+            gdx, gdy = self._reflex.blend(obs[None, :], self.enc.o_proprio, z.copy(), z.copy())
+            self.enc.update_gaze(0, float(gdx[0]), float(gdy[0]))
         self.screen, self.wram, _d, _i = self.env.step(self.last_action)
         # self-restart if wedged (a greedy policy can loop forever)
         sig = self.screen[::8, ::8].tobytes()
