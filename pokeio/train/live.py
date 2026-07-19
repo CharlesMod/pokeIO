@@ -59,15 +59,17 @@ _SW_H = 36
 # present (legacy default, keeps the dashboard working) or when a Yellow
 # manifest declares no RAM taps. A non-Yellow manifest routes taps through
 # ``ram_taps_from_manifest`` instead, so these Yellow addresses never leak.
+# Pokémon YELLOW WRAM save block = Red/Blue - 1; these are the corrected taps
+# (pixels-validated on assets/demo_pikachu — see pokeio.analytics.yellow).
 INTERESTING_RAM = [
-    0xD35E,  # current map id
-    0xD361,  # player Y tile
-    0xD362,  # player X tile
-    0xD163,  # party count
-    0xD356,  # event/flag byte
-    0xD057,  # in-battle flag
-    0xD347,  # money (low byte, BCD)
-    0xD16B,  # first party mon current HP (hi)
+    0xD35D,  # current map id
+    0xD360,  # player Y tile
+    0xD361,  # player X tile
+    0xD162,  # party count
+    0xD355,  # badges (bitfield)
+    0xD056,  # in-battle flag
+    0xD346,  # money (BCD, hi byte)
+    0xD16B,  # first party mon current HP (hi) — Yellow party-mon-1 struct $D16A+1
 ]
 
 

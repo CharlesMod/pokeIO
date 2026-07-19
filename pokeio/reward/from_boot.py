@@ -1,21 +1,22 @@
 """From-boot progress metric — scores REAL game progress from RAM game-state.
 
 The prerequisite Fable flagged as co-equal with the reward (PokeIO v2.0 task #28,
-``docs/specs/brain-architecture.md`` RED-TEAM REVISION): the old boot gauntlet
-reads ~4.4% ≈ noise, and backward-robustification / reward / QD selection all
-depend on a from-boot signal that barely exists. Optimizing against a near-zero
-metric is optimizing against noise.
+``docs/specs/brain-architecture.md`` RED-TEAM REVISION): backward-robustification /
+reward / QD selection all depend on a from-boot signal of *real* progress, not a
+proxy. Optimizing against a proxy is what failed (below).
 
 Why this and not cell-count / novelty
 -------------------------------------
-Cell-count and novelty are exactly what failed: a run can log a Go-Explore
-frontier *depth of 12402* (``runs/live1`` gen 175) while **zero** of its states
-ever held a single Pokémon — the "progress" was the exploration proxy Goodharting
-into glitch/menu state-space (verified: ``pokeio.analytics.gameprogress`` already
-warns "no agent has legitimately started the game"). This metric instead reads
-**RAM game-state milestones** that cannot be faked without competent play:
+Cell-count / novelty are exactly what Goodharted. ``runs/live1`` logged a
+Go-Explore frontier *depth of 12402* while **zero** of its states ever held a
+single Pokémon. Two things drove that: (1) novelty was measured partly on a WRAM
+byte that is a *pointer low byte* ($D35E), which ticks every step you walk — so a
+4-room walk minted ~30 distinct "maps" of pure noise; and (2) even the real
+underlying play never completed the Oak sequence to get a starter. This metric
+instead reads **RAM game-state milestones** that cannot be faked without competent
+play:
 
-  * distinct real map-IDs reached (spatial progress),
+  * distinct map-IDs reached (spatial progress, read from the REAL map byte),
   * badge count,
   * party count + summed party levels (having & training Pokémon),
   * story event-flag count.
@@ -40,28 +41,34 @@ Interface (the seam #29 eval-spine / #30 reward / #31 replay call)
 "badges": int, "party_level": int, "party_count": int, "events": int, ...}`` and
 ``progress_scalar(env_or_rollout, spec=YELLOW) -> float`` for just the composite.
 
-Yellow RAM addresses (source & cross-check)
--------------------------------------------
-The addresses below match the verified table in
-:mod:`pokeio.analytics.yellow` (map/party/badges/money are validated against real
-game states there) and the Gen-1 RAM map (datacrystal Pokémon Red/Blue; Yellow
-shares this WRAM control block — confirmed on this ROM: map ``$D35E``, party count
-``$D163``, party-mon level ``$D18C`` stride ``$2C``, badges ``$D356``, money
-``$D347``). Event flags ``$D747..$D87F`` are the standard Gen-1 ``wEventFlags``
-array; see the CAVEAT in :data:`YELLOW`.
+Yellow RAM addresses (VERIFIED against pixels — the mandatory protocol)
+----------------------------------------------------------------------
+Pokémon **Yellow's** WRAM save block is shifted **-1 vs Red/Blue**; the repo
+historically used the Red/Blue addresses and every semantic tap read its neighbour
+byte (the "-20 map shift", "glitch map 245/253", and the party-count-reads-84 bugs
+were all this one root cause). The table below is the corrected Yellow map, pinned
+by replaying the first-milestone demonstration (``assets/demo_pikachu``, 657 actions
+newgame->Pikachu) and reading RAM *while watching the pixels* — the permanent
+eyes-on-pixels rule now in the eval spine (no RAM tap feeds a metric until it
+agrees with the screen on a ground-truth transition):
+
+    map id      $D35D   (newgame bedroom=38; walks 38->37->0->40 = bedroom->1F->
+                         Pallet->Oak's lab; NO $F0+ sentinels ever appear)
+    party count $D162   (0 at newgame, 1 after the starter)
+    species[0]  $D163   (84 = Pikachu's Gen-1 internal id; = the old party-count tap)
+    mon1 level  $D18B   (stride $2C x6)
+    badges      $D355   (popcount)
+    money       $D346   (3-byte BCD; reads 003000 at newgame)
+    events      $D746..$D87E  (wEventFlags popcount; 0 at newgame, 5 at the starter)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
 WRAM_BASE = 0xC000
-# Map-id bytes >= this are loader/transition sentinels ($F0-$FF), emitted mid-warp
-# — NOT real maps. Counting them would let menu/door-thrashing inflate the score
-# (pokeio.analytics.gameprogress drops the same range for the frontier histogram).
-SENTINEL_MIN = 0xF0
 
 
 # --------------------------------------------------------------------------- spec
@@ -89,18 +96,8 @@ class GameProgressSpec:
     event_regions: tuple[tuple[int, int], ...] = ()   # inclusive (start,end) byte ranges
     # --- generic (2nd-game) progress counters the miner flagged: (addr, width) ---
     progress_counters: tuple[tuple[int, int], ...] = ()
-    sentinel_min: int = SENTINEL_MIN
-    # Cap on the distinct-map term (None => uncapped). Raw distinct-map-byte count
-    # is a WEAK signal: glitch/menu state-space thrashing collides with real map
-    # ids (e.g. runs/live1 shows 30 distinct non-sentinel map-bytes at party=0,
-    # though you cannot legitimately leave Pallet without a Pokémon). Capping keeps
-    # map-thrash bounded well below a single milestone so it cannot fake progress;
-    # once you truly explore widely, party/level/badges dominate anyway. ~= the
-    # count of maps legitimately reachable before the first Pokémon (bedroom, 1F,
-    # Pallet, rival's house, Oak's lab).
-    map_cap: int | None = 6
     # --- composite weights (progress "points") ---
-    w_map: float = 1.0     # each distinct real map beyond the spawn map (capped)
+    w_map: float = 1.0     # each distinct map beyond the spawn map
     w_party: float = 5.0   # each Pokémon in the party (requires reaching Oak)
     w_level: float = 1.0   # each summed party level
     w_badge: float = 50.0  # each gym badge (a major, multi-hour milestone)
@@ -109,31 +106,23 @@ class GameProgressSpec:
     notes: str = ""
 
 
-# Verified Pokémon YELLOW spec. Addresses cross-checked against
-# pokeio.analytics.yellow (validated on this ROM) + the Gen-1 RAM map.
-#
-# EVENT-FLAG CAVEAT: $D747..$D87F is the standard Gen-1 ``wEventFlags`` array.
-# WRAM layout (unlike the map-id *enumeration*, which this ROM revision shifts by
-# -20 on interiors) is stable across Gen-1 revisions, and the region reads a clean
-# 0 at newgame — consistent with the new-game routine zeroing the event array
-# (uninitialised RAM here would be nonzero garbage, as the money bytes are). That
-# is strong-but-not-proof evidence it is the right region on THIS ROM: no reached
-# story event was available to exercise it (no policy/script in-repo starts the
-# game). Treated as a *soft* signal (low weight); the load-bearing discriminators
-# are party / badges / levels / maps.
+# Verified Pokémon YELLOW spec (see module docstring: pixels-validated, Yellow's
+# save block is Red/Blue - 1). Event flags fire on real progress (verified: 0 at
+# newgame, first flag by step ~47 of the demo, 5 at the starter) — they are a
+# load-bearing signal now, not the soft/unverified guess the old R/B tap forced.
 YELLOW = GameProgressSpec(
     name="Pokemon Yellow",
-    map_addr=0xD35E,
-    party_count_addr=0xD163,
-    party_level_addr=0xD18C,
+    map_addr=0xD35D,
+    party_count_addr=0xD162,
+    party_level_addr=0xD18B,
     party_stride=0x2C,
     party_max=6,
     party_uninit=(0xFF,),
-    badge_addr=0xD356,
+    badge_addr=0xD355,
     badge_bits=8,
-    money_addr=0xD347,
-    event_regions=((0xD747, 0xD87F),),
-    notes="event flags soft/unverified-on-reached-event; see module CAVEAT",
+    money_addr=0xD346,
+    event_regions=((0xD746, 0xD87E),),
+    notes="Yellow WRAM save block = Red/Blue - 1; taps pixel-validated on assets/demo_pikachu",
 )
 
 
@@ -196,7 +185,6 @@ def decode_state(wram: np.ndarray, spec: GameProgressSpec = YELLOW) -> dict:
     badge_ct = bin(badges).count("1") if spec.badge_addr is not None else 0
     return {
         "map_id": mid,
-        "real_map": mid < spec.sentinel_min,
         "party_count": pc,
         "party_level": lvl,
         "badges": badge_ct,
@@ -210,11 +198,14 @@ def decode_state(wram: np.ndarray, spec: GameProgressSpec = YELLOW) -> dict:
 # ------------------------------------------------------------------- composition
 def _compose(spec: GameProgressSpec, *, maps: int, party_count: int,
              party_level: int, badges: int, events: int, counter_sum: int) -> float:
-    """Weighted 'progress points'. maps counts distinct real maps beyond spawn,
-    capped by ``spec.map_cap`` so glitch/menu map-thrash cannot inflate the score."""
+    """Weighted 'progress points'. ``maps`` counts distinct map-IDs beyond spawn.
+
+    No cap: the map byte ($D35D) is the REAL current-map id, so distinct maps are
+    genuine spatial progress (the old cap fought the pointer-byte noise from the
+    wrong tap — see the module docstring — which no longer exists). Party / badges
+    / events dominate the composite anyway.
+    """
     maps_beyond = max(0, maps - 1)
-    if spec.map_cap is not None:
-        maps_beyond = min(maps_beyond, spec.map_cap)
     return float(
         spec.w_map * maps_beyond
         + spec.w_party * party_count
@@ -261,8 +252,8 @@ def measure(env_or_rollout, spec: GameProgressSpec = YELLOW) -> dict:
     every step's ``PokeEnv.raw_wram()``), or a single env / snapshot for the
     current state. Monotone milestones (party/level/badges/events/counters) take
     their **max over the rollout** (progress reached counts even if later lost,
-    e.g. a faint); ``maps`` is the count of **distinct real (non-sentinel) map-IDs**
-    seen across the whole rollout.
+    e.g. a faint); ``maps`` is the count of **distinct map-IDs** seen across the
+    whole rollout.
 
     Deterministic (same snapshots -> same score). Reads RAM only. NEVER feed the
     result to the agent as an observation input — it is a reward/eval signal.
@@ -275,15 +266,14 @@ def measure(env_or_rollout, spec: GameProgressSpec = YELLOW) -> dict:
     if not snaps:
         return _empty(spec)
 
-    real_maps: set[int] = set()
+    maps_seen: set[int] = set()
     party_count = party_level = badges = events = counter_sum = 0
     money = None
     last_mid = 0
     for w in snaps:
         d = decode_state(w, spec)
         last_mid = d["map_id"]
-        if d["real_map"]:
-            real_maps.add(d["map_id"])
+        maps_seen.add(d["map_id"])
         # max over the rollout for the monotone-ish milestone signals
         if d["party_count"] > party_count:
             party_count = d["party_count"]
@@ -298,7 +288,7 @@ def measure(env_or_rollout, spec: GameProgressSpec = YELLOW) -> dict:
         if d["money"] is not None:
             money = d["money"]
 
-    maps = len(real_maps)
+    maps = len(maps_seen)
     score = _compose(
         spec, maps=maps, party_count=party_count, party_level=party_level,
         badges=badges, events=events, counter_sum=counter_sum,
@@ -347,6 +337,6 @@ def generic_spec(name: str, map_addr: int, progress_counters, **weights) -> Game
 
 
 __all__ = [
-    "GameProgressSpec", "YELLOW", "SENTINEL_MIN",
+    "GameProgressSpec", "YELLOW",
     "measure", "progress_scalar", "decode_state", "generic_spec",
 ]

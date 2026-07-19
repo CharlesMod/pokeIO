@@ -5,10 +5,12 @@ index 0) into a human-readable :class:`GameState`. This is deliberately
 game-specific — it exists so WE can see how far into Pokémon the swarm has
 gotten. It never feeds the reward stack (which stays game-agnostic).
 
-Addresses are Pokémon YELLOW-specific (pret/pokeyellow); Yellow shifts a few
-vs Red/Blue. Every field is validated against real game states before being
-trusted — unverified/uninitialised reads surface as ``None`` rather than
-garbage. See MAP_NAMES / _ADDR below for the source-of-truth table.
+Addresses are Pokémon YELLOW-specific (pret/pokeyellow): Yellow's WRAM save
+block is shifted **-1 vs Red/Blue**, so every semantic tap is one byte below
+its R/B address. Every field is pixel-validated against real game states (the
+newgame->Pikachu demo) — the mandatory eyes-on-pixels rule — and
+unverified/uninitialised reads surface as ``None`` rather than garbage. See
+MAP_NAMES / _ADDR below for the source-of-truth table.
 
 QUARANTINE: the hardcoded Yellow tables (``_ADDR``, ``MAP_NAMES``,
 ``BADGE_NAMES``) are the game-specific fallback. When a Progress Manifest is
@@ -33,26 +35,28 @@ def _b(wram: np.ndarray, addr: int) -> int:
     return int(wram[i]) if 0 <= i < wram.size else 0
 
 
-# --- verified Yellow WRAM addresses (filled/confirmed from pokeyellow) -------
-# map id byte is confirmed working (env.py taps it and map transitions track).
+# --- verified Yellow WRAM addresses (pixels-validated on assets/demo_pikachu) ----
+# Pokémon YELLOW's WRAM save block is shifted -1 vs Red/Blue; these are the
+# corrected Yellow taps (the repo previously used the R/B addresses, one byte
+# high, which read neighbouring bytes — e.g. $D35E is the tile-view pointer low
+# byte, the source of the phantom "glitch map 245/253" / "-20 offset" readings).
+# Pinned by replaying the newgame->Pikachu demo and reading RAM against the screen.
 _ADDR = {
-    "map_id": 0xD35E,
-    "pos_y": 0xD361,
-    "pos_x": 0xD362,
-    "party_count": 0xD163,   # 0xFF/uninit → None
-    "badges": 0xD356,        # bitfield; verify Yellow bit→badge order
-    "money": 0xD347,         # 3-byte BCD (D347..D349)
-    "in_battle": 0xD057,
+    "map_id": 0xD35D,        # newgame bedroom=38; 38→37→0→40 to Oak's lab
+    "pos_y": 0xD360,
+    "pos_x": 0xD361,
+    "party_count": 0xD162,   # 0 at newgame, 1 after the starter; 0xFF/uninit → None
+    "badges": 0xD355,        # bitfield (popcount)
+    "money": 0xD346,         # 3-byte BCD (D346..D348); reads 003000 at newgame
+    "in_battle": 0xD056,
 }
 
-# Map id → human name (decimal id = byte $D35E). From pret/pokeyellow
-# constants/map_constants.asm.
-# CALIBRATION CAVEAT: this project's ROM/state reads the starting bedroom as
-# map 18 and walks 18→17 going downstairs, whereas pokeyellow master documents
-# 38→37 — a consistent offset, so this ROM is a different revision and the
-# NAMES below may be misaligned. Trust the numeric ids and the RAM invariants
-# (party/money/badges) over the names until the table is empirically calibrated
-# by navigating this ROM to known landmarks. Unknown ids render as "map $NN".
+# Map id → human name (decimal id = byte $D35D). From pret/pokeyellow
+# constants/map_constants.asm — VALIDATED: fed the correct byte, the newgame
+# bedroom reads 38 ("Player's bedroom (2F)") and the demo walks 38→37→0→40, each
+# naming correctly. (The old "-20 offset, names may be misaligned" caveat was an
+# artifact of reading the wrong byte $D35E, which is a pointer low byte: 38-20=18.)
+# Unknown ids render as "map $NN".
 MAP_NAMES: dict[int, str] = {
     0: "Pallet Town", 1: "Viridian City", 2: "Pewter City",
     3: "Cerulean City", 4: "Lavender Town", 5: "Vermilion City",

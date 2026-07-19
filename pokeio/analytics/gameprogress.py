@@ -61,12 +61,12 @@ def checkpoint_progress_summary(run_dir: str | Path, top: int = 60) -> str | Non
     if not states:
         return None
 
-    # Go-Explore captures include mid-transition frames whose map byte is a
-    # loader sentinel ($F0-$FF); drop them from the "where is the frontier"
-    # view so the histogram shows real locations, not transition noise.
-    real = [(d, gs) for d, gs in states if gs.map_id < 0xF0]
-    deepest_depth, deepest = (real or states)[0]
-    map_hist = Counter(gs.map_name for _, gs in (real or states))
+    # The corrected map tap ($D35D — Yellow save block = R/B - 1) reads the REAL
+    # current map, so there is no pointer-byte noise to filter (the old $F0+
+    # "sentinel" drop was an artifact of the wrong byte, and would wrongly discard
+    # real high-id endgame maps — the Elite Four rooms are 245/246/247).
+    deepest_depth, deepest = states[0]
+    map_hist = Counter(gs.map_name for _, gs in states)
     # furthest-progress signals across the sampled frontier
     max_party = max((gs.party_count or 0 for _, gs in states), default=0)
     max_badges = max((gs.badge_count or 0 for _, gs in states), default=0)
@@ -75,10 +75,10 @@ def checkpoint_progress_summary(run_dir: str | Path, top: int = 60) -> str | Non
 
     all_states = [gs for _, gs in states]
     ms = furthest_milestone(all_states)
-    # "legit progression" tell: money leaves its uninitialised newgame value
-    # (¥300081 here) and party>0 only after a real game start. If no sampled
-    # state shows either, the frontier is exploring glitch/menu/transition
-    # state-space, not real playthrough — flag it so depth isn't misread.
+    # "real game start" tell: party>0 only after completing the Oak sequence to
+    # get the starter. If no sampled state has a party, the frontier has explored
+    # (real maps: bedroom/house/Pallet/…) but never obtained a Pokémon — flag it
+    # so raw archive depth isn't misread as game progress.
     legit = any((gs.party_count or 0) > 0 for gs in all_states)
 
     lines = ["GAME PROGRESS  (decoded from the frontier states)"]
@@ -86,10 +86,10 @@ def checkpoint_progress_summary(run_dir: str | Path, top: int = 60) -> str | Non
         lines.append(f"  furthest milestone  [{ms.index + 1}/{ladder_size()}] "
                      f"{ms.label}")
     elif not legit:
-        lines.append("  furthest milestone  none yet — no agent has legitimately "
-                     "started the game")
-        lines.append("                      (deep chains are in glitch/menu "
-                     "state-space; money still at the newgame value, party empty)")
+        lines.append("  furthest milestone  none yet — no sampled state has a "
+                     "Pokémon (never got the starter)")
+        lines.append("                      (frontier reached real maps but the "
+                     "Oak sequence was never completed; party empty)")
     lines.append(f"  deepest chain     depth {deepest_depth} → {deepest.one_line()}")
     top_maps = ", ".join(
         f"{name}×{cnt}" for name, cnt in map_hist.most_common(6)

@@ -340,7 +340,7 @@ def test_ram_addresses_none_and_screen_only():
 # --------------------------------------------------------------------------- #
 def _wram_oaks_lab():
     a = np.zeros(0x2000, dtype=np.uint8)
-    a[0xD35E - 0xC000] = 40  # map id 40 == "Oak's Lab" in the Yellow table
+    a[0xD35D - 0xC000] = 40  # map id 40 == "Oak's Lab" (Yellow map tap = R/B - 1)
     return a
 
 

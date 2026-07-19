@@ -20,7 +20,8 @@ from pokeio.analytics.yellow import GameState, game_is_yellow
 
 # (order index, label, predicate) — predicate is over a decoded GameState.
 # Ordered by natural playthrough progression; "reached" = any frontier state
-# satisfies it. Map-id checks are exact; badge checks test the $D356 bit.
+# satisfies it. Map-id checks are exact (map tap $D35D, decoded by yellow.py);
+# badge checks test the decoded GameState.badges bits (from $D355).
 _LADDER = [
     ("In the bedroom", lambda s: s.map_id == 38),
     ("Left the bedroom", lambda s: s.map_id == 37),

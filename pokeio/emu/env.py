@@ -48,7 +48,7 @@ _TAP_GAP = 2
 # WRAM working block exposed for the (future) RAM miner: 0xC000-0xDFFF inclusive.
 WRAM_START = 0xC000
 WRAM_END = 0xE000  # exclusive; 0xE000 - 0xC000 == 8192 bytes
-MAP_ID_ADDR = 0xD35E  # current map id (Pokemon Yellow); handy for state docs
+MAP_ID_ADDR = 0xD35D  # current map id (Pokemon Yellow; save block = R/B - 1)
 
 
 class PokeEnv:
