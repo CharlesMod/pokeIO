@@ -133,10 +133,23 @@
 
   /* ---------------- swarm ---------------- */
   .swarm-grid{display:grid; gap:6px; grid-template-columns:repeat(auto-fill,minmax(66px,1fr))}
-  .cell{position:relative; background:#050807; border-radius:4px; overflow:hidden; border:1px solid #0c1211; aspect-ratio:40/36}
+  .cell{position:relative; background:#050807; border-radius:4px; overflow:hidden; border:1px solid #0c1211; aspect-ratio:40/36;
+    cursor:pointer; transition:border-color .12s, box-shadow .12s}
+  .cell:hover{border-color:var(--line-2)}
+  .cell.foc{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent), 0 0 12px rgba(55,224,139,.42)}
   .cell canvas{display:block; width:100%; height:100%; image-rendering:pixelated}
   .cell .id{position:absolute; left:3px; top:2px; font-family:var(--mono); font-size:7.5px; color:rgba(55,224,139,.6); font-variant-numeric:tabular-nums}
+  .cell.foc .id{color:var(--accent)}
   .swarm-empty{font-family:var(--mono); font-size:11px; color:var(--ink-mute); letter-spacing:.06em; padding:20px 4px; text-align:center}
+
+  /* focus (swarm-agent) indicators in the hero header */
+  .focus-badge{font-family:var(--mono); font-size:9.5px; letter-spacing:.06em; color:var(--accent); text-transform:uppercase; white-space:nowrap;
+    background:rgba(55,224,139,.1); border:1px solid rgba(55,224,139,.35); border-radius:20px; padding:2px 9px}
+  .focus-badge b{color:#8bf3bf; font-weight:700}
+  .champbtn{flex:none; font-family:var(--mono); font-size:9px; letter-spacing:.12em; text-transform:uppercase; color:var(--cyan);
+    background:none; border:1px solid rgba(51,186,214,.4); border-radius:20px; padding:3px 10px; cursor:pointer}
+  .champbtn:hover{color:#5cd0ea; border-color:#5cd0ea; box-shadow:0 0 8px rgba(51,186,214,.3)}
+  #hero-lbl.focused{color:var(--accent)}
 
   /* ---------------- metrics ---------------- */
   .frontier{margin-bottom:15px}
@@ -233,7 +246,9 @@
     <div class="col">
       <div class="panel">
         <header>
-          <span class="lbl">Champion</span>
+          <span class="lbl" id="hero-lbl">Champion</span>
+          <span class="focus-badge" id="focus-badge" style="display:none">▣ agent #<b id="focus-num">—</b> — training env · live</span>
+          <button class="champbtn" id="to-champ" style="display:none" title="return to the champion showcase">◄ champion</button>
           <span class="idx" id="champ-map">— · from cold boot</span>
           <span class="r" id="champ-action">action —</span>
         </header>
@@ -383,7 +398,7 @@ function renderGate(m){
 
 /* ---------- champion ---------- */
 const padBtns=Array.prototype.slice.call(document.querySelectorAll("#pad .btn"));
-function renderChampion(c){
+function renderChampion(c,focused){
   if(!c) return;
   drawGray($("frame"), c.frame_b64, c.frame_w||160, c.frame_h||144);
   drawGaze(c.gaze);
@@ -402,7 +417,7 @@ function renderChampion(c){
   if(isNum(c.map_id)) setTxt($("mapid"), "#"+c.map_id);
 
   if(isNum(c.action)) setTxt($("champ-action"), "action "+c.action+" · "+ACT[c.action]);
-  if(c.map!=null) setTxt($("champ-map"), (c.map||"—")+" · from cold boot");
+  if(c.map!=null) setTxt($("champ-map"), (c.map||"—")+(focused?" · training env":" · from cold boot"));
 
   if(Array.isArray(c.buttons)){
     padBtns.forEach(b=>{ const i=+b.getAttribute("data-b"); b.classList.toggle("on", c.buttons[i]===1); });
@@ -442,6 +457,12 @@ function renderProgress(pg){
   if(isNum(pg.badges)) setTxt($("pg-badges"), pg.badges);
   if(isNum(pg.maps)) setTxt($("pg-maps"), pg.maps);
   if(isNum(pg.phi)) setTxt($("pg-phi"), fx(pg.phi,1));
+}
+function updateHeroMode(idx){
+  const on=idx>=0;
+  const lbl=$("hero-lbl"); lbl.textContent=on?"Focus":"Champion"; lbl.classList.toggle("focused",on);
+  const fb=$("focus-badge"); fb.style.display=on?"":"none"; if(on) setTxt($("focus-num"), idx);
+  $("to-champ").style.display=on?"":"none";
 }
 
 /* ---------- metrics ---------- */
@@ -486,12 +507,43 @@ function renderHistory(h){
   spark($("sp-ent"), h.entropy, null, $("sp-ent-v"), v=>v.toFixed(2));
 }
 
-/* ---------- swarm ---------- */
+/* ---------- swarm + focus-agent selection ---------- */
 const swarmEl=$("swarm"); const swarmCanvas={};   // id -> canvas
-function renderSwarm(sw){
+const swarmCell={};                                // id -> cell element
+let optimisticFocus=null;   // last user intent (idx, or -1 = champion); null = defer to server
+
+/* reconcile the user's optimistic intent with the server's authoritative focus_idx */
+function focusDisplay(serverIdx){
+  let disp=(isNum(serverIdx)&&serverIdx>=0)?serverIdx:-1;
+  if(optimisticFocus!==null){
+    const matched=(optimisticFocus<0 && disp<0)||(optimisticFocus===disp);
+    if(matched) optimisticFocus=null; else disp=optimisticFocus;
+  }
+  return disp;
+}
+function highlightFocusTile(disp){
+  Object.keys(swarmCell).forEach(function(id){ swarmCell[id].classList.toggle("foc", (+id)===disp); });
+}
+function applyFocusHighlight(){
+  const serverIdx=(last&&isNum(last.focus_idx))?last.focus_idx:-1;
+  highlightFocusTile(focusDisplay(serverIdx));
+}
+function selectAgent(idx){
+  const run=activeRun||(last&&last.run_id); if(!run) return;
+  optimisticFocus=idx; applyFocusHighlight();           // optimistic — server confirms within ~1 poll
+  try{ fetch("/api/select?run="+encodeURIComponent(run)+"&idx="+idx,{cache:"no-store"}); }catch(e){}
+}
+function returnToChampion(){
+  const run=activeRun||(last&&last.run_id); if(!run) return;
+  optimisticFocus=-1; applyFocusHighlight();
+  try{ fetch("/api/select?run="+encodeURIComponent(run)+"&idx=-1",{cache:"no-store"}); }catch(e){}
+}
+function renderSwarm(sw, serverFocusIdx){
   if(!Array.isArray(sw)) return;
   if(!sw.length){
     if(!swarmEl.querySelector(".swarm-empty")) swarmEl.innerHTML='<div class="swarm-empty">no training-env frames</div>';
+    for(const id in swarmCanvas) delete swarmCanvas[id];
+    for(const id in swarmCell) delete swarmCell[id];
     setTxt($("swarm-count"),"0 envs");
     return;
   }
@@ -502,19 +554,22 @@ function renderSwarm(sw){
     seen[id]=1;
     let cv=swarmCanvas[id];
     if(!cv){
-      const cell=document.createElement("div"); cell.className="cell";
+      const cell=document.createElement("div"); cell.className="cell"; cell.title="focus training agent #"+id;
       cv=document.createElement("canvas"); cv.width=w; cv.height=h;
       const tag=document.createElement("div"); tag.className="id"; tag.textContent=id;
-      cell.appendChild(cv); cell.appendChild(tag); swarmEl.appendChild(cell);
-      swarmCanvas[id]=cv;
+      cell.appendChild(cv); cell.appendChild(tag);
+      cell.addEventListener("click", function(){ selectAgent(id); });
+      swarmEl.appendChild(cell);
+      swarmCanvas[id]=cv; swarmCell[id]=cell;
     }
     drawGray(cv, e.b64, w, h);
   });
   // drop cells no longer present
   Object.keys(swarmCanvas).forEach(function(id){
-    if(!seen[id]){ const cv=swarmCanvas[id]; if(cv&&cv.parentNode) cv.parentNode.remove(); delete swarmCanvas[id]; }
+    if(!seen[id]){ const c=swarmCell[id]; if(c&&c.parentNode) c.parentNode.remove(); delete swarmCanvas[id]; delete swarmCell[id]; }
   });
   setTxt($("swarm-count"), sw.length+" envs");
+  highlightFocusTile(focusDisplay(serverFocusIdx));
 }
 
 /* ---------- RUN RAIL ---------- */
@@ -577,6 +632,9 @@ function setActive(id,fromUser){
   if(fromUser){
     userPinned=true;
     try{ const u=new URL(location.href); u.searchParams.set("run",id); history.replaceState(null,"",u.toString()); }catch(e){}
+    // focus is per-run (select.json) — start the newly-focused run on its champion
+    optimisticFocus=-1;
+    try{ fetch("/api/select?run="+encodeURIComponent(id)+"&idx=-1",{cache:"no-store"}); }catch(e){}
   }
   highlightCards();
   poll();   // snap the whole detail view to the new run immediately
@@ -616,10 +674,14 @@ function render(p){
   last=p;
   renderHeader(p);
   renderGate(p.metrics);
-  renderChampion(p.champion);
+  // hero source: a focused training-agent (focus_idx>=0 + focus{}) overrides the champion showcase
+  const fIdx=isNum(p.focus_idx)?p.focus_idx:-1;
+  const focused=fIdx>=0 && p.focus;
+  renderChampion(focused?p.focus:p.champion, !!focused);
+  updateHeroMode(focused?fIdx:-1);
   renderMetrics(p.metrics);
   renderHistory(p.history);
-  renderSwarm(p.swarm);
+  renderSwarm(p.swarm, fIdx);
   // keep the focused run's rail thumbnail fresh from the same frame (no extra fetch)
   const rid=activeRun||p.run_id;
   if(rid && railCanvas[rid] && p.champion && p.champion.frame_b64){
@@ -646,6 +708,9 @@ async function poll(){
 setInterval(poll,250); poll();
 setInterval(pollRuns,2000); pollRuns();
 setInterval(thumbTick,500);
+
+/* ---------- return-to-champion button ---------- */
+$("to-champ").addEventListener("click", returnToChampion);
 
 /* ---------- STOP (two-click confirm) — targets the ACTIVE run ---------- */
 const stopBtn=$("stopbtn"); let armed=false, armT=null;
