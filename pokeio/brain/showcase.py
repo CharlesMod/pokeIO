@@ -25,9 +25,11 @@ live.json contract (kind="system1"):
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -40,6 +42,7 @@ from pokeio.reward.from_boot import measure as measure_progress
 from pokeio.train.live import (
     LiveWriter,
     _b64_block,
+    _gaze_from_obs,
     _gaze_payload,
     _optical_blocks,
     b64_gray,
@@ -139,6 +142,9 @@ class BrainStreamer:
         self.swarm_cap = int(swarm_cap)
         self.show = BrainShowcase(rom_path, reset_state, grid=grid, obs_dim=obs_dim)
         self.writer = LiveWriter(run_dir, hz=hz)
+        self._select_path = Path(run_dir) / "select.json"   # focus-agent selection (/api/select)
+        self._sel_sig = None
+        self._sel_idx = -1
         self._metrics: dict = {}
         self._iter = 0
         self._phase = "training"
@@ -170,6 +176,63 @@ class BrainStreamer:
         except Exception:
             return []
 
+    def _read_select(self) -> int:
+        """Cheap stat of select.json (written by /api/select); return the focused
+        swarm env index, or -1 (= champion). Parses only when the file changes."""
+        try:
+            st = self._select_path.stat()
+        except OSError:
+            return -1
+        sig = (st.st_mtime_ns, st.st_size)
+        if sig != self._sel_sig:
+            try:
+                self._sel_idx = int(json.loads(self._select_path.read_bytes()).get("idx", -1))
+                self._sel_sig = sig
+            except Exception:
+                pass
+        return self._sel_idx
+
+    def _focus_payload(self, idx: int) -> dict | None:
+        """Full detail panel for a SELECTED swarm env, read from the fleet's shm
+        (its live screen + encoded percept + action + progress) — same shape as the
+        champion payload, so the hero can render the focused training agent instead."""
+        try:
+            arr = self.fleet.arr
+            if idx < 0 or idx >= int(self.fleet.n_envs):
+                return None
+            screen = np.asarray(arr["screens"][idx])
+            obs = np.asarray(arr["obs"][idx])
+            action = int(arr["actions"][idx]) if "actions" in arr else 8
+            enc = self.show.enc  # geometry-only decode of a stored obs (not per-env state)
+            blocks = _optical_blocks(obs, enc)
+            gy, gx = _gaze_from_obs(obs, enc)
+            buttons = [0] * 9
+            if 0 <= action < 9:
+                buttons[action] = 1
+            periph = np.clip(blocks["periph"], 0, 1) * 255.0
+            pay = {
+                "idx": int(idx), "frame_w": _W, "frame_h": _H,
+                "frame_b64": b64_gray(screen),
+                "obs_res": int(enc.G), "obs_b64": b64_gray(periph),
+                "fovea_res": int(enc.FG), "fovea_b64": _b64_block(blocks["fovea"]),
+                "motion_b64": _b64_block(blocks["motion"]) if "motion" in blocks else "",
+                "gaze": _gaze_payload(gy, gx, _H, _W, int(enc.F)),
+                "action": action, "buttons": buttons,
+            }
+            if "wram" in arr:
+                w = np.asarray(arr["wram"][idx])
+                m = measure_progress(w)
+                gs = decode_gamestate(w)
+                pay["map"] = gs.map_name
+                pay["map_id"] = int(gs.map_id)
+                pay["progress"] = {"phi": round(m["progress_score"], 1),
+                                   "party": m["party_count"], "level": m["party_level"],
+                                   "events": m["events"], "badges": m["badges"],
+                                   "maps": m["maps"], "started": m["started"]}
+            return pay
+        except Exception:
+            return None
+
     def _loop(self) -> None:
         while not self._stop.wait(0.03):
             if not self.writer.due():
@@ -179,10 +242,13 @@ class BrainStreamer:
                 with self._lock:
                     metrics, it, phase = dict(self._metrics), self._iter, self._phase
                     hist = {k: list(v) for k, v in self._hist.items()}
+                sel = self._read_select()
+                focus = self._focus_payload(sel) if sel is not None and sel >= 0 else None
                 payload = {
                     "kind": "system1", "run_id": self.run_id, "iter": it,
                     "phase": phase, "ts": round(time.monotonic(), 2),
                     "champion": self.show.payload(), "swarm": self._swarm(),
+                    "focus": focus, "focus_idx": (sel if focus is not None else -1),
                     "metrics": metrics, "history": hist,
                 }
                 self.writer.write(payload)
