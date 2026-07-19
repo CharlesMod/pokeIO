@@ -733,6 +733,17 @@ class FovealEncoder:
             # obs is then byte-identical to the single-saccade path).
             self._sub_ema = np.zeros(self.n_envs, np.float64)
             self._sub_seen = np.zeros(self.n_envs, np.int64)
+            # Priority-map channel weights (Step 2 scaffold).  The reflex target is a
+            # soft-argmax over a PRIORITY MAP = (Σ_k w_k · channel_k) · recency-gate +
+            # top-down.  Only the luminance-transient (motion) channel is active with
+            # weight 1.0 for now, so the map == today's motion×staleness reflex
+            # (byte-identical A/B baseline + warm-start).  Step 3 appends fixed
+            # universal channels; Step 4/5 LEARN these weights + a top-down term
+            # (Path B) — the ONLY place domain-specialization enters.  Kept on the
+            # encoder (shared across this worker's envs); a single channel's weight is
+            # scale-free through the soft-argmax, so w[0] is irrelevant until >1 exist.
+            self._channels = ("luminance_transient",)
+            self._pw = np.array([1.0], dtype=np.float64)
         # Trans-saccadic memory per-env state (§1a): the persistent scene buffer,
         # its staleness map, and the per-region divergence EMA that self-calibrates
         # invalidation.  PER-ENV is load-bearing for engine-parity — each env's
@@ -937,16 +948,12 @@ class FovealEncoder:
         A flat field (no motion) has an all-zero salience map => the soft-argmax is
         undefined, so we return the CURRENT gaze (a zero pull — the harmless
         "reflex ~ no pull" fallback, robust to any gaze position).  Zero rng,
-        per-env => engine-parity safe."""
-        sal = np.abs(motion.astype(np.float64) - 0.5)            # (G,G) motion mag
-        if self.foveal_memory:
-            # upsample motion G->M (nearest, reuse the §1a mapping) so it aligns
-            # with the M x M staleness map, then weight by staleness.  One flat
-            # np.take gather == the old sal[g2m_row][:, g2m_col] (bit-identical).
-            sal = np.take(sal, self._g2m_flat).reshape(self.M, self.M) * self._stale[i]
-            P = self.M
-        else:
-            P = self.G
+        per-env => engine-parity safe.
+
+        Step 2: the salience map is now a PRIORITY MAP (:meth:`_priority_map`) — a
+        weighted sum of universal channels, gated by recency; the soft-argmax readout
+        below is unchanged."""
+        P, sal = self._priority_map(i, motion)
         flat = sal.ravel()
         smax = float(flat.max())
         if smax <= 1e-9:  # flat / no salient change: aim at current gaze (zero pull)
@@ -961,6 +968,34 @@ class FovealEncoder:
         tgt_x = (c_star + 0.5) / P * 2.0 - 1.0
         tgt_y = (r_star + 0.5) / P * 2.0 - 1.0
         return (tgt_x, tgt_y)
+
+    def _priority_map(self, i: int, motion: np.ndarray) -> tuple[int, np.ndarray]:
+        """The reflex PRIORITY MAP for env ``i`` (Step 2 scaffold): a weighted sum of
+        universal salience channels, GATED by recency (staleness = inhibition of
+        return), plus a learned top-down term::
+
+            priority = (Σ_k w_k · channel_k) · staleness   [ + top-down (Step 5) ]
+
+        Only the luminance-transient channel (motion magnitude ``|motion-0.5|``,
+        upsampled G->M) is active with weight 1.0, so this is BYTE-IDENTICAL to the
+        prior ``motion × staleness`` reflex (``w_0=1`` and ``1.0 * x == x`` exactly).
+        Step 3 appends fixed universal channels (contrast / edge / onset / flow /
+        proto-object) with per-channel nonlinear normalization; Step 4/5 learn the
+        weights + top-down term (Path B).  Returns ``(P, priority[P,P])``.  Zero rng,
+        per-env => engine-parity safe."""
+        mot = np.abs(motion.astype(np.float64) - 0.5)            # (G,G) luminance transient
+        if self.foveal_memory:
+            P = self.M
+            # channel bank at the priority (M) resolution; each G-channel is nearest-
+            # upsampled G->M via the same §1a flat gather (bit-identical to the old
+            # sal[g2m_row][:, g2m_col]).  Σ_k w_k · channel_k — one channel for now.
+            ch_motion = np.take(mot, self._g2m_flat).reshape(P, P)
+            salience = self._pw[0] * ch_motion
+            priority = salience * self._stale[i]                 # · recency gate (IOR)
+        else:
+            P = self.G                                            # no canvas -> no gate
+            priority = self._pw[0] * mot
+        return P, priority
 
     def _calibrate_invalidation(self, i: int, chg: np.ndarray) -> np.ndarray:
         """[§1a / §11b] Self-calibrated peripheral-change invalidation for env ``i``.
