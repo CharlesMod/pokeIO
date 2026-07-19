@@ -45,7 +45,10 @@ class BrainConfig:
     lam: float = 0.95             # GAE
     clip: float = 0.2             # PPO clip
     vf_coef: float = 0.5
-    ent_coef_base: float = 0.02   # scaled by (1 - success_ema) neuromodulation
+    ent_coef_base: float = 0.02   # entropy BONUS, scaled by (1 - success_ema): explore when stalled
+    decisiveness: float = 0.01    # entropy PENALTY, scaled by success_ema: commit when winning
+                                  # (closes the greedy gap — a diffuse policy that only solves
+                                  #  stochastically; self-tuned by the EMA, no hard schedule)
     lr: float = 2.5e-4
     epochs: int = 4               # PPO epochs per rollout
     minibatches: int = 4
@@ -169,8 +172,11 @@ class BrainTrainer:
         adv = torch.as_tensor(batch["adv"], dtype=torch.float32, device=dev)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        # NE neuromodulation: explore more when the curriculum is stalled.
-        ent_coef = cfg.ent_coef_base * (1.0 - self.curriculum.success_ema)
+        # NE neuromodulation: explore when stalled (bonus), COMMIT when winning
+        # (penalty) — both self-scaled by the success EMA, so a saturated policy is
+        # pushed to be decisive (greedy-workable), not left diffuse.
+        ema = self.curriculum.success_ema
+        ent_coef = cfg.ent_coef_base * (1.0 - ema) - cfg.decisiveness * ema
         n = obs.shape[0]
         idx = np.arange(n)
         mb = max(1, n // cfg.minibatches)

@@ -52,6 +52,7 @@ DASH_DIR = Path(__file__).resolve().parent
 REPO_ROOT = DASH_DIR.parents[1]
 RUNS_DIR = REPO_ROOT / "runs"
 WALL_HTML = DASH_DIR / "wall.html"
+BRAIN_HTML = DASH_DIR / "brain_wall.html"  # System-1 (gradient-RL) dashboard
 LIVE_FILENAME = "live.json"  # real live-frame payload (frames + champion net), written ~3 Hz
 MAX_RECORDS = 200  # tail length returned to the page
 
@@ -288,6 +289,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path in ("/", "/index.html", "/wall.html"):
                 self._send(200, WALL_HTML.read_bytes(), "text/html; charset=utf-8")
+            elif path in ("/brain", "/brain.html", "/brain_wall.html"):
+                self._send(200, BRAIN_HTML.read_bytes(), "text/html; charset=utf-8")
             elif path == "/api/runs":
                 self._json(_list_runs())
             elif path == "/api/telemetry":

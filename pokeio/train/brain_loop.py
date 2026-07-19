@@ -73,6 +73,9 @@ def main(argv=None) -> None:
     ap.add_argument("--gamma", type=float, default=BrainConfig.gamma)
     ap.add_argument("--horizon-max", type=int, default=BrainConfig.horizon_max)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--dashboard", action="store_true",
+                    help="stream a live GUI feed to runs/<id>/live.json (serve with "
+                         "python -m pokeio.dash.serve --port 8600, view /brain?run=<id>)")
     args = ap.parse_args(argv)
 
     run_dir = Path("runs") / args.run_id
@@ -100,7 +103,16 @@ def main(argv=None) -> None:
           f"demo_len={len(tr.demo)} milestone_depth={md} "
           f"frontier={tr.curriculum.frontier:.0f}")
 
+    streamer = None
+    if args.dashboard:
+        from pokeio.brain.showcase import BrainStreamer
+        streamer = BrainStreamer(run_dir, fleet, rom_path=_ROM, reset_state=_STATE,
+                                 obs_dim=tr.obs_dim, run_id=args.run_id)
+        print(f"[brain] dashboard live -> runs/{args.run_id}/live.json "
+              f"(serve :8600, view /brain?run={args.run_id})")
+
     t0 = time.monotonic()
+    live_metrics: dict = {}
 
     def _log(rec: dict) -> None:
         with open(metrics_path, "a") as fh:
@@ -114,6 +126,18 @@ def main(argv=None) -> None:
                          f"greedy={e.get('gate_reached_greedy', 0.0):.2f} "
                          f"prog={e['progress_mean']:.1f} blind={e['blind_delta']:.3f}")
         print("[brain] " + " ".join(parts), flush=True)
+        if streamer is not None:
+            live_metrics.update({
+                "frontier": rec["frontier"], "frontier_frac": rec["frontier_frac"],
+                "reach": rec["reached"], "success_ema": rec["success_ema"],
+                "entropy": rec["entropy"], "reward": rec["rew_sum_mean"],
+            })
+            if "eval" in rec:
+                e = rec["eval"]
+                live_metrics.update({"gate_stochastic": e["gate_reached_frac"],
+                                     "gate_greedy": e.get("gate_reached_greedy", 0.0),
+                                     "progress_mean": e["progress_mean"]})
+            streamer.sync(tr.policy, live_metrics, rec["iter"])
         if rec["iter"] % args.checkpoint_every == 0:
             _checkpoint(ckpt_path, tr)
 
@@ -122,6 +146,8 @@ def main(argv=None) -> None:
         _checkpoint(ckpt_path, tr)
         _export_champion(run_dir, tr, args)
     finally:
+        if streamer is not None:
+            streamer.close()
         fleet.close()
     dt = time.monotonic() - t0
     print(f"[brain] done: {args.iterations} iters in {dt:.0f}s -> {ckpt_path}")
