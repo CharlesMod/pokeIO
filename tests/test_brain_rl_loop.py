@@ -127,8 +127,11 @@ def test_entropy_coef_neuromodulation_scales_with_success():
 def test_evaluate_gate_returns_report():
     tr = _trainer(milestone=3)
     rep = tr.evaluate_gate(horizon=6)
-    assert rep["gate_reached_frac"] == 1.0     # scripted to reach the milestone
+    assert rep["gate_reached_frac"] == 1.0     # HONEST gate = stochastic pass
+    assert rep["gate_reached_greedy"] == 1.0   # greedy pass reported alongside
     assert rep["progress_mean"] > 0.0
+    assert isinstance(rep["greedy_stall_maps"], dict)  # where argmax ends up
+    assert rep["greedy_stall_maps"]                    # non-empty
     for k in ("action_entropy", "action_diversity", "blind_delta", "ram_ablation_delta"):
         assert k in rep and np.isfinite(rep[k])
 

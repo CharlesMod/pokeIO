@@ -212,19 +212,17 @@ class BrainTrainer:
 
     # -- from-boot gate eval ----------------------------------------------
     @torch.no_grad()
-    def evaluate_gate(self, horizon: int | None = None) -> dict:
-        """Greedy from-boot (no restore) eval: the fraction of envs that reach the
-        first milestone (party>0), the mean progress, and the coupling probes. This
-        IS the gate measurement (#35)."""
+    def _gate_pass(self, greedy: bool, H: int) -> dict:
+        """One from-boot (no restore) eval pass; returns reached-frac, progress, the
+        final per-env map-id (for the greedy-stall diagnostic), and the last obs."""
         N = self.n_envs
-        H = int(horizon or self.cfg.eval_horizon)
-        obs = self.fleet.reset_all(restore=None).copy()   # all cold boots
+        obs = self.fleet.reset_all(restore=None).copy()
         self.reward.reset_many(range(N), self._wram_rows())
         reached = np.zeros(N, dtype=bool)
         last_obs = obs
         for _ in range(H):
             t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-            buttons = self.policy.act(t, greedy=True)["buttons"].cpu().numpy().astype(np.int32)
+            buttons = self.policy.act(t, greedy=greedy)["buttons"].cpu().numpy().astype(np.int32)
             zero = np.zeros(N, np.float32)
             obs, _k, _d, _c = self.fleet.step_all(buttons, gaze_dx=zero, gaze_dy=zero)
             obs = obs.copy()
@@ -232,12 +230,36 @@ class BrainTrainer:
             reached |= np.array([self.reward.started(i) for i in range(N)])
             last_obs = obs
         progress = np.array([self.reward.progress(i)["phi"] for i in range(N)])
-        cp = coupling_report(self.policy.numpy_policy_fn(self.device), last_obs,
+        wram = self.fleet.arr["wram"]
+        final_maps = [int(wram[i][0xD35D - 0xC000]) for i in range(N)]
+        return {"reached_frac": float(reached.mean()),
+                "progress_mean": float(progress.mean()),
+                "progress_max": float(progress.max()),
+                "final_maps": final_maps, "last_obs": last_obs}
+
+    @torch.no_grad()
+    def evaluate_gate(self, horizon: int | None = None) -> dict:
+        """From-boot (no restore) gate eval — BOTH stochastic and greedy (#35/#44).
+
+        The HONEST gate is stochastic: the policy's own sampled actions from a cold
+        boot reach party>0. Greedy (argmax) is reported alongside with a stall-map
+        histogram (where argmax ends up), because a policy that solves stochastically
+        but not greedily is capable-but-not-decisive — and the map histogram localizes
+        where the deterministic run gets stuck. Plus the permanent coupling probes.
+        """
+        from collections import Counter
+
+        H = int(horizon or self.cfg.eval_horizon)
+        greedy = self._gate_pass(greedy=True, H=H)
+        stoch = self._gate_pass(greedy=False, H=H)
+        cp = coupling_report(self.policy.numpy_policy_fn(self.device), greedy["last_obs"],
                              ram_slice=self._ram_slice)
         return {
-            "gate_reached_frac": float(reached.mean()),
-            "progress_mean": float(progress.mean()),
-            "progress_max": float(progress.max()),
+            "gate_reached_frac": stoch["reached_frac"],       # HONEST gate (stochastic)
+            "gate_reached_greedy": greedy["reached_frac"],
+            "progress_mean": stoch["progress_mean"],
+            "progress_max": stoch["progress_max"],
+            "greedy_stall_maps": dict(Counter(greedy["final_maps"]).most_common(5)),
             **cp,
         }
 

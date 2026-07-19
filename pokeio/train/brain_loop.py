@@ -91,8 +91,14 @@ def main(argv=None) -> None:
                       horizon_max=args.horizon_max, eval_every=args.eval_every,
                       seed=args.seed)
     tr = BrainTrainer(fleet, device=device, demo=DemoTrajectory(), cfg=cfg)
+    # Start the backward-robustification frontier AT the demo's milestone depth
+    # (game-agnostic: found by replaying the demo), so the run begins where real
+    # learning is — not wasting iterations restoring past an already-won milestone.
+    md = tr.demo.milestone_depth()
+    tr.curriculum.frontier = float(min(len(tr.demo), md))
     print(f"[brain] trainer ready: obs_dim={tr.obs_dim} device={device} "
-          f"demo_len={len(tr.demo)} frontier={tr.curriculum.frontier:.0f}")
+          f"demo_len={len(tr.demo)} milestone_depth={md} "
+          f"frontier={tr.curriculum.frontier:.0f}")
 
     t0 = time.monotonic()
 
@@ -104,9 +110,9 @@ def main(argv=None) -> None:
                  f"rew={rec['rew_sum_mean']:.2f}", f"ent={rec['entropy']:.2f}"]
         if "eval" in rec:
             e = rec["eval"]
-            parts.append(f"| GATE reach={e['gate_reached_frac']:.2f} "
-                         f"prog={e['progress_mean']:.1f} blind={e['blind_delta']:.3f} "
-                         f"ram={e['ram_ablation_delta']:.3f}")
+            parts.append(f"| GATE stoch={e['gate_reached_frac']:.2f} "
+                         f"greedy={e.get('gate_reached_greedy', 0.0):.2f} "
+                         f"prog={e['progress_mean']:.1f} blind={e['blind_delta']:.3f}")
         print("[brain] " + " ".join(parts), flush=True)
         if rec["iter"] % args.checkpoint_every == 0:
             _checkpoint(ckpt_path, tr)
