@@ -34,12 +34,14 @@ _STATE = "roms/yellow_newgame.state"
 
 
 CANVAS_GRID = 96  # M: trans-saccadic memory buffer side (the persisted-vision canvas)
+GB_FPS = 59.7275  # Game Boy DMG refresh — the domain's own time base for cadence
 
 
 def build_fleet(n_envs: int, *, rom=_ROM, state=_STATE, obs_ram=8,
                 frame_skip=24, hold_frames=8, periph_grid=12,
                 fovea_native_px=48, fovea_grid=0, reflex_gaze=True,
-                foveal_memory=True, mem_grid=CANVAS_GRID) -> BarrierFleet:
+                foveal_memory=True, mem_grid=CANVAS_GRID,
+                saccade_substeps: int | None = None) -> BarrierFleet:
     """A BarrierFleet sized to a matching FovealEncoder, with the reward WRAM
     channel + Go-Explore restore both ON (backward-robustification needs restore).
 
@@ -53,11 +55,21 @@ def build_fleet(n_envs: int, *, rom=_ROM, state=_STATE, obs_ram=8,
                         fovea_native_px=fovea_native_px, fovea_grid=fovea_grid,
                         n_ram=obs_ram, reflex_gaze=reflex_gaze,
                         foveal_memory=foveal_memory, mem_grid=mem_grid)
+    # Saccade cadence: DERIVE the intra-action sub-steps from (GB fps, frame_skip,
+    # actuator ceiling) so the fovea saccades at >= human rate in game-time, capped
+    # at what a real gimbal can settle (no hand-tuned frame count). Override for A/B.
+    from pokeio.emu.saccade_cadence import derive_cadence
+    cad = derive_cadence(GB_FPS, frame_skip)
+    sub_steps = cad.sub_steps if saccade_substeps is None else max(1, int(saccade_substeps))
+    print(f"[brain] saccade cadence: action={cad.action_hz:.2f}Hz  gaze={sub_steps * cad.action_hz:.2f}Hz "
+          f"(S={sub_steps}, >=human={sub_steps * cad.action_hz >= 4.0 - 1e-9}, "
+          f"actuator<= {cad.actuator_ceiling_hz:.0f}Hz)")
     fleet = BarrierFleet(
         n_envs, enc.dim, periph_grid, obs_ram, rom, frame_skip, hold_frames, state, {},
         wram_stride=64, goexplore=True, expose_wram=True,
         periph_grid=periph_grid, fovea_native_px=fovea_native_px, fovea_grid=fovea_grid,
         reflex_gaze=reflex_gaze, foveal_memory=foveal_memory, mem_grid=mem_grid,
+        sub_steps=sub_steps,
     )
     return fleet
 

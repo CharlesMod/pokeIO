@@ -43,6 +43,7 @@ import numpy as np  # noqa: E402
 import psutil  # noqa: E402
 
 from pokeio.config import Config, VisionConfig
+from pokeio.emu.saccade_cadence import chunk_frames
 from pokeio.vision.preprocess import ObsBuilder
 
 # NUMA topology of the target box (2x Xeon E5-2690 v4). Kept here so pinning is
@@ -723,6 +724,15 @@ class FovealEncoder:
             # where P = M with foveal memory on, else G).  Precomputed so the hot
             # path skips a per-encode np.arange.
             self._reflex_idx = np.arange(self.M if self.foveal_memory else self.G)
+            # Sub-saccade reflex-command EMA (per-env, GAME-level — NOT reset per
+            # episode, mirroring the parent ReflexGaze self-calibration).  Drives the
+            # intra-action sub-saccades (:meth:`substep`) so the fovea re-aims at
+            # >= human cadence WITHIN one action step: the raw pull is normalized by
+            # this EMA of its own recent magnitude -> a dimensionless velocity (no
+            # fixed pixel step, no-tuned-knobs).  Unused when sub_steps == 1 (the
+            # obs is then byte-identical to the single-saccade path).
+            self._sub_ema = np.zeros(self.n_envs, np.float64)
+            self._sub_seen = np.zeros(self.n_envs, np.int64)
         # Trans-saccadic memory per-env state (§1a): the persistent scene buffer,
         # its staleness map, and the per-region divergence EMA that self-calibrates
         # invalidation.  PER-ENV is load-bearing for engine-parity — each env's
@@ -808,6 +818,63 @@ class FovealEncoder:
             self._gy[i] = min(max(ny, self._gy_lo), self._gy_hi)
         self._nstep[i] += 1
         return float(self._gy[i]), float(self._gx[i])
+
+    # --------------------------------------------------- intra-action sub-saccades
+    _SUB_EPS = 1e-6  # pull-scale floor (guards the seed div; foveal pulls are ~O(1))
+
+    def _integrate_gaze(self, i: int, dx: float, dy: float) -> None:
+        """Integrate a saccade command into the gaze centre WITHOUT advancing the
+        action-step counter (``_nstep``) — for the intra-action sub-saccades that run
+        faster than the action rate (:meth:`substep`).  Same clamp / ``gain*tanh``
+        body as :meth:`update_gaze`; updates the efference copy so proprio reflects
+        the most recent movement.  Bumping ``_nstep`` here would corrupt the proprio
+        step-fraction (one action step must count once)."""
+        self._last_dx[i] = float(dx)
+        self._last_dy[i] = float(dy)
+        nx = self._gx[i] + self.gain * np.tanh(float(dx))
+        self._gx[i] = min(max(nx, self._gx_lo), self._gx_hi)
+        ny = self._gy[i] + self.gain * np.tanh(float(dy))
+        self._gy[i] = min(max(ny, self._gy_lo), self._gy_hi)
+
+    def _reflex_command(self, i: int, pull_x: float, pull_y: float) -> tuple[float, float]:
+        """Self-calibrated reflex saccade command for env ``i`` from the pull
+        ``(target - gaze)`` — the single-env, worker-local twin of
+        :meth:`ReflexGaze.command` (same per-env EMA normalization, so the emitted
+        command is a dimensionless velocity, no fixed pixel step — no-tuned-knobs).
+        A zero pull holds the EMA (never seeds it to ~0, which would saturate the
+        next real pull).  Zero rng, per-env => engine-parity safe."""
+        px = float(pull_x)
+        py = float(pull_y)
+        mag = float(np.hypot(px, py))
+        if mag <= self._SUB_EPS:                        # no meaningful pull: hold EMA
+            return 0.0, 0.0
+        seeded = self._sub_seen[i] > 0
+        scale = self._sub_ema[i] if seeded else mag     # unseeded -> self-scale
+        inv = self.reflex_gain / (scale + self._SUB_EPS)
+        d = self.reflex_ema_decay
+        self._sub_ema[i] = (d * self._sub_ema[i] + (1.0 - d) * mag) if seeded else mag
+        self._sub_seen[i] += 1
+        return px * inv, py * inv
+
+    def substep(self, env_idx: int, screen: np.ndarray) -> None:
+        """One intra-action sub-saccade: perceive + STAMP an intermediate frame into
+        the persisted-vision canvas, then reflex re-aim toward the fresh target —
+        WITHOUT building the obs vector or advancing ``_nstep``.
+
+        The worker calls this at every sub-chunk boundary EXCEPT the last (the last
+        chunk's perceive+stamp happens in :meth:`encode`, which also assembles the
+        obs).  So every sub-saccade lands in the canvas BEFORE the obs the policy
+        acts on is built — the action is informed by ALL of that step's glimpses, not
+        just the last (the cadence-phasing invariant).  No-op in retina mode."""
+        if self.mode == "retina":
+            return
+        i = int(env_idx)
+        self._perceive(i, screen)             # periph/motion/canvas stamp/reflex target
+        if self.reflex_gaze:
+            cx = self._gx[i] / self.W * 2.0 - 1.0
+            cy = self._gy[i] / self.H * 2.0 - 1.0
+            dx, dy = self._reflex_command(i, self._reflex_tx[i] - cx, self._reflex_ty[i] - cy)
+            self._integrate_gaze(i, dx, dy)
 
     def gaze(self, env_idx: int) -> tuple[float, float]:
         """Current ``(gy, gx)`` fovea centre for an env (for telemetry/tests)."""
@@ -1110,6 +1177,44 @@ class FovealEncoder:
         return vec
 
     # ------------------------------------------------------------------ encode
+    def _perceive(self, i: int, screen: np.ndarray):
+        """Perceive one frame for env ``i`` (foveal mode): periphery, sharp fovea
+        crop, motion, the trans-saccadic canvas stamp (:meth:`_mem_step`), and the
+        reflex target.  Shared by :meth:`encode` (final frame, then assembles the
+        obs) and :meth:`substep` (intermediate sub-saccade).  Returns
+        ``(periph, fov, motion)``; mutates the canvas + reflex-target state in place.
+
+        Motion is vs the previous PERCEIVE (``_prev_periph``), so with sub-stepping it
+        is the finer sub-chunk temporal difference — the higher-cadence saccade
+        reflex reads a fresher transient.  With ``sub_steps == 1`` this is called once
+        per step and the obs is byte-identical to the pre-sub-step path."""
+        normd = self._shade.normalize_shades_f64(screen)     # (H,W) float64 [0,1]
+        periph = (self._prow @ normd @ self._pcol).astype(np.float32)   # (G,G)
+        crop = self._crop(normd, self._gy[i], self._gx[i])             # (F,F)
+        fov = (self._frow @ crop @ self._fcol).astype(np.float32)      # (FG,FG)
+
+        prev = self._prev_periph[i]
+        if prev is None:
+            motion = np.full((self.G, self.G), 0.5, np.float32)
+        else:
+            motion = (((periph - prev) + 1.0) * 0.5).astype(np.float32)
+        self._prev_periph[i] = periph
+
+        # Trans-saccadic foveal memory (§1a): stamp the sharp fovea into the
+        # persistent scene buffer, age it, and self-calibrate peripheral-change
+        # invalidation.  Mutates _mem/_stale in place; both enter the obs.  OFF =>
+        # skipped (obs byte-identical to Increment A, o_motion_hi == o_proprio).
+        if self.foveal_memory:
+            self._mem_step(i, periph, crop)
+
+        # Reflex gaze target (§3/§4): soft-argmax of motion x staleness.  Computed
+        # AFTER _mem_step so it reads the freshly-updated staleness (a just-glimpsed
+        # region is now fresh => low salience there, orienting AWAY from what we just
+        # refreshed).  OFF => proprio stays 14-d and this is skipped.  Zero rng.
+        if self.reflex_gaze:
+            self._reflex_tx[i], self._reflex_ty[i] = self._reflex_target(i, motion)
+        return periph, fov, motion
+
     def encode(
         self,
         env_idx: int,
@@ -1134,37 +1239,7 @@ class FovealEncoder:
         i = int(env_idx)
         if self.mode == "retina":
             return self._encode_retina(i, screen, wram, button=button, taps=taps)
-        # Normalize straight to float64 (the dtype the resample matmuls + crop
-        # consume): one np.take gather instead of a float32 build + float64 copy.
-        normd = self._shade.normalize_shades_f64(screen)     # (H,W) float64 [0,1]
-
-        periph = (self._prow @ normd @ self._pcol).astype(np.float32)   # (G,G)
-        crop = self._crop(normd, self._gy[i], self._gx[i])             # (F,F)
-        fov = (self._frow @ crop @ self._fcol).astype(np.float32)      # (FG,FG)
-
-        prev = self._prev_periph[i]
-        if prev is None:
-            motion = np.full((self.G, self.G), 0.5, np.float32)
-        else:
-            motion = (((periph - prev) + 1.0) * 0.5).astype(np.float32)
-        self._prev_periph[i] = periph
-
-        # Trans-saccadic foveal memory (§1a): stamp the sharp fovea into the
-        # persistent scene buffer, age it, and self-calibrate peripheral-change
-        # invalidation.  Mutates _mem/_stale in place; both enter the obs below.
-        # OFF => this block + the buffer/staleness writes are skipped and the obs
-        # is byte-identical to Increment A (o_motion_hi == o_proprio).
-        if self.foveal_memory:
-            self._mem_step(i, periph, crop)
-
-        # Reflex gaze target (§3/§4): soft-argmax of motion x staleness -> proprio.
-        # Computed AFTER _mem_step so it reads the freshly-updated staleness (a
-        # just-glimpsed region is now fresh => low salience there, so the reflex
-        # orients AWAY from what we just refreshed).  OFF => proprio stays 14-d and
-        # this is skipped (obs byte-identical to Increment B).  Zero rng, per-env.
-        if self.reflex_gaze:
-            self._reflex_tx[i], self._reflex_ty[i] = self._reflex_target(i, motion)
-
+        periph, fov, motion = self._perceive(i, screen)
         proprio = self._proprio(i, button)
         ram = self._ram(wram)
         if self.tap_addrs and wram is not None:  # parent path: overlay from wram
@@ -1440,6 +1515,7 @@ def _barrier_worker_main(
     periph_grid, fovea_native_px, fovea_grid, saccade_gain, saccade_every_k,
     episode_steps, foveal_memory, mem_grid, mem_ema_decay, mem_stale_z,
     mem_stale_warmup, reflex_gaze, reflex_gain, reflex_ema_decay, reflex_beta,
+    sub_steps=1,
 ):
     """Worker process: owns envs ``[slice_lo:slice_hi]``; hashes + encodes locally.
 
@@ -1628,9 +1704,29 @@ def _barrier_worker_main(
                             cap_done[gi] = 1
                     else:
                         cap_done[gi] = 0
-                    screen, w64, done = env.step_fast(int(actions[gi]), wram_stride)
-                    dones[gi] = 1 if done else 0
-                    _emit(li, gi, screen, w64, int(actions[gi]))
+                    btn = int(actions[gi])
+                    if use_active and sub_steps > 1:
+                        # Intra-action sub-saccades (cadence >= human): HOLD the button
+                        # for the whole action, advance in `sub_steps` chunks, and
+                        # reflex re-aim + stamp the canvas at each boundary EXCEPT the
+                        # last (its perceive+stamp is the final encode in _emit).  So
+                        # every sub-saccade lands in the canvas BEFORE the obs the
+                        # policy acts on is built (phasing).  Dynamics-identical to
+                        # step_fast (hold + tick_frames summing to frame_skip-used);
+                        # the ACTION rate is unchanged — only the gaze loop sped up.
+                        used = env.hold(btn)
+                        chunks = chunk_frames(frame_skip - used, sub_steps)
+                        for _s in range(sub_steps):
+                            screen = env.tick_frames(chunks[_s])
+                            if _s < sub_steps - 1:
+                                encoder.substep(gi, screen)
+                        w64 = env.wram_strided(wram_stride)
+                        dones[gi] = 0
+                        _emit(li, gi, screen, w64, btn)
+                    else:
+                        screen, w64, done = env.step_fast(btn, wram_stride)
+                        dones[gi] = 1 if done else 0
+                        _emit(li, gi, screen, w64, btn)
             # signal this round complete
             for gi in range(slice_lo, slice_hi):
                 ctl[3 + gi] = local_round
@@ -1690,6 +1786,7 @@ class BarrierFleet:
         reflex_gain: float = 1.0,
         reflex_ema_decay: float = 0.99,
         reflex_beta: float = 4.0,
+        sub_steps: int = 1,
     ):
         self.n_envs = int(n_envs)
         self.obs_dim = int(obs_dim)
@@ -1699,6 +1796,7 @@ class BarrierFleet:
         # the NEAT/furnace path is byte-identical — no extra alloc/reg/read).
         self.expose_wram = bool(expose_wram)
         self.wram_stride = int(wram_stride)
+        self.sub_steps = max(1, int(sub_steps))  # intra-action saccade sub-steps (cadence)
         # Splatted (order-critical) into the worker main after the fixed args;
         # keep in sync with the _barrier_worker_main signature.
         self._foveal = (
@@ -1707,7 +1805,7 @@ class BarrierFleet:
             bool(foveal_memory), int(mem_grid), float(mem_ema_decay),
             float(mem_stale_z), int(mem_stale_warmup),
             bool(reflex_gaze), float(reflex_gain), float(reflex_ema_decay),
-            float(reflex_beta),
+            float(reflex_beta), int(self.sub_steps),
         )
 
         # Derive the fixed cell-key length from the archive's geometry.
@@ -2081,6 +2179,7 @@ def _async_worker_main(
     periph_grid, fovea_native_px, fovea_grid, saccade_gain, saccade_every_k,
     episode_steps, foveal_memory, mem_grid, mem_ema_decay, mem_stale_z,
     mem_stale_warmup, reflex_gaze, reflex_gain, reflex_ema_decay, reflex_beta,
+    sub_steps=1,
 ):
     """Free-running worker: owns envs ``[slice_lo:slice_hi]``.
 
@@ -2277,11 +2376,25 @@ def _async_worker_main(
                         else:
                             cap_len[gi] = nb
                             cap_done[gi] = 1
-                    screen, w64, done = env.step_fast(
-                        int(actions[gi]), wram_stride
-                    )
+                    btn = int(actions[gi])
+                    if use_active and sub_steps > 1:
+                        # Intra-action sub-saccades (cadence >= human): hold the button,
+                        # advance in `sub_steps` chunks, reflex re-aim + stamp at each
+                        # boundary except the last — every sub-saccade lands before the
+                        # obs the policy acts on is built (phasing). Dynamics-identical
+                        # to step_fast; action rate unchanged.
+                        used = env.hold(btn)
+                        chunks = chunk_frames(frame_skip - used, sub_steps)
+                        for _s in range(sub_steps):
+                            screen = env.tick_frames(chunks[_s])
+                            if _s < sub_steps - 1:
+                                encoder.substep(gi, screen)
+                        w64 = env.wram_strided(wram_stride)
+                        done = False
+                    else:
+                        screen, w64, done = env.step_fast(btn, wram_stride)
                     dones[gi] = 1 if done else 0
-                    _emit(gi, env, screen, w64, int(actions[gi]))
+                    _emit(gi, env, screen, w64, btn)
                     obs_seq[gi] = k + 1  # publish AFTER the payload rows
                     progressed = True
                 if progressed:
@@ -2353,6 +2466,7 @@ class AsyncFleet:
         reflex_gain: float = 1.0,
         reflex_ema_decay: float = 0.99,
         reflex_beta: float = 4.0,
+        sub_steps: int = 1,
     ):
         self.n_envs = int(n_envs)
         self.obs_dim = int(obs_dim)
@@ -2362,6 +2476,7 @@ class AsyncFleet:
         # the furnace/NEAT path is byte-identical — no extra alloc/reg/read).
         self.expose_wram = bool(expose_wram)
         self.wram_stride = int(wram_stride)
+        self.sub_steps = max(1, int(sub_steps))  # intra-action saccade sub-steps (cadence)
         # Splatted (order-critical) into the worker main after the fixed args;
         # keep in sync with the _async_worker_main signature.
         self._foveal = (
@@ -2370,7 +2485,7 @@ class AsyncFleet:
             bool(foveal_memory), int(mem_grid), float(mem_ema_decay),
             float(mem_stale_z), int(mem_stale_warmup),
             bool(reflex_gaze), float(reflex_gain), float(reflex_ema_decay),
-            float(reflex_beta),
+            float(reflex_beta), int(self.sub_steps),
         )
         self.key_len = _archive_key_len(archive_kwargs, wram_stride)
         # A5: probe the real save_state size to size the transport buffers.
