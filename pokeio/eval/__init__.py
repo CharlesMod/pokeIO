@@ -12,8 +12,13 @@ Three research-motivated controls that must stand alongside any headline claim:
 :mod:`pokeio.eval.harness` wires them to a run's checkpoint + telemetry and the
 ``scripts/eval_run.py`` CLI drives it. Fully isolated new code; dependency-light
 (numpy + torch + repo modules); ROM-guarded.
+
+:mod:`pokeio.eval.spine` (v2.0 #29) is the evaluation protocol on top of this
+harness: from-boot competence as the headline (IQM+CIs), the same controls as
+Goodhart catchers in the headline currency, a frozen-core git-diff guard, and a
+pre-registered 2nd-game hook.
 """
 
-from pokeio.eval import controls, harness, metrics
+from pokeio.eval import controls, harness, metrics, spine
 
-__all__ = ["controls", "metrics", "harness"]
+__all__ = ["controls", "metrics", "harness", "spine"]
