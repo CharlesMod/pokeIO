@@ -82,6 +82,9 @@ def main(argv=None) -> None:
     ap.add_argument("--dashboard", action="store_true",
                     help="stream a live GUI feed to runs/<id>/live.json (serve with "
                          "python -m pokeio.dash.serve --port 8600, view /brain?run=<id>)")
+    ap.add_argument("--warmstart", default=None,
+                    help="champion brain.pt to load (skip re-learning the first milestone); "
+                         "starts the curriculum AT boot to explore deeper into the game")
     args = ap.parse_args(argv)
 
     run_dir = Path("runs") / args.run_id
@@ -100,14 +103,22 @@ def main(argv=None) -> None:
                       horizon_max=args.horizon_max, eval_every=args.eval_every,
                       seed=args.seed)
     tr = BrainTrainer(fleet, device=device, fovea_grid=48, demo=DemoTrajectory(), cfg=cfg)
-    # Start the backward-robustification frontier AT the demo's milestone depth
-    # (game-agnostic: found by replaying the demo), so the run begins where real
-    # learning is — not wasting iterations restoring past an already-won milestone.
-    md = tr.demo.milestone_depth()
-    tr.curriculum.frontier = float(min(len(tr.demo), md))
-    print(f"[brain] trainer ready: obs_dim={tr.obs_dim} device={device} "
-          f"demo_len={len(tr.demo)} milestone_depth={md} "
-          f"frontier={tr.curriculum.frontier:.0f}")
+    if args.warmstart:
+        state = torch.load(args.warmstart, map_location=device, weights_only=False)
+        sd = state.get("state_dict", state.get("policy", state))
+        tr.policy.load_state_dict(sd)
+        tr.curriculum.frontier = 0.0   # already solve the milestone -> explore from boot
+        print(f"[brain] WARMSTART from {args.warmstart}; frontier=0 (explore deeper), "
+              f"obs_dim={tr.obs_dim}")
+    else:
+        # Start the backward-robustification frontier AT the demo's milestone depth
+        # (game-agnostic: found by replaying the demo), so the run begins where real
+        # learning is — not restoring past an already-won milestone.
+        md = tr.demo.milestone_depth()
+        tr.curriculum.frontier = float(min(len(tr.demo), md))
+        print(f"[brain] trainer ready: obs_dim={tr.obs_dim} device={device} "
+              f"demo_len={len(tr.demo)} milestone_depth={md} "
+              f"frontier={tr.curriculum.frontier:.0f}")
 
     streamer = None
     if args.dashboard:

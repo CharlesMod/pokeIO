@@ -55,9 +55,10 @@ class BrainConfig:
     max_grad_norm: float = 0.5
     horizon_margin: int = 96      # steps beyond (len - frontier) to allow reaching goal
     horizon_min: int = 48
-    horizon_max: int = 768        # compute cap on a single rollout
+    horizon_max: int = 1536       # compute cap; at boot this is the EXPLORE horizon
+                                  # (long enough to progress PAST the demo's endpoint)
     eval_every: int = 20          # iterations between from-boot gate evals
-    eval_horizon: int = 768
+    eval_horizon: int = 1536
     seed: int = 0
 
 
@@ -123,6 +124,11 @@ class BrainTrainer:
         return [w[i] for i in range(self.n_envs)]
 
     def _horizon(self) -> int:
+        # At boot (frontier receded to 0) use the full EXPLORE horizon, so from-boot
+        # episodes run long PAST the demo's endpoint and the dense from-boot reward
+        # can pull the policy toward the next milestones (deeper into the game).
+        if self.curriculum.frontier <= 0:
+            return self.cfg.horizon_max
         played = len(self.demo) - self.curriculum.frontier
         h = int(played + self.cfg.horizon_margin)
         return int(np.clip(h, self.cfg.horizon_min, self.cfg.horizon_max))
