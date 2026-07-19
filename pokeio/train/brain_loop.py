@@ -62,6 +62,24 @@ def build_fleet(n_envs: int, *, rom=_ROM, state=_STATE, obs_ram=8,
     return fleet
 
 
+def _trim_metrics(path: Path, keep_through_iter: int) -> None:
+    """Drop metric records with ``iter > keep_through_iter`` — a crash/power loss can
+    log a few iterations PAST the last saved checkpoint; on resume those would duplicate
+    the re-run iters, so trim the jsonl back to the checkpoint for a clean, continuous log."""
+    if not path.exists():
+        return
+    kept = []
+    with open(path) as fh:
+        for line in fh:
+            try:
+                if int(json.loads(line).get("iter", 0)) <= keep_through_iter:
+                    kept.append(line)
+            except Exception:
+                continue
+    with open(path, "w") as fh:
+        fh.writelines(kept)
+
+
 def _checkpoint(path: Path, tr: BrainTrainer) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
@@ -92,6 +110,11 @@ def main(argv=None) -> None:
     ap.add_argument("--warmstart", default=None,
                     help="champion brain.pt to load (skip re-learning the first milestone); "
                          "starts the curriculum AT boot to explore deeper into the game")
+    ap.add_argument("--resume", default=None,
+                    help="brain.pt checkpoint to CONTINUE (restores policy+optimizer+curriculum"
+                         "+iter and trains to --iterations); use after a crash/power loss to pick "
+                         "up where the run left off. Distinct from --warmstart (which resets the "
+                         "frontier to boot for deeper exploration).")
     args = ap.parse_args(argv)
 
     run_dir = Path("runs") / args.run_id
@@ -111,7 +134,24 @@ def main(argv=None) -> None:
                       seed=args.seed)
     tr = BrainTrainer(fleet, device=device, mem_grid=CANVAS_GRID,
                       demo=DemoTrajectory(), cfg=cfg)
-    if args.warmstart:
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        tr.policy.load_state_dict(ckpt["policy"])
+        try:
+            tr.opt.load_state_dict(ckpt["opt"])
+        except Exception as e:                          # optimizer shape drift -> fresh moments
+            print(f"[brain] resume: optimizer state skipped ({e})")
+        tr.iter = int(ckpt.get("iter", 0))
+        tr.curriculum.frontier = float(ckpt.get("frontier", tr.curriculum.frontier))
+        tr.curriculum.success_ema = float(ckpt.get("success_ema", 0.0))
+        cst = ckpt.get("curriculum") or {}
+        if isinstance(cst, dict) and "seen" in cst:
+            tr.curriculum._seen = int(cst["seen"])
+        _trim_metrics(metrics_path, tr.iter)            # drop iters logged past the checkpoint
+        print(f"[brain] RESUME from {args.resume}; iter={tr.iter} "
+              f"frontier={tr.curriculum.frontier:.0f} ema={tr.curriculum.success_ema:.2f} "
+              f"obs_dim={tr.obs_dim} -> continuing to iter {args.iterations}")
+    elif args.warmstart:
         state = torch.load(args.warmstart, map_location=device, weights_only=False)
         sd = state.get("state_dict", state.get("policy", state))
         tr.policy.load_state_dict(sd)
@@ -167,8 +207,9 @@ def main(argv=None) -> None:
         if rec["iter"] % args.checkpoint_every == 0:
             _checkpoint(ckpt_path, tr)
 
+    remaining = max(0, args.iterations - tr.iter)   # resume continues to --iterations, not past it
     try:
-        tr.train(args.iterations, on_log=_log)
+        tr.train(remaining, on_log=_log)
         _checkpoint(ckpt_path, tr)
         _export_champion(run_dir, tr, args)
     finally:
