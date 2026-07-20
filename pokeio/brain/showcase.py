@@ -58,7 +58,7 @@ class BrainShowcase:
 
     def __init__(self, rom_path: str, reset_state: str, *, grid: int = 12,
                  fovea_grid: int = 12, mem_grid: int = 96, obs_dim: int = 454,
-                 greedy: bool = False) -> None:
+                 greedy: bool = False, learned_gaze: bool = False) -> None:
         from pokeio.emu.env import PokeEnv
 
         self.env = PokeEnv(rom_path=rom_path, frame_skip=24)
@@ -67,8 +67,10 @@ class BrainShowcase:
                                  fovea_grid=fovea_grid, n_ram=8, reflex_gaze=True,
                                  foveal_memory=mem_grid > 0, mem_grid=max(1, mem_grid))
         self._reflex = ReflexGaze.maybe(self.enc, 1)  # bottom-up saccade for the showcase
+        # MUST match the trainer's architecture (learned_gaze adds the gaze head) or
+        # sync_weights' load_state_dict rejects the extra keys.
         self.policy = ActorCritic(obs_dim, periph_grid=grid, fovea_grid=fovea_grid,
-                                  canvas_grid=mem_grid).eval()  # cpu copy, synced by the trainer
+                                  canvas_grid=mem_grid, learned_gaze=learned_gaze).eval()
         self.greedy = bool(greedy)
         self._lock = threading.Lock()
         self.last_action = 8
@@ -84,7 +86,10 @@ class BrainShowcase:
 
     def sync_weights(self, state_dict) -> None:
         with self._lock:
-            self.policy.load_state_dict({k: v.detach().cpu() for k, v in state_dict.items()})
+            # strict=False: never let an arch drift (e.g. a gaze head the render policy
+            # lacks) raise here — the dashboard is best-effort and must not touch training.
+            self.policy.load_state_dict(
+                {k: v.detach().cpu() for k, v in state_dict.items()}, strict=False)
 
     @torch.no_grad()
     def step(self) -> None:
@@ -154,13 +159,15 @@ class BrainStreamer:
     def __init__(self, run_dir, fleet, *, rom_path: str, reset_state: str,
                  grid: int = 12, fovea_grid: int = 12, mem_grid: int = 96,
                  obs_dim: int = 454, hz: float = 4.0, swarm_cap: int = 24,
-                 run_id: str = "brain", total_iters: int = 0) -> None:
+                 run_id: str = "brain", total_iters: int = 0,
+                 learned_gaze: bool = False) -> None:
         self.fleet = fleet
         self.run_id = str(run_id)
         self.total_iters = int(total_iters)   # target iterations (UI progress-to-done bar)
         self.swarm_cap = int(swarm_cap)
         self.show = BrainShowcase(rom_path, reset_state, grid=grid,
-                                  fovea_grid=fovea_grid, mem_grid=mem_grid, obs_dim=obs_dim)
+                                  fovea_grid=fovea_grid, mem_grid=mem_grid, obs_dim=obs_dim,
+                                  learned_gaze=learned_gaze)
         self.writer = LiveWriter(run_dir, hz=hz)
         self._select_path = Path(run_dir) / "select.json"   # focus-agent selection (/api/select)
         self._sel_sig = None
@@ -176,15 +183,21 @@ class BrainStreamer:
         self._t.start()
 
     def sync(self, policy, metrics: dict, iter_: int, phase: str = "training") -> None:
-        """Push fresh weights + metrics from the trainer (once per iteration)."""
-        self.show.sync_weights(policy.state_dict())
-        with self._lock:
-            self._metrics = dict(metrics)
-            self._iter = int(iter_)
-            self._phase = str(phase)
-            self._hist["iter"].append(int(iter_))
-            for k in ("reach", "frontier_frac", "gate_stochastic", "entropy"):
-                self._hist[k].append(round(float(metrics.get(k, 0.0)), 4))
+        """Push fresh weights + metrics from the trainer (once per iteration).
+
+        Runs on the TRAINER's thread (the on_log callback), so any exception here would
+        kill the run — the dashboard must NEVER do that.  Wrapped defensively."""
+        try:
+            self.show.sync_weights(policy.state_dict())
+            with self._lock:
+                self._metrics = dict(metrics)
+                self._iter = int(iter_)
+                self._phase = str(phase)
+                self._hist["iter"].append(int(iter_))
+                for k in ("reach", "frontier_frac", "gate_stochastic", "entropy"):
+                    self._hist[k].append(round(float(metrics.get(k, 0.0)), 4))
+        except Exception:
+            pass  # best-effort telemetry; never propagate into training
 
     def _swarm(self) -> list:
         try:

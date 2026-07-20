@@ -72,3 +72,13 @@ def test_greedy_gaze_is_the_mean():
     out = ac.act(obs, greedy=True)
     mu = ac.gaze_mu(ac._features(obs))
     assert torch.allclose(out["gaze"], mu, atol=1e-6)
+
+
+def test_render_policy_tolerates_gaze_head_mismatch():
+    # the dashboard's render policy may lack the gaze head; loading a trainer
+    # state_dict that HAS it must not raise (strict=False) — a render sync must never
+    # be able to kill training. (Regression: brain5 crashed on this at iter 1.)
+    trainer = _actor(True)                     # has gaze_mu / gaze_log_std
+    render = _actor(False)                     # lacks them
+    sd = {k: v.detach() for k, v in trainer.state_dict().items()}
+    render.load_state_dict(sd, strict=False)   # must not raise
