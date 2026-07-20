@@ -83,7 +83,8 @@ class BrainTrainer:
     ``goexplore=True``. Call :meth:`train(iterations)`."""
 
     def __init__(self, fleet, *, grid: int = 12, fovea_grid: int | None = None,
-                 mem_grid: int = 0, reflex_gaze: bool = True, device="cuda:1",
+                 mem_grid: int = 0, reflex_gaze: bool = True, learned_gaze: bool = False,
+                 device="cuda:1",
                  demo: DemoTrajectory | None = None, cfg: BrainConfig | None = None):
         self.fleet = fleet
         self.cfg = cfg or BrainConfig()
@@ -109,9 +110,14 @@ class BrainTrainer:
             self._reflex = ReflexGaze.maybe(ref, self.n_envs)
             self._o_proprio = int(ref.o_proprio)
 
+        # Path B (#11): a LEARNED gaze-delta action ADDED to the reflex, trained by the
+        # joint PPO objective (critic-baselined REINFORCE).  Off => reflex-only gaze,
+        # byte-identical to before.
+        self._learned_gaze = bool(learned_gaze)
         self.policy = ActorCritic(self.obs_dim, periph_grid=grid,
                                   fovea_grid=self.fovea_grid,
-                                  canvas_grid=self.mem_grid).to(self.device)
+                                  canvas_grid=self.mem_grid,
+                                  learned_gaze=self._learned_gaze).to(self.device)
         self.opt = torch.optim.Adam(self.policy.parameters(), lr=self.cfg.lr)
         self.reward = ProgressReward(self.n_envs)
         self.demo = demo if demo is not None else DemoTrajectory()
@@ -140,18 +146,24 @@ class BrainTrainer:
     def _act(self, obs_np):
         obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device)
         out = self.policy.act(obs)
+        gaze = out["gaze"].cpu().numpy().astype(np.float32) if "gaze" in out else None
         return (out["buttons"].cpu().numpy().astype(np.int32),
-                out["logp"].cpu().numpy(), out["value"].cpu().numpy())
+                out["logp"].cpu().numpy(), out["value"].cpu().numpy(), gaze)
 
-    def _gaze(self, obs, n: int):
-        """Per-env saccade to submit: the self-calibrated REFLEX command (bottom-up,
-        toward motion x staleness, read from the obs proprio target), or zeros when
-        reflex is off (centered fovea). Learned top-down gaze (#11) blends in here."""
+    def _gaze(self, obs, n: int, learned=None):
+        """Per-env saccade command to submit = self-calibrated REFLEX (bottom-up,
+        toward motion x staleness from the obs proprio target) + the LEARNED top-down
+        delta (Path B, #11).  ``learned`` is the sampled ``(n,2)`` gaze action (or None
+        for reflex-only, the byte-identical default).  ReflexGaze.blend adds the reflex
+        ON TOP of the learned seed, so ``gaze_delta = reflex + learned`` — the net can
+        follow, nudge, or override the reflex (tanh in update_gaze saturates)."""
         z = np.zeros(n, np.float32)
+        ldx = z if learned is None else np.ascontiguousarray(learned[:, 0], np.float32)
+        ldy = z if learned is None else np.ascontiguousarray(learned[:, 1], np.float32)
         if self._reflex is None:
-            return z, z
+            return ldx, ldy                       # learned-only when reflex is off
         gdx, gdy = self._reflex.blend(np.asarray(obs, np.float32), self._o_proprio,
-                                      z.copy(), z.copy())
+                                      ldx.copy(), ldy.copy())
         return gdx.astype(np.float32), gdy.astype(np.float32)
 
     # -- one backward-robustification rollout ------------------------------
@@ -168,15 +180,18 @@ class BrainTrainer:
         logp_buf = np.zeros((H, N), np.float32)
         val_buf = np.zeros((H, N), np.float32)
         rew_buf = np.zeros((H, N), np.float32)
+        gaze_buf = np.zeros((H, N, 2), np.float32) if self._learned_gaze else None
         reached = np.zeros(N, dtype=bool)
 
         for t in range(H):
-            buttons, logp, value = self._act(obs)
+            buttons, logp, value, gaze = self._act(obs)
             obs_buf[t] = obs
             act_buf[t] = buttons
-            logp_buf[t] = logp
+            logp_buf[t] = logp           # JOINT (button + gaze) log-prob when learned_gaze
             val_buf[t] = value
-            gdx, gdy = self._gaze(obs, N)
+            if gaze_buf is not None:
+                gaze_buf[t] = gaze
+            gdx, gdy = self._gaze(obs, N, learned=gaze)
             obs2, _keys, _dones, _cap = self.fleet.step_all(buttons, gaze_dx=gdx, gaze_dy=gdy)
             rew_buf[t] = self.reward.step_many(range(N), self._wram_rows())
             obs = obs2.copy()
@@ -192,6 +207,7 @@ class BrainTrainer:
             "obs": obs_buf.reshape(H * N, self.obs_dim),
             "act": act_buf.reshape(H * N),
             "logp": logp_buf.reshape(H * N),
+            "gaze": gaze_buf.reshape(H * N, 2) if gaze_buf is not None else None,
             "adv": adv.reshape(H * N),
             "ret": ret.reshape(H * N),
             "H": H, "reached": float(reached.mean()),
@@ -208,6 +224,10 @@ class BrainTrainer:
         ret = torch.as_tensor(batch["ret"], dtype=torch.float32, device=dev)
         adv = torch.as_tensor(batch["adv"], dtype=torch.float32, device=dev)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        # Path B: the sampled gaze delta is part of the action; re-evaluate its JOINT
+        # log-prob so PPO trains it (critic-baselined REINFORCE).  None => button-only.
+        gaze = (torch.as_tensor(batch["gaze"], dtype=torch.float32, device=dev)
+                if batch.get("gaze") is not None else None)
 
         # NE neuromodulation: explore when stalled (bonus), COMMIT when winning
         # (penalty) — both self-scaled by the success EMA, so a saturated policy is
@@ -223,7 +243,8 @@ class BrainTrainer:
             self._rng().shuffle(idx)
             for s in range(0, n, mb):
                 j = idx[s:s + mb]
-                logp, ent, val = self.policy.evaluate_actions(obs[j], act[j])
+                logp, ent, val = self.policy.evaluate_actions(
+                    obs[j], act[j], gaze[j] if gaze is not None else None)
                 ratio = torch.exp(logp - old_logp[j])
                 a = adv[j]
                 unclipped = ratio * a
@@ -265,8 +286,10 @@ class BrainTrainer:
         last_obs = obs
         for _ in range(H):
             t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-            buttons = self.policy.act(t, greedy=greedy)["buttons"].cpu().numpy().astype(np.int32)
-            gdx, gdy = self._gaze(obs, N)
+            out = self.policy.act(t, greedy=greedy)
+            buttons = out["buttons"].cpu().numpy().astype(np.int32)
+            gaze = out["gaze"].cpu().numpy().astype(np.float32) if "gaze" in out else None
+            gdx, gdy = self._gaze(obs, N, learned=gaze)
             obs, _k, _d, _c = self.fleet.step_all(buttons, gaze_dx=gdx, gaze_dy=gdy)
             obs = obs.copy()
             self.reward.step_many(range(N), self._wram_rows())

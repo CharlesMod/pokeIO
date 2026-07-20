@@ -139,6 +139,32 @@ def test_evaluate_gate_returns_report():
         assert k in rep and np.isfinite(rep[k])
 
 
+def test_learned_gaze_off_batch_has_no_gaze():
+    tr = _trainer(milestone=3)                 # default: learned_gaze off
+    batch = tr.rollout()
+    assert batch["gaze"] is None               # reflex-only; no gaze action stored
+    assert not tr.policy.learned_gaze
+
+
+def test_learned_gaze_rollout_stores_action_and_trains_head():
+    fleet = FakeFleet(n_envs=4, milestone=2)
+    cfg = BrainConfig(horizon_min=4, horizon_max=8, minibatches=2, epochs=2,
+                      eval_every=0, seed=1)
+    tr = BrainTrainer(fleet, device="cpu", demo=FakeDemo(), cfg=cfg, learned_gaze=True)
+    batch = tr.rollout()
+    # the sampled gaze action is captured for every (step, env)
+    assert batch["gaze"] is not None
+    assert batch["gaze"].shape == (batch["H"] * tr.n_envs, 2)
+    assert np.isfinite(batch["gaze"]).all()
+    # the joint PPO update actually moves the gaze-head parameters
+    before_mu = tr.policy.gaze_mu.weight.detach().clone()
+    before_std = tr.policy.gaze_log_std.detach().clone()
+    stats = tr.update(batch)
+    assert not torch.allclose(before_mu, tr.policy.gaze_mu.weight.detach())
+    assert not torch.allclose(before_std, tr.policy.gaze_log_std.detach())
+    assert np.isfinite(stats["pi_loss"]) and np.isfinite(stats["entropy"])
+
+
 def test_train_runs_multiple_iterations():
     tr = _trainer(milestone=3, eval_every=2)
     hist = tr.train(3)

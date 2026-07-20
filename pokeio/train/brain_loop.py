@@ -120,6 +120,10 @@ def main(argv=None) -> None:
                     help="intra-action saccade sub-steps (gaze cadence). Default: DERIVED "
                          "from GB fps x actuator ceiling (S=2 -> 4.98Hz). Pass 1 to resume a "
                          "run trained at the old 2.49Hz single-saccade regime without a shift.")
+    ap.add_argument("--learned-gaze", action="store_true",
+                    help="Path B (#11): learn a top-down saccade delta ADDED to the reflex, "
+                         "trained by the joint PPO objective (REINFORCE, critic baseline). "
+                         "Off (default) = reflex-only gaze, byte-identical to prior runs.")
     ap.add_argument("--dashboard", action="store_true",
                     help="stream a live GUI feed to runs/<id>/live.json (serve with "
                          "python -m pokeio.dash.serve --port 8600, view /brain?run=<id>)")
@@ -149,6 +153,7 @@ def main(argv=None) -> None:
                       horizon_max=args.horizon_max, eval_every=args.eval_every,
                       seed=args.seed)
     tr = BrainTrainer(fleet, device=device, mem_grid=CANVAS_GRID,
+                      learned_gaze=args.learned_gaze,
                       demo=DemoTrajectory(), cfg=cfg)
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
