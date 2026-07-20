@@ -30,6 +30,26 @@ def _logits(policy, x):
         return policy(x)[0].numpy()
 
 
+def test_champion_roundtrip_canvas_and_learned_gaze(tmp_path):
+    # a canvas (persisted-vision) + Path-B learned-gaze champion must reload into the
+    # SAME architecture -> arch_of must capture canvas_grid AND learned_gaze, else
+    # load_state_dict mismatches on canvas_conv / gaze_mu / gaze_log_std.
+    from pokeio.brain.champion import export_brain
+
+    ac = ActorCritic(18888, grid=12, fovea_grid=12, canvas_grid=96,
+                     learned_gaze=True).eval()
+    assert ac.canvas and ac.learned_gaze
+    bp = tmp_path / "canvas_gaze_brain.pt"
+    export_brain(ac, str(bp))
+    p2, _art = load_brain(str(bp))
+    assert p2.M == 96 and p2.learned_gaze          # architecture faithfully rebuilt
+    sd0, sd1 = ac.state_dict(), p2.state_dict()
+    assert set(sd0) == set(sd1)
+    assert "gaze_mu.weight" in sd1 and "gaze_log_std" in sd1
+    for k in sd0:                                    # every param reloads bit-identically
+        assert torch.equal(sd0[k], sd1[k])
+
+
 # ------------------------------------------------------------ brain round-trip
 def test_brain_export_load_reproduces_policy(tmp_path):
     from pokeio.brain.champion import export_brain

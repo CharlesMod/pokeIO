@@ -47,16 +47,22 @@ def _now() -> str:
 
 
 def arch_of(policy: ActorCritic) -> dict:
-    """The ActorCritic constructor args needed to rebuild it."""
+    """The ActorCritic constructor args needed to rebuild it.  Captures canvas_grid
+    (persisted-vision mode) and learned_gaze (Path B) so a canvas / learned-gaze
+    champion reloads into the SAME architecture (else load_state_dict mismatches)."""
     return {"obs_dim": int(policy.obs_dim), "grid": int(policy.G),
-            "fovea_grid": int(policy.FG), "hidden": int(policy.trunk[0].out_features),
-            "n_buttons": int(policy.n_buttons)}
+            "fovea_grid": int(policy.FG), "canvas_grid": int(policy.M),
+            "hidden": int(policy.trunk[0].out_features),
+            "n_buttons": int(policy.n_buttons),
+            "learned_gaze": bool(policy.learned_gaze)}
 
 
 def _build(arch: dict) -> ActorCritic:
     return ActorCritic(int(arch["obs_dim"]), periph_grid=int(arch["grid"]),
                        fovea_grid=int(arch.get("fovea_grid", arch["grid"])),
-                       hidden=int(arch["hidden"]), n_buttons=int(arch["n_buttons"]))
+                       canvas_grid=int(arch.get("canvas_grid", 0)),
+                       hidden=int(arch["hidden"]), n_buttons=int(arch["n_buttons"]),
+                       learned_gaze=bool(arch.get("learned_gaze", False)))
 
 
 # ------------------------------------------------------------------------- brain io
