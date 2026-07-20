@@ -116,6 +116,10 @@ def main(argv=None) -> None:
     ap.add_argument("--gamma", type=float, default=BrainConfig.gamma)
     ap.add_argument("--horizon-max", type=int, default=BrainConfig.horizon_max)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--saccade-substeps", type=int, default=None,
+                    help="intra-action saccade sub-steps (gaze cadence). Default: DERIVED "
+                         "from GB fps x actuator ceiling (S=2 -> 4.98Hz). Pass 1 to resume a "
+                         "run trained at the old 2.49Hz single-saccade regime without a shift.")
     ap.add_argument("--dashboard", action="store_true",
                     help="stream a live GUI feed to runs/<id>/live.json (serve with "
                          "python -m pokeio.dash.serve --port 8600, view /brain?run=<id>)")
@@ -140,7 +144,7 @@ def main(argv=None) -> None:
         device = "cpu"
 
     print(f"[brain] building fleet: n_envs={args.n_envs}")
-    fleet = build_fleet(args.n_envs)
+    fleet = build_fleet(args.n_envs, saccade_substeps=args.saccade_substeps)
     cfg = BrainConfig(n_envs=args.n_envs, lr=args.lr, gamma=args.gamma,
                       horizon_max=args.horizon_max, eval_every=args.eval_every,
                       seed=args.seed)
