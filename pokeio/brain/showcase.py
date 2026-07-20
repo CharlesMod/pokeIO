@@ -154,9 +154,10 @@ class BrainStreamer:
     def __init__(self, run_dir, fleet, *, rom_path: str, reset_state: str,
                  grid: int = 12, fovea_grid: int = 12, mem_grid: int = 96,
                  obs_dim: int = 454, hz: float = 4.0, swarm_cap: int = 24,
-                 run_id: str = "brain") -> None:
+                 run_id: str = "brain", total_iters: int = 0) -> None:
         self.fleet = fleet
         self.run_id = str(run_id)
+        self.total_iters = int(total_iters)   # target iterations (UI progress-to-done bar)
         self.swarm_cap = int(swarm_cap)
         self.show = BrainShowcase(rom_path, reset_state, grid=grid,
                                   fovea_grid=fovea_grid, mem_grid=mem_grid, obs_dim=obs_dim)
@@ -269,6 +270,7 @@ class BrainStreamer:
                 focus = self._focus_payload(sel) if sel is not None and sel >= 0 else None
                 payload = {
                     "kind": "system1", "run_id": self.run_id, "iter": it,
+                    "total_iters": self.total_iters,
                     "phase": phase, "ts": round(time.monotonic(), 2),
                     "champion": self.show.payload(), "swarm": self._swarm(),
                     "focus": focus, "focus_idx": (sel if focus is not None else -1),

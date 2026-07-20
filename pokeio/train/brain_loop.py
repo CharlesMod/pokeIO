@@ -194,7 +194,8 @@ def main(argv=None) -> None:
         from pokeio.brain.showcase import BrainStreamer
         streamer = BrainStreamer(run_dir, fleet, rom_path=_ROM, reset_state=_STATE,
                                  obs_dim=tr.obs_dim, fovea_grid=tr.fovea_grid,
-                                 mem_grid=tr.mem_grid, run_id=args.run_id)
+                                 mem_grid=tr.mem_grid, run_id=args.run_id,
+                                 total_iters=args.iterations)
         print(f"[brain] dashboard live -> runs/{args.run_id}/live.json "
               f"(serve :8600, view /brain?run={args.run_id})")
 

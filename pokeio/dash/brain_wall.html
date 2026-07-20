@@ -204,6 +204,21 @@
 
   .foot{padding:7px 13px; font-family:var(--mono); font-size:8.5px; letter-spacing:.1em; color:var(--ink-mute); text-align:center}
 
+  /* ---------------- run progress ---------------- */
+  .runprog{position:relative; height:26px; overflow:hidden;
+    background:linear-gradient(180deg,var(--panel-2),var(--panel));
+    border:1px solid var(--line); border-radius:var(--r)}
+  .rp-fill{position:absolute; left:0; top:0; bottom:0; width:0;
+    background:linear-gradient(90deg,var(--accent-deep),var(--accent));
+    box-shadow:0 0 18px rgba(55,224,139,.35); opacity:.9;
+    transition:width .5s cubic-bezier(.2,.7,.3,1)}
+  .rp-fill.done{background:linear-gradient(90deg,var(--accent-deep),var(--cyan))}
+  .rp-label{position:absolute; inset:0; display:flex; align-items:center; gap:12px;
+    justify-content:center; font-family:var(--mono); font-size:11px; font-weight:600;
+    letter-spacing:.12em; color:var(--ink); text-transform:uppercase;
+    text-shadow:0 1px 3px rgba(0,0,0,.75)}
+  .rp-label b{color:var(--accent)}
+
   /* ---------------- run rail ---------------- */
   .railbar{display:flex; align-items:center; gap:12px; overflow:hidden;
     background:linear-gradient(180deg,var(--panel-2),var(--panel)); border:1px solid var(--line); border-radius:var(--r); padding:9px 12px}
@@ -256,6 +271,12 @@
     </div>
     <div class="live warn" id="live-badge"><span class="dot"></span><span id="live-text">connecting…</span></div>
     <button class="stopbtn" id="stopbtn" title="request a graceful checkpoint + stop">■ STOP</button>
+  </div>
+
+  <!-- ============ RUN PROGRESS ============ -->
+  <div class="runprog" title="training progress toward the target iteration count">
+    <div class="rp-fill" id="rp-fill"></div>
+    <div class="rp-label"><span id="rp-text">waiting for a run…</span></div>
   </div>
 
   <!-- ============ RUN RAIL ============ -->
@@ -467,6 +488,23 @@ function renderHeader(p){
   if(p.phase){
     const el=$("s-phase"); el.textContent=p.phase;
     el.className="pill"+(p.phase==="training"?" training":p.phase==="eval"?" eval":"");
+  }
+  renderRunProgress(p);
+}
+/* full-width progress-to-done bar: iter X / N · P% (falls back to bare iter) */
+function renderRunProgress(p){
+  const fill=$("rp-fill"), txt=$("rp-text");
+  if(!fill||!txt) return;
+  const run=p.run_id!=null?p.run_id:(activeRun||"");
+  if(isNum(p.iter) && isNum(p.total_iters) && p.total_iters>0){
+    const frac=clamp(p.iter/p.total_iters,0,1), done=frac>=1;
+    fill.style.width=(frac*100).toFixed(1)+"%";
+    fill.classList.toggle("done", done);
+    txt.innerHTML=run+" &nbsp; <b>"+p.iter.toLocaleString()+"</b> / "+p.total_iters.toLocaleString()
+      +" &nbsp;·&nbsp; "+Math.round(frac*100)+"%"+(done?" &nbsp;·&nbsp; ✓ done":"");
+  }else if(isNum(p.iter)){
+    fill.style.width="0%"; fill.classList.remove("done");
+    txt.innerHTML=run+" &nbsp; iter <b>"+p.iter.toLocaleString()+"</b>";
   }
 }
 function renderGate(m){
