@@ -27,7 +27,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Normal
 
 N_BUTTONS = 9  # up down left right A B START SELECT NOOP (ACTIONS order)
 
@@ -50,7 +50,7 @@ class ActorCritic(nn.Module):
 
     def __init__(self, obs_dim: int, periph_grid: int = 12, fovea_grid: int | None = None,
                  canvas_grid: int = 0, hidden: int = 256, n_buttons: int = N_BUTTONS,
-                 grid: int | None = None) -> None:
+                 grid: int | None = None, learned_gaze: bool = False) -> None:
         super().__init__()
         if grid is not None:            # back-compat alias for periph_grid
             periph_grid = grid
@@ -115,6 +115,17 @@ class ActorCritic(nn.Module):
             _orthogonal(nn.Linear(hidden, hidden), np.sqrt(2)), nn.ReLU())
         self.pi = _orthogonal(nn.Linear(hidden, self.n_buttons), 0.01)
         self.vf = _orthogonal(nn.Linear(hidden, 1), 1.0)
+        self.learned_gaze = bool(learned_gaze)
+        if self.learned_gaze:
+            # Path B (#11): a LEARNED saccade-delta action (dpan, dtilt) ADDED to the
+            # bottom-up reflex, SAMPLED and trained by REINFORCE (critic-baselined via
+            # the shared PPO objective).  RAM-style hard gaze (Mnih 2014): the location
+            # is a stochastic action, not differentiable soft-attention — the faithful
+            # match for a real discrete/rate-limited PTZ actuator.  Small init => gaze
+            # starts ~0 (reflex dominates) and learns the top-down correction;
+            # downstream ``update_gaze``'s gain*tanh bounds the emitted delta.
+            self.gaze_mu = _orthogonal(nn.Linear(hidden, 2), 0.01)
+            self.gaze_log_std = nn.Parameter(torch.zeros(2))
 
     # -- forward -----------------------------------------------------------
     def _features(self, obs: torch.Tensor) -> torch.Tensor:
@@ -153,19 +164,47 @@ class ActorCritic(nn.Module):
         h = self._features(obs)
         return self.pi(h), self.vf(h).squeeze(-1)
 
+    def _gaze_dist(self, h: torch.Tensor) -> Normal:
+        """Diagonal-Gaussian policy over the learned saccade delta (dpan, dtilt) from
+        the shared trunk features ``h`` (Path B; only when ``learned_gaze``)."""
+        mu = self.gaze_mu(h)
+        std = self.gaze_log_std.exp().expand_as(mu)
+        return Normal(mu, std)
+
     # -- rollout / update API ---------------------------------------------
     @torch.no_grad()
     def act(self, obs: torch.Tensor, greedy: bool = False) -> dict:
-        logits, value = self.forward(obs)
+        h = self._features(obs)
+        logits = self.pi(h)
+        value = self.vf(h).squeeze(-1)
         dist = Categorical(logits=logits)
         buttons = logits.argmax(-1) if greedy else dist.sample()
-        return {"buttons": buttons, "logp": dist.log_prob(buttons),
-                "value": value, "entropy": dist.entropy()}
+        logp = dist.log_prob(buttons)
+        entropy = dist.entropy()
+        out = {"buttons": buttons, "value": value}
+        if self.learned_gaze:
+            gd = self._gaze_dist(h)
+            gaze = gd.mean if greedy else gd.sample()            # (N, 2) saccade delta
+            logp = logp + gd.log_prob(gaze).sum(-1)              # joint (factorized) log-prob
+            entropy = entropy + gd.entropy().sum(-1)
+            out["gaze"] = gaze
+        out["logp"] = logp
+        out["entropy"] = entropy
+        return out
 
-    def evaluate_actions(self, obs: torch.Tensor, buttons: torch.Tensor):
-        logits, value = self.forward(obs)
+    def evaluate_actions(self, obs: torch.Tensor, buttons: torch.Tensor,
+                         gaze: torch.Tensor | None = None):
+        h = self._features(obs)
+        logits = self.pi(h)
+        value = self.vf(h).squeeze(-1)
         dist = Categorical(logits=logits)
-        return dist.log_prob(buttons), dist.entropy(), value
+        logp = dist.log_prob(buttons)
+        entropy = dist.entropy()
+        if self.learned_gaze and gaze is not None:
+            gd = self._gaze_dist(h)
+            logp = logp + gd.log_prob(gaze).sum(-1)
+            entropy = entropy + gd.entropy().sum(-1)
+        return logp, entropy, value
 
     # -- coupling adapter --------------------------------------------------
     def numpy_policy_fn(self, device=None):
