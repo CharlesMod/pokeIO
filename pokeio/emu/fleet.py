@@ -742,8 +742,9 @@ class FovealEncoder:
             # (Path B) — the ONLY place domain-specialization enters.  Kept on the
             # encoder (shared across this worker's envs); a single channel's weight is
             # scale-free through the soft-argmax, so w[0] is irrelevant until >1 exist.
-            self._channels = ("luminance_transient",)
-            self._pw = np.array([1.0], dtype=np.float64)
+            self._channels = ("luminance_transient", "center_surround",
+                              "orientation_edge", "high_freq_detail")
+            self._pw = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
         # Trans-saccadic memory per-env state (§1a): the persistent scene buffer,
         # its staleness map, and the per-region divergence EMA that self-calibrates
         # invalidation.  PER-ENV is load-bearing for engine-parity — each env's
@@ -933,9 +934,12 @@ class FovealEncoder:
         i = int(env_idx)
         return (float(self._reflex_tx[i]), float(self._reflex_ty[i]))
 
-    def _reflex_target(self, i: int, motion: np.ndarray) -> tuple[float, float]:
+    def _reflex_target(self, i: int, motion: np.ndarray,
+                       periph: np.ndarray | None = None) -> tuple[float, float]:
         """[§3] Bottom-up reflex gaze target for env ``i`` from ``motion`` (× the
-        staleness map when ``foveal_memory`` is on).
+        staleness map when ``foveal_memory`` is on).  ``periph`` (the G×G low-res
+        field) feeds the spatial-contrast channels; omit it (warm-start / tests) and
+        only the motion channel contributes.
 
         The salience map is the motion MAGNITUDE ``|motion - 0.5|`` (0.5 == no
         motion), multiplied by the per-cell staleness when the trans-saccadic
@@ -953,7 +957,7 @@ class FovealEncoder:
         Step 2: the salience map is now a PRIORITY MAP (:meth:`_priority_map`) — a
         weighted sum of universal channels, gated by recency; the soft-argmax readout
         below is unchanged."""
-        P, sal = self._priority_map(i, motion)
+        P, sal = self._priority_map(i, motion, periph)
         flat = sal.ravel()
         smax = float(flat.max())
         if smax <= 1e-9:  # flat / no salient change: aim at current gaze (zero pull)
@@ -969,33 +973,81 @@ class FovealEncoder:
         tgt_y = (r_star + 0.5) / P * 2.0 - 1.0
         return (tgt_x, tgt_y)
 
-    def _priority_map(self, i: int, motion: np.ndarray) -> tuple[int, np.ndarray]:
-        """The reflex PRIORITY MAP for env ``i`` (Step 2 scaffold): a weighted sum of
-        universal salience channels, GATED by recency (staleness = inhibition of
-        return), plus a learned top-down term::
+    def _priority_map(self, i: int, motion: np.ndarray,
+                      periph: np.ndarray | None = None) -> tuple[int, np.ndarray]:
+        """The reflex PRIORITY MAP for env ``i``: a weighted sum of UNIVERSAL salience
+        channels, GATED by recency (staleness = inhibition of return), plus a learned
+        top-down term::
 
             priority = (Σ_k w_k · channel_k) · staleness   [ + top-down (Step 5) ]
 
-        Only the luminance-transient channel (motion magnitude ``|motion-0.5|``,
-        upsampled G->M) is active with weight 1.0, so this is BYTE-IDENTICAL to the
-        prior ``motion × staleness`` reflex (``w_0=1`` and ``1.0 * x == x`` exactly).
-        Step 3 appends fixed universal channels (contrast / edge / onset / flow /
-        proto-object) with per-channel nonlinear normalization; Step 4/5 learn the
-        weights + top-down term (Path B).  Returns ``(P, priority[P,P])``.  Zero rng,
-        per-env => engine-parity safe."""
-        mot = np.abs(motion.astype(np.float64) - 0.5)            # (G,G) luminance transient
+        Channels (all domain-agnostic, any pixel stream; NO game-specific detectors):
+          0 luminance_transient  |motion-0.5|          — temporal transient (warm-start)
+          1 center_surround      |periph - localmean|  — Itti-Koch DoG salience
+          2 orientation_edge     gradient magnitude    — edge/orientation energy
+          3 high_freq_detail     windowed high-pass    — the UNIVERSAL of text/HUD detail
+
+        Accumulated at G then upsampled G->M once (nearest, the §1a gather).  A channel
+        is computed ONLY when its weight is non-zero, so at the warm-start
+        (``w = [1,0,0,0]``) this is BYTE-IDENTICAL to the prior ``motion × staleness``
+        reflex (``1.0*x == x`` exactly; the weight-0 channels are never touched).
+        Step 4/5 LEARN the weights + a top-down term (Path B) — the ONLY place
+        domain-specialization enters.  Zero rng, per-env => engine-parity safe."""
+        pw = self._pw
+        acc = pw[0] * np.abs(motion.astype(np.float64) - 0.5)    # (G,G) transient channel
+        if periph is not None:                                   # spatial-contrast channels
+            if pw[1] != 0.0:
+                acc = acc + pw[1] * self._ch_center_surround(periph)
+            if pw[2] != 0.0:
+                acc = acc + pw[2] * self._ch_orientation_edge(periph)
+            if pw[3] != 0.0:
+                acc = acc + pw[3] * self._ch_high_freq_detail(periph)
         if self.foveal_memory:
             P = self.M
-            # channel bank at the priority (M) resolution; each G-channel is nearest-
-            # upsampled G->M via the same §1a flat gather (bit-identical to the old
-            # sal[g2m_row][:, g2m_col]).  Σ_k w_k · channel_k — one channel for now.
-            ch_motion = np.take(mot, self._g2m_flat).reshape(P, P)
-            salience = self._pw[0] * ch_motion
-            priority = salience * self._stale[i]                 # · recency gate (IOR)
+            salience = np.take(acc, self._g2m_flat).reshape(P, P)  # G->M nearest upsample
+            priority = salience * self._stale[i]                   # · recency gate (IOR)
         else:
-            P = self.G                                            # no canvas -> no gate
-            priority = self._pw[0] * mot
+            P = self.G                                             # no canvas -> no gate
+            priority = acc
         return P, priority
+
+    # ------------------------------------------------ universal salience channels (Step 3)
+    @staticmethod
+    def _local_mean3(a: np.ndarray) -> np.ndarray:
+        """3x3 edge-replicated local mean — the 'surround' for center-surround.  Pure
+        per-pixel, no domain assumptions; SIMD-friendly (a separable box in C)."""
+        p = np.pad(a, 1, mode="edge")
+        s = (p[0:-2, 0:-2] + p[1:-1, 0:-2] + p[2:, 0:-2]
+             + p[0:-2, 1:-1] + p[1:-1, 1:-1] + p[2:, 1:-1]
+             + p[0:-2, 2:] + p[1:-1, 2:] + p[2:, 2:])
+        return s / 9.0
+
+    def _ch_center_surround(self, periph: np.ndarray) -> np.ndarray:
+        """Center-surround luminance contrast |center - local mean| — the atomic
+        Itti-Koch DoG salience operator.  Salience is RELATIVE contrast, so this is
+        flat->0 (inert on a uniform field).  Universal (any luminance stream)."""
+        p = periph.astype(np.float64)
+        return np.abs(p - self._local_mean3(p))
+
+    def _ch_orientation_edge(self, periph: np.ndarray) -> np.ndarray:
+        """Edge / orientation energy = central-difference gradient magnitude.  Inert
+        on a uniform field.  Universal."""
+        p = periph.astype(np.float64)
+        gx = np.zeros_like(p)
+        gy = np.zeros_like(p)
+        gx[:, 1:-1] = (p[:, 2:] - p[:, :-2]) * 0.5
+        gy[1:-1, :] = (p[2:, :] - p[:-2, :]) * 0.5
+        return np.sqrt(gx * gx + gy * gy)
+
+    def _ch_high_freq_detail(self, periph: np.ndarray) -> np.ndarray:
+        """Local DENSITY of high-frequency detail = windowed magnitude of the high-
+        pass (|periph - local mean|, then locally accumulated).  This is the UNIVERSAL
+        of dense structured 'symbol/detail' regions (text, HUD, signage) — a texture
+        primitive, NOT a text/glyph/word detector (that would be transfer-poison).
+        Inert on a uniform field.  Universal."""
+        p = periph.astype(np.float64)
+        hp = np.abs(p - self._local_mean3(p))          # fine high-pass detail
+        return self._local_mean3(hp)                    # local accumulation -> density
 
     def _calibrate_invalidation(self, i: int, chg: np.ndarray) -> np.ndarray:
         """[§1a / §11b] Self-calibrated peripheral-change invalidation for env ``i``.
@@ -1247,7 +1299,7 @@ class FovealEncoder:
         # region is now fresh => low salience there, orienting AWAY from what we just
         # refreshed).  OFF => proprio stays 14-d and this is skipped.  Zero rng.
         if self.reflex_gaze:
-            self._reflex_tx[i], self._reflex_ty[i] = self._reflex_target(i, motion)
+            self._reflex_tx[i], self._reflex_ty[i] = self._reflex_target(i, motion, periph)
         return periph, fov, motion
 
     def encode(

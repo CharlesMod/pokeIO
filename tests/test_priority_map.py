@@ -78,3 +78,48 @@ def test_single_channel_weight_is_scale_free_through_softargmax():
     e._pw[0] = 5.0
     t5 = e._reflex_target(0, motion)
     assert t1 == t5
+
+
+# ------------------------------------------------------- Step 3: universal channels
+def test_channels_inert_on_flat_field():
+    # salience is RELATIVE contrast -> every spatial channel is ~0 on a uniform field
+    e = _mk(True)
+    flat = np.full((e.G, e.G), 0.5, np.float32)
+    assert np.allclose(e._ch_center_surround(flat), 0.0)
+    assert np.allclose(e._ch_orientation_edge(flat), 0.0)
+    assert np.allclose(e._ch_high_freq_detail(flat), 0.0)
+
+
+def test_channels_respond_to_structure_and_stay_finite():
+    e = _mk(True)
+    p = np.zeros((e.G, e.G), np.float32)
+    p[5:7, 5:7] = 1.0                                       # a bright blob
+    for ch in (e._ch_center_surround, e._ch_orientation_edge, e._ch_high_freq_detail):
+        out = ch(p)
+        assert out.shape == (e.G, e.G)
+        assert np.isfinite(out).all()
+        assert out.max() > 0.0                             # actually responds to structure
+
+
+def test_periph_does_not_change_target_at_warmstart():
+    # passing periph must NOT move the target while the non-motion weights are 0
+    e = _mk(True)
+    rng = np.random.default_rng(7)
+    e._stale[0] = rng.random((e.M, e.M)).astype(np.float32)
+    periph = rng.random((e.G, e.G)).astype(np.float32)
+    motion = rng.random((e.G, e.G)).astype(np.float32)
+    assert e._reflex_target(0, motion, periph) == e._reflex_target(0, motion, None)
+
+
+def test_active_channel_drives_the_gaze():
+    # with no transient the motion channel is silent; turning on a spatial channel
+    # (weight > 0) must make the reflex orient to spatial structure
+    e = _mk(True)
+    rng = np.random.default_rng(8)
+    e._stale[0] = np.ones((e.M, e.M), np.float32)          # uniform gate -> isolate channels
+    periph = rng.random((e.G, e.G)).astype(np.float32)
+    motion = np.full((e.G, e.G), 0.5, np.float32)          # no transient
+    base = e._reflex_target(0, motion, periph)             # all silent -> current-gaze fallback
+    e._pw[1] = 1.0                                          # activate center-surround
+    assert e._reflex_target(0, motion, periph) != base
+
