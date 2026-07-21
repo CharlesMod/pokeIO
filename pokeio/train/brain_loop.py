@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import time
 from pathlib import Path
 
@@ -41,7 +43,8 @@ def build_fleet(n_envs: int, *, rom=_ROM, state=_STATE, obs_ram=8,
                 frame_skip=24, hold_frames=8, periph_grid=12,
                 fovea_native_px=48, fovea_grid=0, reflex_gaze=True,
                 foveal_memory=True, mem_grid=CANVAS_GRID,
-                saccade_substeps: int | None = None) -> BarrierFleet:
+                saccade_substeps: int | None = None,
+                numa_node: int | None = None) -> BarrierFleet:
     """A BarrierFleet sized to a matching FovealEncoder, with the reward WRAM
     channel + Go-Explore restore both ON (backward-robustification needs restore).
 
@@ -64,12 +67,24 @@ def build_fleet(n_envs: int, *, rom=_ROM, state=_STATE, obs_ram=8,
     print(f"[brain] saccade cadence: action={cad.action_hz:.2f}Hz  gaze={sub_steps * cad.action_hz:.2f}Hz "
           f"(S={sub_steps}, >=human={sub_steps * cad.action_hz >= 4.0 - 1e-9}, "
           f"actuator<= {cad.actuator_ceiling_hz:.0f}Hz)")
+    # WRAM churn-mask BEFORE the fleet exists (the loop.py:3647-3686 idiom): the
+    # unmasked stride-64 sample lands in the tile-map buffer that churns on every
+    # camera scroll (+ audio scratch). The keys were dormant in the backward
+    # path, but --forward makes them load-bearing: the parent novelty seen-set
+    # and the Go-Explore capture budget both run on them — unmasked they grow
+    # without bound / are spent on scroll-noise cells. Workers hash from these
+    # kwargs; the trainer's parent NoveltyArchive reads them back off the fleet
+    # (fleet.archive_kwargs), so both sides mint IDENTICAL keys. Self-calibrated
+    # per (rom, state, seed) — no hand-picked addresses.
+    from pokeio.train.loop import calibrate_wram_mask
+    wram_mask = calibrate_wram_mask(rom, state, frame_skip=frame_skip)
     fleet = BarrierFleet(
-        n_envs, enc.dim, periph_grid, obs_ram, rom, frame_skip, hold_frames, state, {},
+        n_envs, enc.dim, periph_grid, obs_ram, rom, frame_skip, hold_frames, state,
+        {"wram_mask": wram_mask},
         wram_stride=64, goexplore=True, expose_wram=True,
         periph_grid=periph_grid, fovea_native_px=fovea_native_px, fovea_grid=fovea_grid,
         reflex_gaze=reflex_gaze, foveal_memory=foveal_memory, mem_grid=mem_grid,
-        sub_steps=sub_steps,
+        sub_steps=sub_steps, numa_node=numa_node,
     )
     return fleet
 
@@ -94,14 +109,51 @@ def _trim_metrics(path: Path, keep_through_iter: int) -> None:
 
 def _checkpoint(path: Path, tr: BrainTrainer) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    ckpt = {
         "policy": tr.policy.state_dict(),
         "opt": tr.opt.state_dict(),
         "iter": tr.iter,
         "curriculum": tr.curriculum.state(),
         "frontier": tr.curriculum.frontier,
         "success_ema": tr.curriculum.success_ema,
-    }, str(path))
+    }
+    # ForwardCurriculum (--forward): persist the FULL-precision source-mix state
+    # alongside the legacy keys so a power-loss resume restores the mix exactly.
+    # (The Go-Explore blob archive is deliberately NOT persisted — it is bounded
+    # RAM, rebuilds within iterations, and the curriculum degrades gracefully to
+    # boot+demo while it refills.)
+    if hasattr(tr.curriculum, "full_state"):
+        ckpt["curriculum_full"] = tr.curriculum.full_state()
+    # ATOMIC write (the solar box power-cycles mid-run): save to a temp file,
+    # then rename over brain.pt — a reboot can never leave a truncated
+    # checkpoint for the pipeline's --resume to crash-loop on (there is
+    # deliberately no warm-start fallback in the pipeline, so a corrupt
+    # brain.pt would dead-end the arm until a human intervened). The previous
+    # good checkpoint is kept as .pt.prev (COPIED before the rename so brain.pt
+    # exists complete at every instant); the --resume path falls back to it.
+    tmp = path.with_suffix(".pt.tmp")
+    torch.save(ckpt, str(tmp))
+    if path.exists():
+        shutil.copy2(str(path), str(path.with_suffix(".pt.prev")))
+    os.replace(str(tmp), str(path))
+
+
+def _apply_warm_start(tr: BrainTrainer, path: str, device="cpu"):
+    """--warm-start: load POLICY WEIGHTS ONLY, strict=False (#brain6).
+
+    strict=False lets the load cross the learned-gaze arch boundary cleanly: a
+    gaze checkpoint into a learned_gaze=False model drops the 3 ``gaze*`` keys;
+    the reverse leaves the gaze head at its near-zero init (reflex dominates
+    initially — the intended cold start). Everything else stays at the trainer's
+    FRESH init: fresh Adam moments, curriculum EMAs at 0 with _seen=0 (so the
+    adaptive ent_coef re-arms at its initial exploration state and re-seeds from
+    the first real batch — the exploration re-heat, no new knob), iter=0.
+    Accepts champion-brain or raw-checkpoint formats like --warmstart does.
+    Returns torch's ``(missing_keys, unexpected_keys)``.
+    """
+    state = torch.load(path, map_location=device, weights_only=False)
+    sd = state.get("state_dict", state.get("policy", state))
+    return tr.policy.load_state_dict(sd, strict=False)
 
 
 def main(argv=None) -> None:
@@ -116,6 +168,11 @@ def main(argv=None) -> None:
     ap.add_argument("--gamma", type=float, default=BrainConfig.gamma)
     ap.add_argument("--horizon-max", type=int, default=BrainConfig.horizon_max)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--numa-node", type=int, default=None,
+                    help="pin this fleet's workers to ONE NUMA node's cores (0 or 1). "
+                         "Required for concurrent dual arms: without it both fleets pin "
+                         "to the same deterministic core list (2 hot-spinning workers "
+                         "per core on the first 32 cores while 24 sit idle).")
     ap.add_argument("--saccade-substeps", type=int, default=None,
                     help="intra-action saccade sub-steps (gaze cadence). Default: DERIVED "
                          "from GB fps x actuator ceiling (S=2 -> 4.98Hz). Pass 1 to resume a "
@@ -124,12 +181,25 @@ def main(argv=None) -> None:
                     help="Path B (#11): learn a top-down saccade delta ADDED to the reflex, "
                          "trained by the joint PPO objective (REINFORCE, critic baseline). "
                          "Off (default) = reflex-only gaze, byte-identical to prior runs.")
+    ap.add_argument("--forward", action="store_true",
+                    help="brain6 FORWARD-PROGRESSION regime: episodes spawn from a "
+                         "self-tuning mix of {boot, demo depth, Go-Explore archive "
+                         "frontier} so no open-loop script solves the start distribution "
+                         "and vision becomes necessary. Off = the backward curriculum, "
+                         "byte-identical to prior runs.")
     ap.add_argument("--dashboard", action="store_true",
                     help="stream a live GUI feed to runs/<id>/live.json (serve with "
                          "python -m pokeio.dash.serve --port 8600, view /brain?run=<id>)")
     ap.add_argument("--warmstart", default=None,
                     help="champion brain.pt to load (skip re-learning the first milestone); "
                          "starts the curriculum AT boot to explore deeper into the game")
+    ap.add_argument("--warm-start", dest="warm_start", default=None,
+                    help="brain.pt/champion to seed the POLICY ONLY (strict=False, so it "
+                         "crosses the learned-gaze arch boundary: extra gaze keys drop, "
+                         "missing ones keep their near-zero init). Optimizer, curriculum, "
+                         "ent-coef machinery and the iter counter all start FRESH (the "
+                         "exploration re-heat). Distinct from --warmstart (frontier->0) "
+                         "and --resume (continues everything).")
     ap.add_argument("--resume", default=None,
                     help="brain.pt checkpoint to CONTINUE (restores policy+optimizer+curriculum"
                          "+iter and trains to --iterations); use after a crash/power loss to pick "
@@ -147,16 +217,29 @@ def main(argv=None) -> None:
         print("[brain] CUDA unavailable -> falling back to cpu")
         device = "cpu"
 
-    print(f"[brain] building fleet: n_envs={args.n_envs}")
-    fleet = build_fleet(args.n_envs, saccade_substeps=args.saccade_substeps)
+    print(f"[brain] building fleet: n_envs={args.n_envs} numa_node={args.numa_node}")
+    fleet = build_fleet(args.n_envs, saccade_substeps=args.saccade_substeps,
+                        numa_node=args.numa_node)
     cfg = BrainConfig(n_envs=args.n_envs, lr=args.lr, gamma=args.gamma,
                       horizon_max=args.horizon_max, eval_every=args.eval_every,
                       seed=args.seed)
     tr = BrainTrainer(fleet, device=device, mem_grid=CANVAS_GRID,
-                      learned_gaze=args.learned_gaze,
+                      learned_gaze=args.learned_gaze, forward=args.forward,
                       demo=DemoTrajectory(), cfg=cfg)
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        try:
+            ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        except Exception as e:
+            # A power-cut mid-copy can only ever corrupt .pt.prev, and the
+            # atomic rename means brain.pt is only unreadable via fs-level
+            # damage — but if it IS, fall back to the previous good checkpoint
+            # rather than crash-looping the unattended pipeline arm.
+            prev = Path(args.resume).with_suffix(".pt.prev")
+            if not prev.exists():
+                raise
+            print(f"[brain] RESUME: {args.resume} unreadable ({e}); "
+                  f"falling back to {prev}")
+            ckpt = torch.load(str(prev), map_location=device, weights_only=False)
         tr.policy.load_state_dict(ckpt["policy"])
         try:
             tr.opt.load_state_dict(ckpt["opt"])
@@ -168,6 +251,11 @@ def main(argv=None) -> None:
         cst = ckpt.get("curriculum") or {}
         if isinstance(cst, dict) and "seen" in cst:
             tr.curriculum._seen = int(cst["seen"])
+        # --forward resume: the full-precision source-mix state supersedes the
+        # legacy scalars above (which remain for display/back-compat).
+        fst = ckpt.get("curriculum_full")
+        if fst and hasattr(tr.curriculum, "load_state"):
+            tr.curriculum.load_state(fst)
         _trim_metrics(metrics_path, tr.iter)            # drop iters logged past the checkpoint
         print(f"[brain] RESUME from {args.resume}; iter={tr.iter} "
               f"frontier={tr.curriculum.frontier:.0f} ema={tr.curriculum.success_ema:.2f} "
@@ -180,14 +268,24 @@ def main(argv=None) -> None:
         print(f"[brain] WARMSTART from {args.warmstart}; frontier=0 (explore deeper), "
               f"obs_dim={tr.obs_dim}")
     else:
+        if args.warm_start:
+            missing, unexpected = _apply_warm_start(tr, args.warm_start, device)
+            print(f"[brain] WARM-START (policy only, strict=False) from "
+                  f"{args.warm_start}; dropped={list(unexpected)} "
+                  f"fresh={list(missing)} — optimizer/curriculum/ent-coef/iter all "
+                  f"fresh (exploration re-heat)")
         # Start the backward-robustification frontier AT the demo's milestone depth
         # (game-agnostic: found by replaying the demo), so the run begins where real
-        # learning is — not restoring past an already-won milestone.
+        # learning is — not restoring past an already-won milestone. Under
+        # --forward this seeds the DEMO source's inner frontier; the per-source
+        # EMAs then take over (a warm policy saturates the easy sources and the
+        # mix shifts mass to the learning frontier on its own).
         md = tr.demo.milestone_depth()
         tr.curriculum.frontier = float(min(len(tr.demo), md))
         print(f"[brain] trainer ready: obs_dim={tr.obs_dim} device={device} "
               f"demo_len={len(tr.demo)} milestone_depth={md} "
-              f"frontier={tr.curriculum.frontier:.0f}")
+              f"frontier={tr.curriculum.frontier:.0f} "
+              f"forward={'on' if args.forward else 'off'}")
 
     streamer = None
     if args.dashboard:
@@ -209,6 +307,9 @@ def main(argv=None) -> None:
         parts = [f"it={rec['iter']}", f"H={rec['H']}", f"reach={rec['reached']:.2f}",
                  f"front={rec['frontier']:.0f}", f"ema={rec['success_ema']:.2f}",
                  f"rew={rec['rew_sum_mean']:.2f}", f"ent={rec['entropy']:.2f}"]
+        if "sources" in rec:   # --forward: the self-tuned spawn mix
+            parts.append("mix=" + ",".join(
+                f"{s[:4]}:{v['mass']:.2f}" for s, v in rec["sources"].items()))
         if "eval" in rec:
             e = rec["eval"]
             parts.append(f"| GATE stoch={e['gate_reached_frac']:.2f} "
@@ -227,7 +328,7 @@ def main(argv=None) -> None:
                                      "gate_greedy": e.get("gate_reached_greedy", 0.0),
                                      "progress_mean": e["progress_mean"]})
             streamer.sync(tr.policy, live_metrics, rec["iter"])
-        if rec["iter"] % args.checkpoint_every == 0:
+        if args.checkpoint_every and rec["iter"] % args.checkpoint_every == 0:
             _checkpoint(ckpt_path, tr)
 
     remaining = max(0, args.iterations - tr.iter)   # resume continues to --iterations, not past it

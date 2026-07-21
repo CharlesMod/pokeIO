@@ -52,6 +52,11 @@ class _EnvProgress:
     counter_sum: int = 0
     maps: set = field(default_factory=set)   # distinct map-ids seen since reset
     phi: float = 0.0                          # last composite (the diff baseline)
+    # Spawn-time milestone baseline (set at reset AFTER history+WRAM absorption):
+    # the tier the env was HANDED, against which earned_milestone judges.
+    spawn_party: int = 0
+    spawn_badges: int = 0
+    spawn_events: int = 0
 
 
 class ProgressReward:
@@ -105,16 +110,37 @@ class ProgressReward:
         p.maps.add(d["map_id"])
 
     # -- single-env API ----------------------------------------------------
-    def reset(self, env_idx: int, wram: np.ndarray) -> None:
+    def reset(self, env_idx: int, wram: np.ndarray,
+              history: dict | None = None) -> None:
         """Re-baseline env ``env_idx`` from ``wram`` (teleport-decoupled). No reward.
 
         Seeds the running maxes + the maps-seen set from the current (possibly
         restored/progressed) state, so the progress it was HANDED is never paid —
         only progress made from here on earns reward.
+
+        ``history`` (optional) is the SPAWNING trajectory's progress snapshot
+        (:meth:`snapshot` of the env that captured the spawn state, or the demo
+        prefix at the restored depth): its maps-seen set + running maxes seed the
+        baseline too. WRAM only holds the CURRENT map id, so without the history
+        every map the spawning trajectory already traversed would be re-payable
+        by backtracking through it — the maps term must be teleport-decoupled
+        exactly like the running maxes.
         """
         p = _EnvProgress()
+        if history:
+            p.party_count = int(history.get("party_count", 0))
+            p.party_level = int(history.get("party_level", 0))
+            p.badges = int(history.get("badges", 0))
+            p.events = int(history.get("events", 0))
+            p.counter_sum = int(history.get("counter_sum", 0))
+            p.maps = set(history.get("maps", ()))
         self._absorb(p, wram)
         p.phi = self._phi(p)
+        # Spawn-relative milestone baseline (AFTER history+WRAM absorption):
+        # everything up to here was HANDED, never a success.
+        p.spawn_party = p.party_count
+        p.spawn_badges = p.badges
+        p.spawn_events = p.events
         self._envs[int(env_idx)] = p
 
     def step(self, env_idx: int, wram: np.ndarray) -> float:
@@ -136,10 +162,16 @@ class ProgressReward:
         return float(r)
 
     # -- batched API (fleet) ----------------------------------------------
-    def reset_many(self, env_indices, wrams) -> None:
-        """Re-baseline several envs. ``wrams`` aligned with ``env_indices``."""
-        for i, w in zip(env_indices, wrams):
-            self.reset(i, w)
+    def reset_many(self, env_indices, wrams, histories=None) -> None:
+        """Re-baseline several envs. ``wrams`` aligned with ``env_indices``;
+        ``histories`` (optional) aligned spawning-trajectory snapshots (``None``
+        entries = nothing handed, e.g. a boot spawn)."""
+        if histories is None:
+            for i, w in zip(env_indices, wrams):
+                self.reset(i, w)
+        else:
+            for i, w, h in zip(env_indices, wrams, histories):
+                self.reset(i, w, h)
 
     def step_many(self, env_indices, wrams) -> np.ndarray:
         """Dense reward for several envs. Returns a float32 array aligned to inputs."""
@@ -164,6 +196,38 @@ class ProgressReward:
         """True iff env ``env_idx`` has reached the first real milestone (party>0)."""
         p = self._envs.get(int(env_idx))
         return bool(p is not None and (p.party_count > 0 or p.badges > 0))
+
+    def snapshot(self, env_idx: int) -> dict | None:
+        """The env's FULL progress state (running maxes + maps-seen set), for
+        persisting alongside a captured spawn state — feed it back to
+        :meth:`reset` as ``history`` when that state is later restored, so the
+        capturing trajectory's progress (including its traversed maps) is part
+        of the handed baseline, never re-payable."""
+        p = self._envs.get(int(env_idx))
+        if p is None:
+            return None
+        return {"party_count": p.party_count, "party_level": p.party_level,
+                "badges": p.badges, "events": p.events,
+                "counter_sum": p.counter_sum, "maps": set(p.maps)}
+
+    def earned_milestone(self, env_idx: int) -> bool:
+        """Spawn-relative MILESTONE crossing — the forward-regime outcome signal.
+
+        A tier-0 spawn (no party/badge handed) succeeds only by EARNING
+        ``started()`` (party>0 or a badge — the original BackwardCurriculum
+        milestone). A spawn already handed that milestone reports against the
+        NEXT unearned tier: a new badge or story event flag beyond its spawn
+        baseline. Map transitions never count (walking out the spawn building
+        is not a milestone), and restored progress can never be a success (it
+        is folded into the spawn baseline at :meth:`reset`). The tiers come
+        from the game-progress spec's own milestone taxonomy — no tuned bar.
+        """
+        p = self._envs.get(int(env_idx))
+        if p is None:
+            return False
+        if p.spawn_party == 0 and p.spawn_badges == 0:
+            return p.party_count > 0 or p.badges > 0
+        return p.badges > p.spawn_badges or p.events > p.spawn_events
 
 
 __all__ = ["ProgressReward"]

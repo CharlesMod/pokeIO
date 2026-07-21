@@ -1874,6 +1874,7 @@ class BarrierFleet:
         reflex_ema_decay: float = 0.99,
         reflex_beta: float = 4.0,
         sub_steps: int = 1,
+        numa_node: int | None = None,
     ):
         self.n_envs = int(n_envs)
         self.obs_dim = int(obs_dim)
@@ -1898,6 +1899,10 @@ class BarrierFleet:
         # Derive the fixed cell-key length from the archive's geometry.
         probe = _archive_key_len(archive_kwargs, wram_stride)
         self.key_len = probe
+        # Kept for parent-side consumers that must hash/hold IDENTICAL keys to
+        # the workers (e.g. the brain trainer's parent NoveltyArchive — the
+        # WRAM churn-mask must match on both sides, loop.py:3686 idiom).
+        self.archive_kwargs = dict(archive_kwargs)
 
         # A5: size the Go-Explore state buffers from an ACTUAL save_state (probed
         # once here, mirroring the key-length probe) instead of a hardcoded cap,
@@ -1955,7 +1960,15 @@ class BarrierFleet:
 
         # ------------------------------------------------------------ workers
         self._ctx = mp.get_context("spawn")
-        core_order = _numa_core_order()
+        # Dual-run pinning: the interleaved core order is DETERMINISTIC, so two
+        # concurrent fleets (e.g. the brain6r/brain6g arms) would otherwise pin
+        # their workers to the IDENTICAL first-N cores — 2 hot-spinning workers
+        # per core while the rest of the box idles. ``numa_node`` restricts this
+        # fleet's workers to one socket so concurrent fleets stay disjoint.
+        if numa_node is not None and int(numa_node) in NUMA_NODES:
+            core_order = list(NUMA_NODES[int(numa_node)])
+        else:
+            core_order = _numa_core_order()
         epw = max(1, int(envs_per_worker))
         self._epw = epw
         # A8: generous per-round wall-clock deadline (see module constants).

@@ -70,6 +70,12 @@ class CellEntry:
     visits: int = 1  # times the cell has been reached (any player, any gen)
     selections: int = 0  # times chosen as a restart point
     gen_seen: int = 0  # most recent generation the cell was reached
+    # Progress snapshot of the DISCOVERING trajectory at capture time (running
+    # milestone maxes + maps-seen set — see ProgressReward.snapshot). A spawn
+    # restored from this cell seeds its reward baseline from it, so handed
+    # progress INCLUDING the trajectory's already-traversed maps is never
+    # re-payable (teleport-decoupling). None for legacy/NEAT captures.
+    progress: dict | None = None
 
 
 # --------------------------------------------------------------------------
@@ -230,7 +236,8 @@ class GoExplore:
         entry.gen_seen = self.cur_gen
         return True
 
-    def store_captured(self, key: bytes, state: bytes, depth: int) -> None:
+    def store_captured(self, key: bytes, state: bytes, depth: int,
+                       progress: dict | None = None) -> None:
         """Store a state blob captured in a worker for a freshly-discovered cell.
 
         The parallel fleet captures the emulator state inside the worker that
@@ -238,6 +245,8 @@ class GoExplore:
         globally-new, i.e. while the worker still sits in that exact state), then
         hands the bytes to the parent, which calls this.  Mirrors the capture
         branch of :meth:`note` (capacity-bounded, evicts the least-useful entry).
+        ``progress`` (optional) is the discovering trajectory's reward snapshot
+        at capture time (see :class:`CellEntry`).
         """
         if key in self.cells:  # already stored (e.g. flagged twice); keep first
             return
@@ -250,6 +259,7 @@ class GoExplore:
             depth=int(depth),
             gen_added=self.cur_gen,
             gen_seen=self.cur_gen,
+            progress=progress,
         )
 
     # ---------------------------------------------------------------- weight

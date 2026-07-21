@@ -34,7 +34,7 @@ import torch.nn as nn
 
 from pokeio.brain.actor_critic import ActorCritic
 from pokeio.brain.coupling import coupling_report
-from pokeio.brain.replay import BackwardCurriculum, DemoTrajectory
+from pokeio.brain.replay import BackwardCurriculum, DemoTrajectory, ForwardCurriculum
 from pokeio.brain.reward import ProgressReward
 
 
@@ -60,6 +60,13 @@ class BrainConfig:
     eval_every: int = 20          # iterations between from-boot gate evals
     eval_horizon: int = 896
     seed: int = 0
+    # -- forward-progression (brain6) archive bounds: RESOURCE caps, not behaviour
+    # knobs, mirroring the NEAT loop's defaults (loop.py --goexplore-capacity /
+    # --goexplore-caps-per-round). capacity bounds blob RAM (the only heavy
+    # payload); caps_per_round meters the measured ~47 ms worker-side save_states
+    # (the realtime CPU-burn cause) via the archive's existing token bucket.
+    goexplore_capacity: int = 16384
+    goexplore_caps_per_round: float = 4.0
 
 
 def _gae(rewards, values, last_value, gamma, lam):
@@ -84,7 +91,7 @@ class BrainTrainer:
 
     def __init__(self, fleet, *, grid: int = 12, fovea_grid: int | None = None,
                  mem_grid: int = 0, reflex_gaze: bool = True, learned_gaze: bool = False,
-                 device="cuda:1",
+                 forward: bool = False, device="cuda:1",
                  demo: DemoTrajectory | None = None, cfg: BrainConfig | None = None):
         self.fleet = fleet
         self.cfg = cfg or BrainConfig()
@@ -121,7 +128,34 @@ class BrainTrainer:
         self.opt = torch.optim.Adam(self.policy.parameters(), lr=self.cfg.lr)
         self.reward = ProgressReward(self.n_envs)
         self.demo = demo if demo is not None else DemoTrajectory()
-        self.curriculum = BackwardCurriculum(len(self.demo), seed=self.cfg.seed)
+        # Forward-progression regime (brain6): episodes spawn from a SELF-TUNING
+        # mix of {boot, demo depth, Go-Explore archive frontier} so no open-loop
+        # script solves the start distribution and vision becomes necessary. The
+        # capture half of the fleet's goexplore plumbing (dormant in the backward
+        # path) is switched on: worker cell keys feed a parent NoveltyArchive
+        # (bookkeeping only — keys are computed worker-side with the fleet's own
+        # geometry) and promising cells are captured into a bounded GoExplore
+        # archive whose states seed later spawns. Off => byte-identical backward.
+        self._forward = bool(forward)
+        if self._forward:
+            from pokeio.reward.archive import NoveltyArchive
+            from pokeio.reward.goexplore import GoExplore
+
+            self.curriculum = ForwardCurriculum(len(self.demo), seed=self.cfg.seed)
+            # The parent novelty set must hold the SAME (churn-masked) keys the
+            # workers mint: reuse the fleet's archive kwargs (brain_loop's
+            # build_fleet calibrates the WRAM churn-mask, the loop.py:3647-3686
+            # idiom). Unmasked keys land in the tile-map buffer that churns on
+            # every camera scroll — the seen-set would grow without bound and
+            # the capture budget would be spent on scroll/animation noise.
+            self.archive = NoveltyArchive(
+                **dict(getattr(fleet, "archive_kwargs", None) or {}))
+            self.goexplore = GoExplore(
+                capacity=self.cfg.goexplore_capacity,
+                caps_per_round=self.cfg.goexplore_caps_per_round,
+                rng=np.random.default_rng(self.cfg.seed + 1))
+        else:
+            self.curriculum = BackwardCurriculum(len(self.demo), seed=self.cfg.seed)
         # RAM block slice of the foveal obs (for the coupling ablation probe).
         self._ram_slice = (self.obs_dim - int(getattr(fleet, "obs_ram", 8)), self.obs_dim)
         self.iter = 0
@@ -132,10 +166,24 @@ class BrainTrainer:
         w = self.fleet.arr["wram"]
         return [w[i] for i in range(self.n_envs)]
 
-    def _horizon(self) -> int:
+    def _horizon(self, spawns=None) -> int:
         # At boot (frontier receded to 0) use the full EXPLORE horizon, so from-boot
         # episodes run long PAST the demo's endpoint and the dense from-boot reward
         # can pull the policy toward the next milestones (deeper into the game).
+        if spawns is not None:
+            # Forward mix: the SAME rule generalized per spawn, no new constant.
+            # A demo spawn has a known distance-to-goal, so it gets the backward
+            # formula with the batch's shallowest sampled depth standing in for
+            # the frontier (the frontier IS where backward's depths cluster). A
+            # boot/archive spawn has no known distance-to-goal — exactly the
+            # existing frontier<=0 case — so it needs the horizon_max explore/
+            # compute cap. One rollout shares one H: take the max over the batch.
+            demo_depths = [d for s, d in spawns if s == "demo" and d > 0]
+            if len(demo_depths) < len(spawns):
+                return self.cfg.horizon_max
+            played = len(self.demo) - min(demo_depths)
+            return int(np.clip(played + self.cfg.horizon_margin,
+                               self.cfg.horizon_min, self.cfg.horizon_max))
         if self.curriculum.frontier <= 0:
             return self.cfg.horizon_max
         played = len(self.demo) - self.curriculum.frontier
@@ -166,14 +214,109 @@ class BrainTrainer:
                                       ldx.copy(), ldy.copy())
         return gdx.astype(np.float32), gdy.astype(np.float32)
 
-    # -- one backward-robustification rollout ------------------------------
+    # -- forward-progression spawn/capture plumbing (brain6) ----------------
+    def _demo_history(self, depth: int):
+        """Spawning-trajectory progress for a demo-depth restore (``None`` at
+        boot, and for demo stand-ins that expose no ``history_at``)."""
+        if depth <= 0:
+            return None
+        fn = getattr(self.demo, "history_at", None)
+        return fn(depth) if fn else None
+
+    def _forward_spawns(self):
+        """Draw this rollout's spawn mix and build the fleet restore map.
+
+        Returns ``(spawns, restore, base_depth, histories)``. Demo blobs come
+        from the demo capture ladder; archive blobs from Go-Explore
+        ``sample_many`` (exactly the NEAT restore idiom, loop.py).
+        ``base_depth`` is each env's CUMULATIVE distance-from-newgame (demo
+        depth, or the restored cell's chained depth) so cells discovered this
+        rollout store honest frontier depths. ``histories`` maps env -> the
+        spawning trajectory's progress snapshot (demo prefix / capturing cell's
+        reward state) for the teleport-decoupled reward baseline."""
+        N = self.n_envs
+        spawns = self.curriculum.sample_spawns(N, self.goexplore.size)
+        base_depth = np.zeros(N, dtype=np.int64)
+        histories: dict[int, dict] = {}
+        restore = self.demo.restore_map(
+            {i: d for i, (s, d) in enumerate(spawns) if s == "demo"})
+        for i, (s, d) in enumerate(spawns):
+            if s == "demo":
+                base_depth[i] = d
+                h = self._demo_history(d)
+                if h:
+                    histories[i] = h
+        arch = [i for i, (s, _) in enumerate(spawns) if s == "archive"]
+        if arch:
+            for i, entry in zip(arch, self.goexplore.sample_many(len(arch))):
+                restore[i] = entry.state
+                base_depth[i] = entry.depth
+                if entry.progress:
+                    histories[i] = entry.progress
+            self.goexplore.n_restores += len(arch)
+        return spawns, restore, base_depth, histories
+
+    def _absorb_captures(self, keys, captured, cap_flags, pending, base_depth, t):
+        """One barrier round of parent-side Go-Explore bookkeeping (deferred
+        capture semantics — mirrors the NEAT barrier loop, train/loop.py):
+        fulfil the flags set LAST round (``captured`` holds the state each env
+        was still in), then pick this round's candidates — globally-new cells
+        plus still-rare re-captures of evicted ones — under the token budget
+        that meters the ~47 ms worker-side save_states."""
+        for i, (key, depth) in pending.items():
+            blob = captured.get(i)
+            if blob is not None:
+                # The reward has absorbed exactly through LAST round's step —
+                # the same state the worker's deferred capture serialized — so
+                # this snapshot is the blob's own progress history (running
+                # maxes + maps traversed), stored with it for teleport-decoupled
+                # re-baselining when the cell later seeds a spawn.
+                self.goexplore.store_captured(key, blob, depth,
+                                              progress=self.reward.snapshot(i))
+        pending.clear()
+        cap_flags[:] = 0
+        cand: list[tuple[int, bytes]] = []
+        for i in range(self.n_envs):
+            key = keys[i].tobytes()
+            globally_new = self.archive.add(key)
+            prior = self.archive.visit(key)
+            if not self.goexplore.revisit(key) and (globally_new or prior < 3):
+                cand.append((i, key))
+        self.goexplore.feed_capture_budget(1.0)
+        off = t % len(cand) if cand else 0
+        for j in range(len(cand)):
+            if not self.goexplore.admit_capture():
+                self.goexplore.n_throttled += len(cand) - 1 - j
+                break
+            i, key = cand[(off + j) % len(cand)]
+            cap_flags[i] = 1
+            pending[i] = (key, int(base_depth[i]) + t)
+
+    # -- one curriculum rollout (backward demo-recede, or forward spawn-mix) --
     def rollout(self) -> dict:
         cfg, N = self.cfg, self.n_envs
-        depths = self.curriculum.sample_depths(N)
-        restore = self.demo.restore_map({i: depths[i] for i in range(N)})
+        if self._forward:
+            spawns, restore, base_depth, histories = self._forward_spawns()
+            self.goexplore.begin_generation(self.iter)  # recency clock = iters
+        else:
+            spawns = None
+            depths = self.curriculum.sample_depths(N)
+            restore = self.demo.restore_map({i: depths[i] for i in range(N)})
+            histories = {}
+            for i in range(N):
+                h = self._demo_history(depths[i])
+                if h:
+                    histories[i] = h
         obs = self.fleet.reset_all(restore=restore).copy()
-        self.reward.reset_many(range(N), self._wram_rows())
-        H = self._horizon()
+        # TELEPORT-DECOUPLING INVARIANT: re-baseline the reward from the RESTORED
+        # state's WRAM (the reset round published it) PLUS the spawning
+        # trajectory's own progress history BEFORE any reward step — progress a
+        # spawn was HANDED (running maxes AND the maps its trajectory already
+        # traversed, which the WRAM alone cannot show) is never paid, for demo
+        # AND archive spawns alike.
+        self.reward.reset_many(range(N), self._wram_rows(),
+                               [histories.get(i) for i in range(N)])
+        H = self._horizon(spawns)
 
         obs_buf = np.zeros((H, N, self.obs_dim), np.float32)
         act_buf = np.zeros((H, N), np.int64)
@@ -182,6 +325,8 @@ class BrainTrainer:
         rew_buf = np.zeros((H, N), np.float32)
         gaze_buf = np.zeros((H, N, 2), np.float32) if self._learned_gaze else None
         reached = np.zeros(N, dtype=bool)
+        cap_flags = np.zeros(N, np.uint8) if self._forward else None
+        pending: dict[int, tuple[bytes, int]] = {}
 
         for t in range(H):
             buttons, logp, value, gaze = self._act(obs)
@@ -192,7 +337,13 @@ class BrainTrainer:
             if gaze_buf is not None:
                 gaze_buf[t] = gaze
             gdx, gdy = self._gaze(obs, N, learned=gaze)
-            obs2, _keys, _dones, _cap = self.fleet.step_all(buttons, gaze_dx=gdx, gaze_dy=gdy)
+            if self._forward:
+                obs2, keys, _dones, captured = self.fleet.step_all(
+                    buttons, capture_flags=cap_flags, gaze_dx=gdx, gaze_dy=gdy)
+                self._absorb_captures(keys, captured, cap_flags, pending,
+                                      base_depth, t)
+            else:
+                obs2, _keys, _dones, _cap = self.fleet.step_all(buttons, gaze_dx=gdx, gaze_dy=gdy)
             rew_buf[t] = self.reward.step_many(range(N), self._wram_rows())
             obs = obs2.copy()
             reached |= np.array([self.reward.started(i) for i in range(N)])
@@ -202,7 +353,21 @@ class BrainTrainer:
                 torch.as_tensor(obs, dtype=torch.float32, device=self.device)
             )[1].cpu().numpy()
         adv, ret = _gae(rew_buf, val_buf, last_v, cfg.gamma, cfg.lam)
-        self.curriculum.report_many(reached.tolist())
+        if self._forward:
+            # Outcome = spawn-relative MILESTONE crossing (earned_milestone):
+            # a tier-0 spawn succeeds only by EARNING started() (party>0/badge
+            # — the same real milestone the BackwardCurriculum receded on); a
+            # spawn handed that milestone reports against the NEXT unearned
+            # badge/event tier. Immune to the started() leak (handed party>0
+            # is in the spawn baseline, not a success) AND not trivially
+            # satisfiable by +w_map map transitions — 'walk out the door' must
+            # not recede the frontier, flip ent_coef into its decisiveness
+            # penalty, or saturate the source EMAs. ``reached`` stays a pure
+            # metric here.
+            progressed = [self.reward.earned_milestone(i) for i in range(N)]
+            self.curriculum.report_spawns([s for s, _ in spawns], progressed)
+        else:
+            self.curriculum.report_many(reached.tolist())
         return {
             "obs": obs_buf.reshape(H * N, self.obs_dim),
             "act": act_buf.reshape(H * N),
@@ -337,6 +502,12 @@ class BrainTrainer:
             stats = self.update(batch)
             rec = {"iter": self.iter, **{k: batch[k] for k in ("H", "reached", "rew_sum_mean")},
                    **stats, **self.curriculum.state()}
+            if self._forward:
+                # Seen-set growth is the churn-mask's health metric (an unmasked
+                # key stream grows this without bound); goexplore_states shows
+                # whether the capture budget is buying real frontier cells.
+                rec["archive_cells"] = self.archive.size
+                rec["goexplore_states"] = self.goexplore.size
             if self.cfg.eval_every and self.iter % self.cfg.eval_every == 0:
                 rec["eval"] = self.evaluate_gate()
             self.history.append(rec)
