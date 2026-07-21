@@ -1,22 +1,51 @@
 #!/bin/bash
 # Idempotent training-pipeline manager (survives the box's solar-power reboots).
 #
-# Drives the run SEQUENCE and keeps the dashboard up, resuming from checkpoints:
-#   brain4  reflex-only baseline, S=1 (2.49 Hz)         -> to 400 iters
-#   brain5  Path-B LEARNED GAZE A/B, S=2 (4.98 Hz)       -> to 400 iters, --learned-gaze
+# BRAIN6 era: FORWARD-PROGRESSION (vision-necessary) dual-GPU A/B, both arms
+# CONCURRENT (independent guards, may launch in the same 5-min tick):
+#   brain6r  reflex-only gaze,        cuda:0, --forward            -> to 400 iters
+#   brain6g  LEARNED gaze (Path B),   cuda:1, --forward --learned-gaze -> to 400 iters
 #
-# brain5 auto-launches only once brain4 has logged 400 iters AND its process has fully
-# exited (so it has checkpointed/exported and freed cuda:1 — no GPU contention). Safe to
-# call repeatedly: an @reboot hook recovers fast, a */5 cron drives the handoff + ongoing
-# resume. Self-terminating once both runs reach 400 (just logs "nothing to do").
+# WHY --forward: brain4/brain5 proved boot-reset episodes are solvable by an
+# open-loop memorized script (mode collapse at progress 32.0), starving the
+# learned gaze of gradient (battery verdict: learned head < random). --forward
+# mixes spawn sources {boot, demo depth, Go-Explore archive frontier} with a
+# self-tuning mass per source, so no single script solves the distribution and
+# vision becomes necessary.
+#
+# CONCLUDED runs — never resumed here: brain4 (done at 400) and brain5
+# (deliberately STOPPED at iter 210 = the approved brain6 warm-start seed).
+#
+# First launch of an arm: --warm-start runs/brain5/brain.pt (policy only,
+# strict=False — the gaze keys drop cleanly into brain6r's gaze-less arch; fresh
+# optimizer/curriculum/ent-coef/iter). Later ticks: --resume the arm's own
+# checkpoint. NOTE --resume strict-loads, so brain6g must keep --learned-gaze on
+# every launch (its checkpoints carry the gaze head) and brain6r must never gain
+# it. Neither arm passes --saccade-substeps (derived S=2, 4.98 Hz, as brain5).
+#
+# Dashboards don't clobber: one serve.py on :8600 serves ALL runs; each trainer
+# writes only its own runs/<id>/live.json (+ per-run control files). Pin tabs
+# with /brain?run=brain6r and /brain?run=brain6g (no ?run= = newest by mtime).
+#
+# CPU: the arms run CONCURRENTLY, so each is pinned to its own NUMA node
+# (--numa-node 0/1) — without this both fleets pin their spin-workers to the
+# IDENTICAL deterministic core list (2-per-core on 32 cores, 24 idle). 28 envs
+# per arm = one spin-worker per core of a 28-core node (2x Xeon E5-2690 v4).
 #
 # DISABLE: `crontab -l | grep -v train_pipeline | crontab -`
 set -u
 cd /home/cmod/pokeIO || exit 0
+# Single-instance lock: a manual invocation racing a */5 cron tick in the same
+# second launched DUPLICATE arms on 2026-07-20 (the pgrep guard can't see a child
+# in the sub-second window before its cmdline exists). flock serializes runs;
+# a concurrent instance exits immediately rather than double-launching.
+exec 9>runs/_pipeline.lock
+flock -n 9 || exit 0
 export PYTHONPATH=.
 PY=.venv/bin/python
 LOG=runs/_pipeline.log
 ITERS=400
+SEED_CKPT=runs/brain5/brain.pt   # approved warm-start: brain5 iter 210
 
 maxit() {  # highest logged iter for run id $1 (0 if none)
     "$PY" - "$1" <<'PYEOF'
@@ -38,35 +67,35 @@ if ! pgrep -f "[p]okeio.dash.serve" >/dev/null; then
     echo "[pipeline $(date)] started dashboard" >> "$LOG"
 fi
 
-# Stage 1: brain4 (reflex-only baseline, S=1) to 400.
-b4=$(maxit brain4)
-if [ "${b4:-0}" -lt "$ITERS" ]; then
-    if ! running brain4; then
-        nohup "$PY" -m pokeio.train.brain_loop --n-envs 64 --iterations "$ITERS" \
-            --device cuda:1 --eval-every 10 --checkpoint-every 10 --run-id brain4 \
-            --resume runs/brain4/brain.pt --saccade-substeps 1 --dashboard \
-            >> runs/_brain4.log 2>&1 &
-        echo "[pipeline $(date)] resumed brain4 (was iter $b4)" >> "$LOG"
-    fi
-    exit 0
-fi
-# brain4 logged 400 but may still be exiting (final checkpoint/export/free GPU): wait.
-if running brain4; then
-    echo "[pipeline $(date)] brain4 hit $ITERS; letting it exit before brain5" >> "$LOG"
-    exit 0
-fi
+# STOP sentinel: `touch runs/_pipeline.stop` halts run management (dashboard keepalive
+# above still runs); `rm runs/_pipeline.stop` resumes within 5 min from latest checkpoints.
+[ -f runs/_pipeline.stop ] && exit 0
 
-# Stage 2: brain5 (Path-B LEARNED GAZE A/B, S=2) to 400 — cuda:1 is now free.
-b5=$(maxit brain5)
-if [ "${b5:-0}" -lt "$ITERS" ]; then
-    if ! running brain5; then
-        RESUME=""
-        [ -f runs/brain5/brain.pt ] && RESUME="--resume runs/brain5/brain.pt"
-        nohup "$PY" -m pokeio.train.brain_loop --n-envs 64 --iterations "$ITERS" \
-            --device cuda:1 --eval-every 10 --checkpoint-every 10 --run-id brain5 \
-            --learned-gaze $RESUME --dashboard >> runs/_brain5.log 2>&1 &
-        echo "[pipeline $(date)] launched brain5 --learned-gaze (was iter $b5; resume='$RESUME')" >> "$LOG"
+# arm <run-id> <device> [extra flags...]: drive one brain6 arm to $ITERS.
+# Warm-start on first launch, resume-from-own-checkpoint afterwards. Guarded by
+# the [b]racket pgrep + maxit, so repeated ticks are no-ops while it runs.
+arm() {
+    local id=$1 dev=$2 it src
+    shift 2
+    it=$(maxit "$id")
+    [ "${it:-0}" -ge "$ITERS" ] && return 0
+    running "$id" && return 0
+    if [ -f "runs/$id/brain.pt" ]; then
+        src="--resume runs/$id/brain.pt"
+    else
+        src="--warm-start $SEED_CKPT"
     fi
-    exit 0
+    nohup "$PY" -m pokeio.train.brain_loop --n-envs 28 --iterations "$ITERS" \
+        --device "$dev" --forward --eval-every 10 --checkpoint-every 10 \
+        --run-id "$id" --dashboard $src "$@" >> "runs/_$id.log" 2>&1 &
+    echo "[pipeline $(date)] launched $id on $dev (was iter $it; src='$src')" >> "$LOG"
+}
+
+# Both arms every tick — separate GPUs, separate NUMA nodes, separate run dirs.
+arm brain6r cuda:0 --numa-node 0
+arm brain6g cuda:1 --learned-gaze --numa-node 1
+
+if [ "$(maxit brain6r)" -ge "$ITERS" ] && [ "$(maxit brain6g)" -ge "$ITERS" ] \
+    && ! running brain6r && ! running brain6g; then
+    echo "[pipeline $(date)] brain6r + brain6g both at $ITERS; nothing to do" >> "$LOG"
 fi
-echo "[pipeline $(date)] brain4 + brain5 both at $ITERS; nothing to do" >> "$LOG"
