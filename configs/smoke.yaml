@@ -1,0 +1,19 @@
+# ROM-free, CPU-only smoke run on the gridworld fake console.
+#   python -m pokeio train --spec games/gridworld/spec.yaml --config configs/smoke.yaml
+spec: games/gridworld/spec.yaml
+vec:
+  num_workers: 2
+  envs_per_worker: 4
+  batch_workers: 1
+policy:
+  conv: [[16, 8, 4], [32, 4, 2]]
+  hidden: 128
+  bits_hidden: 32
+train:
+  total_steps: 200000
+  rollout_len: 64
+  bptt: 16
+  minibatch_seqs: 8
+  device: cpu
+  checkpoint_every: 20
+  run_name: smoke

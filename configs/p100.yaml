@@ -1,0 +1,20 @@
+# The training box: 2x Xeon (28 cores / 56 threads), 128 GB, 2x Tesla P100 16 GB.
+# Use on top of default.yaml:  --config configs/default.yaml --config configs/p100.yaml
+#
+# * 52 workers x 6 envs = 312 envs; half the workers per batch so emulation
+#   overlaps inference. Leaves 4 threads for the learner process.
+# * Pascal (sm_60): no bf16, no tensor cores, no Triton/Inductor -> compile off.
+#   fp16 autocast is worth an A/B (P100 has 2x-rate fp16); off by default.
+# * One run per GPU: launch a second seed with train.device=cuda:1.
+# * PyTorch: pin <= 2.14 with CUDA 12.6 wheels (2.15 drops Pascal).
+vec:
+  num_workers: 52
+  envs_per_worker: 6
+  batch_workers: 26
+  pin_cpus: false
+
+train:
+  rollout_len: 192          # 312 envs x 192 = 59,904 steps per update
+  amp: false
+  compile: false
+  checkpoint_every: 50

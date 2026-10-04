@@ -14,3 +14,6 @@ roms/*.sav
 
 # libretro cores (fetched via scripts/fetch_cores.py; open-source but not tracked as binaries)
 assets/cores/*.so
+probe/
+recording/
+*.egg-info/

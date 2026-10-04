@@ -1,0 +1,32 @@
+[project]
+name = "pokeio"
+version = "3.0.0.dev0"
+description = "Game-agnostic recurrent-PPO agent for console games (Pokémon Yellow first)."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pyyaml>=6",
+    "pyboy>=2.5",
+    # Pascal (P100, sm_60): last prebuilt wheels are torch 2.14 + CUDA 12.6.
+    "torch>=2.4,<2.15",
+]
+
+[project.optional-dependencies]
+tb = ["tensorboard"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+pokeio = "pokeio.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["pokeio*"]
+
+[tool.setuptools.package-data]
+pokeio = ["dash/static/*.html"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

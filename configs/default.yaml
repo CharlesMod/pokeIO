@@ -1,0 +1,32 @@
+# Defaults mirror pokemonred_puffer's swept PPO settings (config.yaml, CARBS),
+# which the sweeps barely moved from: lr 2e-4, gamma 0.998, lambda 0.95,
+# clip 0.1, vf_clip 0.1, ent 0.01, 3 epochs, BPTT 16, minibatch 2048 steps.
+spec: games/pokemon_yellow/spec.yaml
+
+vec:
+  num_workers: 24
+  envs_per_worker: 12
+  batch_workers: 12
+
+policy:
+  conv: [[32, 8, 2], [64, 4, 2], [64, 3, 2]]
+  bits_hidden: 128
+  hidden: 512
+  layer_norm: true
+
+train:
+  total_steps: 2000000000
+  rollout_len: 128
+  bptt: 16
+  minibatch_seqs: 128
+  epochs: 3
+  lr: 0.0002
+  gamma: 0.998
+  gae_lambda: 0.95
+  clip: 0.1
+  vf_clip: 0.1
+  vf_coef: 0.5
+  ent_coef: 0.01
+  max_grad_norm: 0.5
+  value_norm: true
+  device: cuda

@@ -1,0 +1,153 @@
+# Pokémon Red (Game Boy). Cross-check target: the same engine on the game that
+# pokemonred_puffer and Pleines et al. 2025 report results for. All addresses are
+# verified against pret/pokered's pokered.sym (as shipped by pokemonred_puffer).
+#
+# Start state: copy pyboy_states/Bulbasaur.state (post-parcel, Bulbasaur, the
+# puffer default) from drubinstein/pokemonred_puffer to roms/red_bulbasaur.state,
+# and pokemonred_puffer/pokered.sym to roms/pokered.sym.
+
+name: pokemon_red
+platform: gameboy
+rom: roms/pokemon_red.gb
+symbols: roms/pokered.sym
+
+start:
+  states: [roms/red_bulbasaur.state]
+  memory_patches:
+    - {field: options, value: 0xC1, only_if_mask: 0x0F, only_if_in: [1, 3, 5]}
+
+controls:
+  buttons: [down, left, right, up, a, b, start]
+  frames_per_action: 24
+  press_frames: 8
+  wait_while: {field: joy_ignore, op: nonzero}
+  wait_button: a
+  wait_max_loops: 1000
+
+screen:
+  downsample: 2
+  levels: 4
+
+memory:
+  map_id:          {addr: 0xD35E}
+  player_y:        {addr: 0xD361}
+  player_x:        {addr: 0xD362}
+  in_battle:       {addr: 0xD057}
+  party_count:     {addr: 0xD163}
+  party_species:   {addr: 0xD164, count: 6}
+  party_levels:    {addr: 0xD18C, count: 6, stride: 44}
+  party_hp:        {addr: 0xD16C, type: u16be, count: 6, stride: 44}
+  party_max_hp:    {addr: 0xD18D, type: u16be, count: 6, stride: 44}
+  badges:          {addr: 0xD356}
+  money:           {addr: 0xD347, type: bcd, bcd_bytes: 3}
+  event_flags:     {addr: 0xD747, length: 320}
+  pokedex_owned:   {addr: 0xD2F7, length: 19}
+  options:         {addr: 0xD355}
+  joy_ignore:      {addr: 0xCD6B}
+
+position:
+  room: map_id
+  x: player_x
+  y: player_y
+  cell_px: 16
+  player_cell_px: [64, 64]
+  pause_when: {field: in_battle, op: nonzero}
+
+observation:
+  vector:
+    - {field: map_id, kind: categorical, num: 256, embed: 8}
+    - {field: in_battle, kind: categorical, num: 256, embed: 2}
+    - {field: party_species, kind: categorical, num: 256, embed: 8}
+    - {field: party_levels, kind: scalar, scale: 0.01}
+    - {field: party_hp, kind: ratio, denom: party_max_hp}
+    - {field: party_count, kind: scalar, scale: 0.1667}
+    - {field: badges, kind: bits}
+    - {field: event_flags, kind: bits}
+
+rewards:
+  exploration:
+    cell_weight: 0.01
+    half_life_steps: 0
+    interaction_weight: 0.01
+  terms:
+    - {name: events, kind: bitcount, field: event_flags, weight: 1.0, ignore_bits: [[13, 0]]}
+    - {name: badges, kind: bitcount, field: badges, weight: 5.0}
+    - {name: party, kind: value, field: party_count, weight: 1.0}
+    - {name: caught, kind: bitcount, field: pokedex_owned, weight: 1.0}
+    - {name: levels, kind: sum_softcap, field: party_levels, count_field: party_count,
+       knee: 22, slope: 0.25, weight: 0.5, swarm: false}
+    - {name: heal, kind: ratio_gain, field: party_hp, denom: party_max_hp,
+       count_field: party_count, weight: 1.0}
+
+milestones:
+  - {name: viridian_forest, when: {field: map_id, op: eq, value: 51}}
+  - {name: pewter_city,     when: {field: map_id, op: eq, value: 2}}
+  - {name: badge_boulder,   when: {field: badges, op: bit, index: 0}}
+  - {name: mt_moon,         when: {field: map_id, op: eq, value: 59}}
+  - {name: cerulean_city,   when: {field: map_id, op: eq, value: 3}}
+  - {name: badge_cascade,   when: {field: badges, op: bit, index: 1}}
+  - {name: vermilion_city,  when: {field: map_id, op: eq, value: 5}}
+  - {name: badge_thunder,   when: {field: badges, op: bit, index: 2}}
+
+swarm:
+  enabled: true
+  score: progress
+  min_delta: 3.0
+  fraction: 0.9
+  min_interval_steps: 2000000
+
+episode:
+  memory_reset_steps: 19816
+  memory_reset_jitter: 2000
+  start_jitter_frames: 60
+
+# Dashboard-only labels (pokered map constants; the agent never sees these).
+display:
+  title: "Pokémon Red"
+  frames_per_second: 59.73
+  palette: ["#0f380f", "#306230", "#8bac0f", "#9bbc0f"]
+  room_names:
+    0: Pallet Town
+    1: Viridian City
+    2: Pewter City
+    3: Cerulean City
+    4: Lavender Town
+    5: Vermilion City
+    6: Celadon City
+    7: Fuchsia City
+    8: Cinnabar Island
+    9: Indigo Plateau
+    10: Saffron City
+    12: Route 1
+    13: Route 2
+    14: Route 3
+    15: Route 4
+    16: Route 5
+    17: Route 6
+    18: Route 7
+    19: Route 8
+    20: Route 9
+    21: Route 10
+    22: Route 11
+    23: Route 12
+    24: Route 13
+    25: Route 14
+    26: Route 15
+    27: Route 16
+    28: Route 17
+    29: Route 18
+    30: Route 19
+    31: Route 20
+    32: Route 21
+    33: Route 22
+    34: Route 23
+    35: Route 24
+    36: Route 25
+    37: Player's House 1F
+    38: Player's House 2F
+    39: Rival's House
+    40: Oak's Lab
+    51: Viridian Forest
+    59: Mt. Moon 1F
+    60: Mt. Moon B1F
+    61: Mt. Moon B2F

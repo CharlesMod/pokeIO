@@ -1,0 +1,180 @@
+# Pokémon Yellow (Game Boy). The ONLY place Yellow-specific facts live.
+#
+# Address provenance (see games/README.md):
+#   [V] verified on the ROM by pokeIO v2 (assets/demo_pikachu, 2026-07-18)
+#   [D] derived: Red address (pokered.sym) minus 1. Every [V] address in the
+#       D057..D747 range is exactly Red-1, so these are high-confidence but
+#       should be confirmed once with `python -m pokeio probe`.
+#   [S] symbol only: resolved from roms/pokeyellow.sym if present (build it from
+#       pret/pokeyellow with `make`), otherwise silently disabled.
+
+name: pokemon_yellow
+platform: gameboy
+rom: roms/pokemon_yellow.gb
+rom_md5: d9290db87b1f0a23b89f99ee4469e34b
+symbols: roms/pokeyellow.sym
+platform_options:
+  cgb: false            # DMG mode: exact 4-shade frames (Yellow is CGB-enhanced)
+
+start:
+  states: [roms/yellow_newgame.state]
+  # `python -m pokeio make-state` replays this from power-on (ported from v2's
+  # scripts/make_newgame_state.py): boot, title, Oak's speech, preset names.
+  boot_macro:
+    - [tick, 400]
+    - [press, start, 20]
+    - [press, a, 30]
+    - [seq, [[press, a, 6], [press, down, 1]], 50]
+  memory_patches:
+    # Fast text, battle animations off, "set" battle style. Guarded: only applied
+    # when the low nibble looks like a text-speed value (1/3/5).
+    - {field: options, value: 0xC1, only_if_mask: 0x0F, only_if_in: [1, 3, 5]}
+
+controls:
+  buttons: [down, left, right, up, a, b, start]   # no SELECT (as in puffer / Pleines)
+  frames_per_action: 24
+  press_frames: 8
+  wait_while: {field: joy_ignore, op: nonzero}     # skip text/cutscenes [S]
+  wait_button: a
+  wait_max_loops: 1000
+
+screen:
+  downsample: 2        # 144x160 -> 72x80
+  levels: 4
+
+memory:
+  map_id:          {addr: 0xD35D}                          # [V] wCurMap
+  player_y:        {addr: 0xD360}                          # [V] wYCoord
+  player_x:        {addr: 0xD361}                          # [V] wXCoord
+  in_battle:       {addr: 0xD056}                          # [V] wIsInBattle
+  party_count:     {addr: 0xD162}                          # [V] wPartyCount
+  party_species:   {addr: 0xD163, count: 6}                # [V] wPartySpecies
+  party_levels:    {addr: 0xD18B, count: 6, stride: 44}    # [V] wPartyMon1Level
+  party_hp:        {addr: 0xD16B, type: u16be, count: 6, stride: 44}   # [D] wPartyMon1HP
+  party_max_hp:    {addr: 0xD18C, type: u16be, count: 6, stride: 44}   # [D] wPartyMon1MaxHP
+  badges:          {addr: 0xD355}                          # [V] wObtainedBadges
+  money:           {addr: 0xD346, type: bcd, bcd_bytes: 3} # [V] wPlayerMoney
+  event_flags:     {addr: 0xD746, length: 320}             # [V] start; [D] length (Red: 320)
+  pokedex_owned:   {addr: 0xD2F6, length: 19}              # [D] wPokedexOwned
+  options:         {addr: 0xD354}                          # [D] wOptions
+  joy_ignore:      {symbol: wJoyIgnore}                    # [S]
+
+position:
+  room: map_id
+  x: player_x
+  y: player_y
+  cell_px: 16                 # Gen-1 movement cell = 2x2 tiles
+  player_cell_px: [64, 64]    # player's cell on screen; check with probe's start_obs.png
+  pause_when: {field: in_battle, op: nonzero}
+
+observation:
+  vector:
+    - {field: map_id, kind: categorical, num: 256, embed: 8}
+    - {field: in_battle, kind: categorical, num: 256, embed: 2}
+    - {field: party_species, kind: categorical, num: 256, embed: 8}
+    - {field: party_levels, kind: scalar, scale: 0.01}
+    - {field: party_hp, kind: ratio, denom: party_max_hp}
+    - {field: party_count, kind: scalar, scale: 0.1667}
+    - {field: badges, kind: bits}
+    - {field: event_flags, kind: bits}
+
+rewards:
+  exploration:
+    cell_weight: 0.01           # per new (map, x, y); Pleines 0.005, puffer ~0.02-0.03
+    half_life_steps: 0          # binary memory, wiped every mini-episode (puffer default)
+    interaction_weight: 0.01    # A at a new (cell, facing) that changes the screen
+    interaction_buttons: [a]
+    screen_novelty_weight: 0.0
+  terms:
+    - {name: events, kind: bitcount, field: event_flags, weight: 1.0, ignore_bits: [[13, 0]]}  # museum ticket
+    - {name: badges, kind: bitcount, field: badges, weight: 5.0}
+    - {name: party, kind: value, field: party_count, weight: 1.0}
+    - {name: caught, kind: bitcount, field: pokedex_owned, weight: 1.0}
+    - {name: levels, kind: sum_softcap, field: party_levels, count_field: party_count,
+       knee: 22, slope: 0.25, weight: 0.5, swarm: false}
+    - {name: heal, kind: ratio_gain, field: party_hp, denom: party_max_hp,
+       count_field: party_count, weight: 1.0}
+
+# Eval/logging checkpoints (pokered map constants are shared by Yellow).
+milestones:
+  - {name: got_starter,     when: {field: party_count, op: ge, value: 1}}
+  - {name: route_1,         when: {field: map_id, op: eq, value: 12}}
+  - {name: viridian_city,   when: {field: map_id, op: eq, value: 1}}
+  - {name: viridian_forest, when: {field: map_id, op: eq, value: 51}}
+  - {name: pewter_city,     when: {field: map_id, op: eq, value: 2}}
+  - {name: badge_boulder,   when: {field: badges, op: bit, index: 0}}
+  - {name: mt_moon,         when: {field: map_id, op: eq, value: 59}}
+  - {name: cerulean_city,   when: {field: map_id, op: eq, value: 3}}
+  - {name: badge_cascade,   when: {field: badges, op: bit, index: 1}}
+  - {name: vermilion_city,  when: {field: map_id, op: eq, value: 5}}
+  - {name: badge_thunder,   when: {field: badges, op: bit, index: 2}}
+  - {name: badge_rainbow,   when: {field: badges, op: bit, index: 3}}
+  - {name: badge_soul,      when: {field: badges, op: bit, index: 4}}
+  - {name: badge_marsh,     when: {field: badges, op: bit, index: 5}}
+  - {name: badge_volcano,   when: {field: badges, op: bit, index: 6}}
+  - {name: badge_earth,     when: {field: badges, op: bit, index: 7}}
+
+swarm:
+  enabled: true
+  score: progress          # weighted events + badges + party + caught (levels excluded)
+  min_delta: 3.0
+  fraction: 0.9            # keep 10% of envs off the frontier for diversity
+  min_interval_steps: 2000000
+
+episode:
+  memory_reset_steps: 19816
+  memory_reset_jitter: 2000
+  hard_reset_steps: 0
+  stall_reset_steps: 0
+  start_jitter_frames: 60
+
+# Dashboard-only labels (pokered map constants; the agent never sees these).
+display:
+  title: "Pokémon Yellow"
+  frames_per_second: 59.73
+  palette: ["#0f380f", "#306230", "#8bac0f", "#9bbc0f"]
+  room_names:
+    0: Pallet Town
+    1: Viridian City
+    2: Pewter City
+    3: Cerulean City
+    4: Lavender Town
+    5: Vermilion City
+    6: Celadon City
+    7: Fuchsia City
+    8: Cinnabar Island
+    9: Indigo Plateau
+    10: Saffron City
+    12: Route 1
+    13: Route 2
+    14: Route 3
+    15: Route 4
+    16: Route 5
+    17: Route 6
+    18: Route 7
+    19: Route 8
+    20: Route 9
+    21: Route 10
+    22: Route 11
+    23: Route 12
+    24: Route 13
+    25: Route 14
+    26: Route 15
+    27: Route 16
+    28: Route 17
+    29: Route 18
+    30: Route 19
+    31: Route 20
+    32: Route 21
+    33: Route 22
+    34: Route 23
+    35: Route 24
+    36: Route 25
+    37: Player's House 1F
+    38: Player's House 2F
+    39: Rival's House
+    40: Oak's Lab
+    51: Viridian Forest
+    59: Mt. Moon 1F
+    60: Mt. Moon B1F
+    61: Mt. Moon B2F

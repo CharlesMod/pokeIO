@@ -1,0 +1,63 @@
+# ROM-free fake console (pokeio/platforms/gridworld.py) for tests and smoke runs.
+# Four rooms. Talking to the NPC in a room (A while facing it) sets that room's
+# event bit and opens the east door to the next room.
+#
+#   python -m pokeio train --spec games/gridworld/spec.yaml --config configs/smoke.yaml
+
+name: gridworld
+platform: gridworld
+rom: "-"
+platform_options: {rooms: 4, seed: 0}
+
+controls:
+  buttons: [down, left, right, up, a, b]
+  frames_per_action: 24
+  press_frames: 8
+  wait_while: {field: busy, op: nonzero}
+  wait_button: b
+
+screen:
+  downsample: 2
+  levels: 4
+
+memory:
+  room:   {addr: 0x00}
+  x:      {addr: 0x01}
+  y:      {addr: 0x02}
+  busy:   {addr: 0x04}
+  events: {addr: 0x10, length: 4}
+
+position:
+  room: room
+  x: x
+  y: y
+  cell_px: 16
+  camera: fixed           # rooms are drawn statically, cell (x, y) at (x, y) * 16 px
+
+observation:
+  vector:
+    - {field: room, kind: categorical, num: 8, embed: 4}
+    - {field: events, kind: bits}
+
+rewards:
+  exploration:
+    cell_weight: 0.02
+    interaction_weight: 0.05
+  terms:
+    - {name: events, kind: bitcount, field: events, weight: 1.0}
+
+milestones:
+  - {name: room_1, when: {field: room, op: ge, value: 1}}
+  - {name: room_2, when: {field: room, op: ge, value: 2}}
+  - {name: room_3, when: {field: room, op: ge, value: 3}}
+
+swarm:
+  enabled: true
+  score: progress
+  min_delta: 1.0
+  fraction: 0.75
+
+episode:
+  memory_reset_steps: 2000
+  memory_reset_jitter: 200
+  hard_reset_steps: 4000

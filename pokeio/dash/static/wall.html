@@ -1,0 +1,560 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pokeIO Training Wall</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0b0f0c; --panel: #121a14; --panel2: #18231b; --line: #24352a;
+  --text: #d6e7d0; --dim: #7f9a86; --gb0: #0f380f; --gb1: #306230; --gb2: #8bac0f; --gb3: #9bbc0f;
+  --gold: #f7c948; --hot: #ff6b4a; --blue: #5ab0ff; --violet: #b18cff;
+  --pixel: "Press Start 2P", ui-monospace, Menlo, monospace;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.4 var(--mono); }
+a { color: var(--gb3); }
+#top { display: flex; flex-wrap: wrap; align-items: center; gap: 18px; padding: 10px 16px;
+  border-bottom: 1px solid var(--line); background: linear-gradient(180deg, #102014, var(--bg)); position: sticky; top: 0; z-index: 5; }
+#logo { font: 16px var(--pixel); color: var(--gb3); letter-spacing: 1px; text-shadow: 0 0 12px #9bbc0f55; }
+#logo small { display: block; font: 9px var(--pixel); color: var(--dim); margin-top: 4px; }
+.stat { display: flex; flex-direction: column; min-width: 92px; }
+.stat b { font: 15px var(--mono); color: var(--text); font-weight: 600; }
+.stat span { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); }
+.spacer { flex: 1; }
+.badge { font: 9px var(--pixel); padding: 6px 8px; border-radius: 3px; background: var(--gb1); color: var(--gb3); }
+.badge.live { animation: pulse 1.6s infinite; }
+.badge.offline { background: #333; color: #aaa; animation: none; }
+.badge.stopping { background: #5a2a1a; color: var(--hot); }
+@keyframes pulse { 50% { box-shadow: 0 0 0 4px #9bbc0f33; } }
+button { font: 11px var(--mono); background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 3px; padding: 5px 9px; cursor: pointer; }
+button:hover { border-color: var(--gb2); }
+button.on { background: var(--gb1); border-color: var(--gb2); color: var(--gb3); }
+button.danger:hover { border-color: var(--hot); color: var(--hot); }
+
+main { display: grid; gap: 12px; padding: 12px 16px 40px;
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr) minmax(0, .8fr); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; min-width: 0; }
+.panel h2 { margin: 0 0 8px; font: 10px var(--pixel); color: var(--gb2); letter-spacing: .5px; display: flex; gap: 8px; align-items: center; }
+.panel h2 .sub { font: 11px var(--mono); color: var(--dim); margin-left: auto; letter-spacing: 0; }
+.span2 { grid-column: span 2; } .span3 { grid-column: 1 / -1; }
+@media (max-width: 1200px) { main { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } .span3, .span2 { grid-column: 1 / -1; } }
+@media (max-width: 760px) { main { grid-template-columns: minmax(0, 1fr); padding: 10px; } }
+
+/* hero */
+#hero-wrap { display: grid; grid-template-columns: minmax(0, 1fr) 210px; gap: 12px; }
+@media (max-width: 760px) { #hero-wrap { grid-template-columns: minmax(0, 1fr); } }
+.screen { width: 100%; image-rendering: pixelated; background: #000; border-radius: 4px; display: block; aspect-ratio: 160 / 144; }
+#hero-cap { margin: 6px 0 0; color: var(--dim); display: flex; flex-wrap: wrap; gap: 4px 12px; }
+#hero-cap b { color: var(--text); }
+.ctrls { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.bar { display: grid; grid-template-columns: 46px 1fr 38px; align-items: center; gap: 6px; margin: 3px 0; font-size: 11px; }
+.bar .track { height: 10px; background: var(--panel2); border-radius: 2px; overflow: hidden; }
+.bar .fill { height: 100%; background: var(--gb1); transition: width .12s; }
+.bar.chosen .fill { background: var(--gb3); }
+.bar.chosen { color: var(--gb3); }
+.kv { display: flex; justify-content: space-between; color: var(--dim); font-size: 11px; margin: 2px 0; }
+.kv b { color: var(--text); font-weight: 500; }
+canvas.spark { width: 100%; height: 46px; display: block; background: var(--panel2); border-radius: 3px; }
+.mini-views { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px; }
+.mini-views figure { margin: 0; } .mini-views figcaption { font-size: 10px; color: var(--dim); text-align: center; }
+
+/* wall */
+#wall { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.tile { position: relative; cursor: pointer; border: 2px solid transparent; border-radius: 4px; overflow: hidden; background: #000; }
+.tile.hero { border-color: var(--gb3); }
+.tile canvas { width: 100%; display: block; image-rendering: pixelated; aspect-ratio: 160 / 144; }
+.tile .lbl { position: absolute; left: 0; right: 0; bottom: 0; font-size: 9px; padding: 2px 4px; background: #000a; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .rw { position: absolute; top: 2px; right: 4px; font-size: 10px; color: var(--gold); text-shadow: 0 0 4px #000; }
+.tile.flash { animation: flash 1.8s ease-out; }
+@keyframes flash { 0% { border-color: var(--gold); box-shadow: 0 0 18px var(--gold); } 100% { border-color: transparent; box-shadow: none; } }
+.tile .ms { position: absolute; top: 30%; left: 0; right: 0; text-align: center; font: 8px var(--pixel); color: var(--gold);
+  text-shadow: 0 0 6px #000, 0 0 2px #000; animation: rise 1.8s ease-out forwards; }
+@keyframes rise { from { transform: translateY(10px); opacity: 1; } to { transform: translateY(-20px); opacity: 0; } }
+
+/* lists */
+#ladder { list-style: none; margin: 0; padding: 0; }
+#ladder li { display: grid; grid-template-columns: 18px 1fr auto; gap: 8px; padding: 4px 2px; border-bottom: 1px dashed var(--line); align-items: center; }
+#ladder li .chk { font: 10px var(--pixel); color: var(--line); }
+#ladder li.done .chk { color: var(--gold); }
+#ladder li.done .nm { color: var(--text); }
+#ladder li .nm { color: var(--dim); }
+#ladder li .when { color: var(--dim); font-size: 11px; text-align: right; }
+#ladder li.next { background: #9bbc0f0d; }
+#ladder li.next .nm::after { content: "  ← next"; color: var(--gb2); font-size: 10px; }
+#events { list-style: none; margin: 0; padding: 0; max-height: 330px; overflow-y: auto; }
+#events li { padding: 3px 0; border-bottom: 1px solid #ffffff08; display: grid; grid-template-columns: 62px 1fr; gap: 8px; }
+#events li .t { color: var(--dim); font-size: 11px; }
+#events li.milestone .x { color: var(--gold); } #events li.swarm .x { color: var(--violet); }
+#events li.room .x { color: var(--blue); } #events li.stop .x { color: var(--hot); }
+#events li .x a { cursor: pointer; text-decoration: underline dotted; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+td, th { padding: 3px 4px; text-align: left; border-bottom: 1px solid #ffffff0a; }
+th { color: var(--dim); font-weight: normal; font-size: 10px; text-transform: uppercase; }
+tr.click { cursor: pointer; } tr.click:hover { background: var(--panel2); }
+
+/* map */
+#map { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; max-height: 420px; overflow-y: auto; }
+.room { background: var(--panel2); border-radius: 3px; padding: 4px; }
+.room canvas { image-rendering: pixelated; display: block; }
+.room .rn { font-size: 10px; color: var(--dim); max-width: 140px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.room .rn b { color: var(--text); font-weight: 500; }
+.room.occupied .rn::before { content: "● "; color: var(--gb3); }
+
+/* frontier */
+#gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 6px; max-height: 300px; overflow-y: auto; }
+#gallery figure { margin: 0; background: var(--panel2); border-radius: 3px; padding: 3px; }
+#gallery canvas { width: 100%; image-rendering: pixelated; display: block; }
+#gallery figcaption { font-size: 10px; color: var(--dim); }
+
+/* charts */
+#charts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 1200px) { #charts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.chart h3 { margin: 0 0 3px; font-size: 11px; color: var(--dim); font-weight: normal; display: flex; justify-content: space-between; }
+.chart h3 b { color: var(--text); font-weight: 500; }
+.chart canvas { width: 100%; height: 90px; display: block; background: var(--panel2); border-radius: 3px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 10px; color: var(--dim); margin-top: 4px; }
+.legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 3px; }
+#host { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; }
+#cores { display: flex; gap: 2px; align-items: flex-end; height: 40px; }
+#cores div { width: 6px; background: var(--gb1); border-radius: 1px; }
+.gpu { min-width: 170px; } .gpu .track { height: 8px; background: var(--panel2); border-radius: 2px; overflow: hidden; margin: 2px 0 4px; }
+.gpu .fill { height: 100%; background: var(--blue); }
+#toast { position: fixed; left: 50%; top: 74px; transform: translateX(-50%); background: #201a05; border: 2px solid var(--gold);
+  color: var(--gold); font: 11px var(--pixel); padding: 12px 18px; border-radius: 4px; box-shadow: 0 0 30px #f7c94855;
+  opacity: 0; pointer-events: none; transition: opacity .3s; z-index: 10; text-align: center; max-width: 92vw;
+  white-space: pre-line; line-height: 1.8; }
+#toast.show { opacity: 1; }
+.empty { color: var(--dim); font-size: 11px; padding: 8px 0; }
+</style>
+</head>
+<body>
+<div id="top">
+  <div id="logo">pokeIO<small id="game">—</small></div>
+  <div class="stat"><b id="s-steps">0</b><span>agent steps</span></div>
+  <div class="stat"><b id="s-play">0</b><span>game time played</span></div>
+  <div class="stat"><b id="s-sps">0</b><span>steps / sec</span></div>
+  <div class="stat"><b id="s-agents">0</b><span>agents</span></div>
+  <div class="stat"><b id="s-cells">0</b><span>tiles explored</span></div>
+  <div class="stat"><b id="s-ms">0</b><span>milestones</span></div>
+  <div class="stat"><b id="s-up">0</b><span>uptime · update</span></div>
+  <div class="spacer"></div>
+  <span id="status" class="badge live">LIVE</span>
+  <button id="stop" class="danger" title="Checkpoint and stop training">■ STOP</button>
+</div>
+
+<main>
+  <section class="panel">
+    <h2>▶ FOCUS AGENT <span class="sub" id="hero-sub"></span></h2>
+    <div id="hero-wrap">
+      <div>
+        <canvas id="hero" class="screen" width="160" height="144"></canvas>
+        <div id="hero-cap"></div>
+        <div class="ctrls">
+          <button id="b-follow" class="on" title="Always watch the agent with the best frontier score">follow frontier</button>
+          <button id="b-mask" title="Overlay the agent's visited-cell memory">visited memory</button>
+          <button id="b-sal" title="Where the policy's chosen action is most sensitive to the screen">saliency</button>
+          <span style="flex:1"></span>
+          <button data-speed="0" class="spd on" title="Newest frame as it arrives">live</button>
+          <button data-speed="1" class="spd" title="Replay at real Game Boy speed">1×</button>
+          <button data-speed="4" class="spd">4×</button>
+          <button data-speed="16" class="spd">16×</button>
+        </div>
+      </div>
+      <div>
+        <div id="probs"></div>
+        <div class="kv" style="margin-top:8px"><span>value estimate</span><b id="h-value">–</b></div>
+        <canvas id="h-vspark" class="spark"></canvas>
+        <div class="kv" style="margin-top:6px"><span>reward (last step)</span><b id="h-rew">–</b></div>
+        <canvas id="h-rspark" class="spark"></canvas>
+        <div class="mini-views">
+          <figure><canvas id="v-screen" class="screen" width="80" height="72"></canvas><figcaption>what it sees</figcaption></figure>
+          <figure><canvas id="v-mask" class="screen" width="80" height="72"></canvas><figcaption>what it remembers</figcaption></figure>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>▦ THE WALL <span class="sub">click an agent to follow it</span></h2>
+    <div id="wall"></div>
+  </section>
+
+  <section class="panel">
+    <h2>★ MILESTONES <span class="sub" id="ms-sub"></span></h2>
+    <ul id="ladder"></ul>
+  </section>
+
+  <section class="panel span2">
+    <h2>🗺 WORLD — POPULATION FOOTPRINTS <span class="sub" id="map-sub"></span></h2>
+    <div id="map"><div class="empty">no areas yet</div></div>
+  </section>
+
+  <section class="panel">
+    <h2>⚑ LEADERS <span class="sub">frontier score</span></h2>
+    <table id="leaders"><thead><tr><th>agent</th><th>score</th><th>where</th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section class="panel span2">
+    <h2>⇪ SWARM FRONTIER <span class="sub" id="fr-sub"></span></h2>
+    <div class="chart"><canvas id="c-frontier" style="width:100%;height:70px;display:block;background:var(--panel2);border-radius:3px"></canvas></div>
+    <div id="gallery" style="margin-top:8px"><div class="empty">no swarm migrations yet. Each one teleports the population to a new best save state.</div></div>
+  </section>
+
+  <section class="panel">
+    <h2>☰ EVENTS <span class="sub" id="ev-sub"></span></h2>
+    <ul id="events"></ul>
+  </section>
+
+  <section class="panel span3">
+    <h2>∿ LEARNING VITALS <span class="sub">per update</span></h2>
+    <div id="charts"></div>
+  </section>
+
+  <section class="panel span2">
+    <h2>◧ REWARD ANATOMY <span class="sub">where the agents' reward comes from (per mini-episode)</span></h2>
+    <div class="chart"><canvas id="c-reward" style="width:100%;height:150px;display:block;background:var(--panel2);border-radius:3px"></canvas></div>
+    <div class="legend" id="reward-legend"></div>
+  </section>
+
+  <section class="panel">
+    <h2>✚ BUTTONS <span class="sub">what the population presses</span></h2>
+    <div class="chart"><canvas id="c-actions" style="width:100%;height:150px;display:block;background:var(--panel2);border-radius:3px"></canvas></div>
+    <div class="legend" id="action-legend"></div>
+  </section>
+
+  <section class="panel span3">
+    <h2>⚙ MACHINE</h2>
+    <div id="host"><div class="empty">host stats need psutil / nvidia-smi</div></div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const SERIES = ["#9bbc0f", "#5ab0ff", "#f7c948", "#ff6b4a", "#b18cff", "#4dd6c1", "#ff8fd0", "#c9d36a", "#8aa0ff", "#ffa94d"];
+let META = null, STATE = null, PALETTE = [[15,56,15],[48,98,48],[139,172,15],[155,188,15]];
+let since = 0, heroQueue = [], heroLast = null, speed = 0, lastHeroDraw = 0;
+let showMask = false, showSal = false, saliency = null;
+let vHist = [], rHist = [], seenMilestones = new Set(), firstState = true;
+
+/* ---------------- formatting ---------------- */
+function fmt(n) {
+  if (n == null || !isFinite(n)) return "–";
+  const a = Math.abs(n);
+  if (a >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (a >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (a >= 1e4) return (n / 1e3).toFixed(1) + "k";
+  if (a >= 100) return n.toFixed(0);
+  if (a >= 1) return n.toFixed(2);
+  return n.toFixed(3);
+}
+function dur(s) {
+  if (!isFinite(s)) return "–";
+  if (s < 90) return s.toFixed(0) + "s";
+  if (s < 5400) return (s / 60).toFixed(0) + "m";
+  if (s < 172800) return (s / 3600).toFixed(1) + "h";
+  if (s < 3e7) return (s / 86400).toFixed(1) + "d";
+  return (s / 31557600).toFixed(2) + "y";
+}
+const pretty = (s) => s.replace(/_/g, " ");
+function hex(c) { const v = parseInt(c.slice(1), 16); return [v >> 16 & 255, v >> 8 & 255, v & 255]; }
+
+/* ---------------- pixel decoding ---------------- */
+function b64(s) { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; }
+function unpackChannel(bytes, ch) {
+  const { h, w, bpp } = META; const per = bpp < 8 ? 8 / bpp : 1, pw = w / per;
+  const out = new Uint8Array(h * w), off = ch * h * pw, mask = (1 << Math.min(bpp, 8)) - 1;
+  for (let y = 0; y < h; y++) for (let x = 0; x < pw; x++) {
+    const b = bytes[off + y * pw + x];
+    if (per === 1) { out[y * w + x] = b; continue; }
+    for (let k = 0; k < per; k++) out[y * w + x * per + k] = (b >> ((per - 1 - k) * bpp)) & mask;
+  }
+  return out;
+}
+function drawLevels(ctx, lv, opts = {}) {
+  const { h, w, levels } = META; const img = ctx.createImageData(w, h); const d = img.data;
+  const pal = PALETTE, L = levels - 1;
+  for (let i = 0; i < lv.length; i++) {
+    const c = pal[Math.round(lv[i] * (pal.length - 1) / L)] || pal[0];
+    d[i * 4] = c[0]; d[i * 4 + 1] = c[1]; d[i * 4 + 2] = c[2]; d[i * 4 + 3] = 255;
+  }
+  if (opts.mask) for (let i = 0; i < lv.length; i++) {
+    const m = opts.mask[i] / L; if (m <= 0) continue;   // visited: tint violet
+    d[i * 4] = d[i * 4] * (1 - .45 * m) + 177 * .45 * m; d[i * 4 + 1] = d[i * 4 + 1] * (1 - .45 * m) + 140 * .45 * m;
+    d[i * 4 + 2] = d[i * 4 + 2] * (1 - .45 * m) + 255 * .45 * m;
+  }
+  if (opts.sal) { const s = opts.sal;
+    for (let i = 0; i < lv.length; i++) { const a = s[i] / 255 * .85; if (a < .04) continue;
+      d[i * 4] = d[i * 4] * (1 - a) + 255 * a; d[i * 4 + 1] = d[i * 4 + 1] * (1 - a) + 90 * a; d[i * 4 + 2] = d[i * 4 + 2] * (1 - a) + 40 * a; } }
+  ctx.putImageData(img, 0, 0);
+}
+function maskImage(ctx, lv) {
+  const { h, w, levels } = META; const img = ctx.createImageData(w, h); const d = img.data;
+  for (let i = 0; i < lv.length; i++) { const m = lv[i] / (levels - 1);
+    d[i * 4] = 20 + 157 * m; d[i * 4 + 1] = 20 + 120 * m; d[i * 4 + 2] = 30 + 225 * m; d[i * 4 + 3] = 255; }
+  ctx.putImageData(img, 0, 0);
+}
+function sizeCanvas(c) { if (!META) return; if (c.width !== META.w) { c.width = META.w; c.height = META.h; } }
+
+/* ---------------- charts ---------------- */
+function prep(c) {
+  const r = c.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  c.width = Math.max(10, r.width * dpr); c.height = Math.max(10, r.height * dpr);
+  const ctx = c.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); return [ctx, r.width, r.height];
+}
+function lineChart(c, series, opts = {}) {
+  const [ctx, W, H] = prep(c); ctx.clearRect(0, 0, W, H);
+  let xs = [], ys = [];
+  for (const s of series) for (let i = 0; i < s.x.length; i++) if (isFinite(s.y[i])) { xs.push(s.x[i]); ys.push(s.y[i]); }
+  if (!xs.length) { ctx.fillStyle = "#7f9a86"; ctx.font = "11px monospace"; ctx.fillText("waiting for data…", 8, H / 2); return; }
+  let x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = opts.y0 ?? Math.min(...ys), y1 = Math.max(...ys);
+  if (x1 === x0) x1 = x0 + 1; if (y1 === y0) { y1 += 1; y0 -= opts.y0 != null ? 0 : 1; }
+  const px = (x) => 4 + (x - x0) / (x1 - x0) * (W - 8), py = (y) => H - 12 - (y - y0) / (y1 - y0) * (H - 18);
+  ctx.strokeStyle = "#24352a"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(0, py(y0) + .5); ctx.lineTo(W, py(y0) + .5); ctx.stroke();
+  for (const s of series) {
+    ctx.strokeStyle = s.color; ctx.lineWidth = 1.6; ctx.beginPath(); let started = false;
+    for (let i = 0; i < s.x.length; i++) { if (!isFinite(s.y[i])) continue;
+      const X = px(s.x[i]), Y = py(s.y[i]); if (!started) { ctx.moveTo(X, Y); started = true; } else ctx.lineTo(X, Y); }
+    ctx.stroke();
+    if (s.dots) { ctx.fillStyle = s.color; for (let i = 0; i < s.x.length; i++) { ctx.beginPath(); ctx.arc(px(s.x[i]), py(s.y[i]), 3, 0, 7); ctx.fill(); } }
+  }
+  ctx.fillStyle = "#7f9a86"; ctx.font = "10px monospace";
+  ctx.fillText(fmt(y1), 4, 10); ctx.fillText(fmt(y0), 4, H - 2); ctx.textAlign = "right"; ctx.fillText(fmt(x1) + " steps", W - 4, H - 2); ctx.textAlign = "left";
+}
+function stackChart(c, x, layers, colors, normalize) {
+  const [ctx, W, H] = prep(c); ctx.clearRect(0, 0, W, H);
+  if (x.length < 2) { ctx.fillStyle = "#7f9a86"; ctx.font = "11px monospace"; ctx.fillText("waiting for data…", 8, H / 2); return; }
+  const n = x.length, tot = new Array(n).fill(0);
+  for (const L of layers) for (let i = 0; i < n; i++) tot[i] += Math.max(0, L[i] || 0);
+  const ymax = normalize ? 1 : Math.max(...tot, 1e-9);
+  const px = (i) => i / (n - 1) * W, base = new Array(n).fill(0);
+  layers.forEach((L, k) => {
+    ctx.fillStyle = colors[k]; ctx.beginPath();
+    for (let i = 0; i < n; i++) { const v = Math.max(0, L[i] || 0) / (normalize ? (tot[i] || 1) : 1);
+      const y = H - (base[i] + v) / ymax * (H - 4); i ? ctx.lineTo(px(i), y) : ctx.moveTo(px(i), y); }
+    for (let i = n - 1; i >= 0; i--) ctx.lineTo(px(i), H - base[i] / ymax * (H - 4));
+    ctx.closePath(); ctx.fill();
+    for (let i = 0; i < n; i++) base[i] += Math.max(0, L[i] || 0) / (normalize ? (tot[i] || 1) : 1);
+  });
+}
+function spark(c, vals, color) {
+  const [ctx, W, H] = prep(c); ctx.clearRect(0, 0, W, H); if (vals.length < 2) return;
+  let lo = Math.min(...vals), hi = Math.max(...vals); if (hi === lo) { hi += 1; lo -= 1; }
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath();
+  vals.forEach((v, i) => { const x = i / (vals.length - 1) * W, y = H - 3 - (v - lo) / (hi - lo) * (H - 6); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.stroke();
+}
+
+/* ---------------- toast ---------------- */
+let toastTimer = null;
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 4200); }
+
+/* ---------------- state panels ---------------- */
+const CHARTS = [
+  ["episode/return", "episode return", 0], ["episode/cells", "tiles per mini-episode", 1], ["sps", "steps / sec", 2],
+  ["episode/rooms", "areas per mini-episode", 5], ["loss/entropy", "policy entropy", 4], ["loss/approx_kl", "approx KL", 3],
+  ["loss/explained_variance", "value explained var.", 6], ["loss/value_loss", "value loss", 7],
+];
+function buildCharts() {
+  $("charts").innerHTML = CHARTS.map(([k, label], i) =>
+    `<div class="chart"><h3>${label}<b id="cv-${i}">–</b></h3><canvas id="ch-${i}"></canvas></div>`).join("");
+}
+function renderState(s) {
+  STATE = s;
+  if (s.meta && (!META || META.run !== s.meta.run)) {
+    META = s.meta; PALETTE = (META.palette || []).map(hex); if (PALETTE.length < 2) PALETTE = [[15,56,15],[155,188,15]];
+    $("game").textContent = META.title + " · " + META.run; document.title = "pokeIO · " + META.title;
+    for (const id of ["hero", "v-screen", "v-mask"]) sizeCanvas($(id));
+    $("hero").style.aspectRatio = `${META.w} / ${META.h}`;
+    buildWall();
+  }
+  if (!META) return;
+  const st = s.status || "training"; const b = $("status");
+  b.textContent = st === "offline" ? "OFFLINE" : st === "stopping" ? "STOPPING" : "LIVE";
+  b.className = "badge " + (st === "offline" ? "offline" : st === "stopping" ? "stopping" : "live");
+  $("s-steps").textContent = fmt(s.global_step);
+  $("s-play").textContent = dur(s.global_step * META.frames_per_action / META.fps);
+  $("s-sps").textContent = fmt(s.sps);
+  $("s-agents").textContent = META.num_envs;
+  $("s-cells").textContent = fmt(s.total_cells);
+  $("s-up").textContent = dur(s.uptime) + " · " + s.update;
+  $("b-follow").classList.toggle("on", !!s.follow);
+
+  // milestones
+  const ms = s.milestones || {}; const order = META.milestone_order.concat(Object.keys(ms).filter(k => !META.milestone_order.includes(k)));
+  let done = 0, nextMarked = false;
+  $("ladder").innerHTML = order.map(name => {
+    const m = ms[name] || {}; const ok = m.first_step != null; if (ok) done++;
+    let cls = ok ? "done" : ""; if (!ok && !nextMarked) { cls = "next"; nextMarked = true; }
+    const when = ok ? `${fmt(m.first_step)} · ${dur(m.first_time)} · ×${m.hits}` : "";
+    return `<li class="${cls}"><span class="chk">${ok ? "★" : "·"}</span><span class="nm">${pretty(name)}</span><span class="when">${when}</span></li>`;
+  }).join("");
+  $("s-ms").textContent = `${done}/${order.length}`; $("ms-sub").textContent = `${done} of ${order.length} reached`;
+  for (const name of order) { const m = ms[name]; if (m && m.first_step != null && !seenMilestones.has(name)) {
+    seenMilestones.add(name); if (!firstState) toast(`★ FIRST EVER ★\n${pretty(name).toUpperCase()}\nafter ${fmt(m.first_step)} steps`); } }
+
+  // events
+  const evs = (s.events || []).slice().reverse();
+  $("events").innerHTML = evs.map(e => `<li class="${e.kind}"><span class="t">${dur(e.t)}</span><span class="x">${e.text}${
+    e.env != null ? ` <a data-env="${e.env}">#${e.env}</a>` : ""}</span></li>`).join("");
+  $("ev-sub").textContent = evs.length + " recent";
+
+  // leaders
+  $("leaders").querySelector("tbody").innerHTML = (s.leaders || []).map(l =>
+    `<tr class="click" data-env="${l.env}"><td>#${l.env}</td><td>${fmt(l.score)}</td><td>${l.room}</td></tr>`).join("");
+
+  // world map
+  const heat = s.heat || [];
+  $("map-sub").textContent = `${heat.length} areas · ${fmt(s.total_cells)} distinct tiles`;
+  if (heat.length) {
+    $("map").innerHTML = "";
+    for (const r of heat) {
+      const scale = Math.max(2, Math.min(6, Math.floor(110 / Math.max(r.w, r.h))));
+      const div = document.createElement("div"); div.className = "room" + (r.occupants ? " occupied" : "");
+      div.title = `${r.name}: ${r.cells} tiles, ${fmt(r.visits)} visits, discovered at ${fmt(r.first_step)} steps, ${r.occupants} agents here now`;
+      const c = document.createElement("canvas"); c.width = r.w; c.height = r.h;
+      c.style.width = r.w * scale + "px"; c.style.height = r.h * scale + "px";
+      const ctx = c.getContext("2d"), img = ctx.createImageData(r.w, r.h), d = b64(r.data);
+      for (let i = 0; i < d.length; i++) { const v = d[i] / 255; const o = i * 4;
+        if (v === 0) { img.data[o + 3] = 0; continue; }
+        img.data[o] = 30 + 225 * Math.pow(v, .7); img.data[o + 1] = 60 + 160 * v; img.data[o + 2] = 20 + 40 * (1 - v); img.data[o + 3] = 255; }
+      ctx.putImageData(img, 0, 0);
+      div.appendChild(c);
+      const label = document.createElement("div"); label.className = "rn";
+      label.innerHTML = `<b>${r.name}</b> ${r.cells}${r.occupants ? " · " + r.occupants + "⚇" : ""}`;
+      div.appendChild(label); $("map").appendChild(div);
+    }
+  }
+
+  // frontier
+  const fr = s.frontier || [];
+  $("fr-sub").textContent = fr.length ? `${fr.length} migrations · best score ${fmt(fr[fr.length - 1].score)}` : "";
+  lineChart($("c-frontier"), [{ x: fr.map(f => f.step), y: fr.map(f => f.score), color: "#b18cff", dots: true }]);
+  if (fr.length) {
+    $("gallery").innerHTML = "";
+    for (const f of fr.slice().reverse()) {
+      const fig = document.createElement("figure"); const c = document.createElement("canvas"); sizeCanvas(c);
+      if (f.pix) drawLevels(c.getContext("2d"), unpackChannel(b64(f.pix), 0));
+      fig.appendChild(c); const cap = document.createElement("figcaption");
+      cap.textContent = `score ${fmt(f.score)} · ${fmt(f.step)} · ${f.room || "#" + f.env}`; fig.appendChild(cap);
+      $("gallery").appendChild(fig);
+    }
+  }
+
+  // vitals
+  const H = s.history || []; const xs = H.map(h => h.step);
+  CHARTS.forEach(([k, , col], i) => {
+    const ys = H.map(h => h[k]); lineChart($("ch-" + i), [{ x: xs, y: ys, color: SERIES[col % SERIES.length] }]);
+    const last = ys.filter(v => v != null && isFinite(v)).pop(); $("cv-" + i).textContent = fmt(last);
+  });
+
+  // reward anatomy
+  const rk = [...new Set(H.flatMap(h => Object.keys(h).filter(k => k.startsWith("episode/r/"))))].sort();
+  stackChart($("c-reward"), xs, rk.map(k => H.map(h => h[k] || 0)), rk.map((_, i) => SERIES[i % SERIES.length]), false);
+  $("reward-legend").innerHTML = rk.map((k, i) => `<span><i style="background:${SERIES[i % SERIES.length]}"></i>${k.slice(10)}</span>`).join("");
+
+  // actions
+  const acts = H.filter(h => h.actions); const btn = META.buttons;
+  stackChart($("c-actions"), acts.map(h => h.step), btn.map((_, j) => acts.map(h => h.actions[j] || 0)), btn.map((_, j) => SERIES[j % SERIES.length]), true);
+  $("action-legend").innerHTML = btn.map((b, j) => `<span><i style="background:${SERIES[j % SERIES.length]}"></i>${b}</span>`).join("");
+  firstState = false;
+}
+
+/* ---------------- wall + hero ---------------- */
+function buildWall() {
+  $("wall").innerHTML = META.wall_ids.map(e => `<div class="tile" id="t-${e}" data-env="${e}"><canvas width="${META.w}" height="${META.h}"></canvas><div class="lbl">#${e}</div><div class="rw"></div></div>`).join("");
+}
+function roomName(id) { return (STATE && STATE.heat || []).find(r => r.room === id)?.name ?? (id >= 0 ? "room " + id : "—"); }
+function renderLive(d) {
+  if (!META) return;
+  for (const [e, f] of Object.entries(d.wall || {})) {
+    const t = $("t-" + e); if (!t) continue;
+    drawLevels(t.querySelector("canvas").getContext("2d"), unpackChannel(b64(f.pix), 0));
+    t.querySelector(".lbl").textContent = `#${e} · ${roomName(f.aux[0])} · ${fmt(f.aux[4] / 100)}`;
+    t.querySelector(".rw").textContent = f.r > 0.001 ? "+" + fmt(f.r) : "";
+    t.classList.toggle("hero", +e === d.hero);
+    if (f.flash) { t.classList.remove("flash"); void t.offsetWidth; t.classList.add("flash");
+      const m = document.createElement("div"); m.className = "ms"; m.textContent = "★ " + pretty(f.flash).toUpperCase(); t.appendChild(m); setTimeout(() => m.remove(), 1900); }
+  }
+  for (const t of document.querySelectorAll(".tile")) t.classList.toggle("hero", +t.dataset.env === d.hero);
+  if (d.saliency) saliency = d.saliency;
+  const fr = d.hero_frames || [];
+  if (fr.length) { since = fr[fr.length - 1].seq; heroQueue.push(...fr); if (heroQueue.length > 600) heroQueue.splice(0, heroQueue.length - 600); }
+  $("hero-sub").textContent = `agent #${d.hero}${d.follow ? " · following frontier" : ""}`;
+  if (d.status) { $("status").textContent = d.status === "offline" ? "OFFLINE" : d.status === "stopping" ? "STOPPING" : "LIVE"; }
+}
+function drawHero(f) {
+  heroLast = f;
+  const lv = unpackChannel(b64(f.pix), 0);
+  const mask = META.channels > 1 ? unpackChannel(b64(f.pix), 1) : null;
+  let sal = null;
+  if (showSal && saliency && saliency.env === f.env) sal = b64(saliency.data);
+  drawLevels($("hero").getContext("2d"), lv, { mask: showMask ? mask : null, sal });
+  drawLevels($("v-screen").getContext("2d"), lv);
+  if (mask) maskImage($("v-mask").getContext("2d"), mask);
+  const a = f.aux; $("hero-cap").innerHTML =
+    `<span>agent <b>#${f.env}</b></span><span>in <b>${roomName(a[0])}</b></span>` +
+    (a[1] >= 0 ? `<span>at <b>(${a[1]}, ${a[2]})</b></span>` : "") +
+    `<span>score <b>${fmt(a[4] / 100)}</b></span>` + (a[3] > 0 ? `<span><b style="color:var(--hot)">in battle / paused</b></span>` : "");
+  const btn = META.buttons;
+  $("probs").innerHTML = btn.map((b, i) => `<div class="bar ${i === f.a ? "chosen" : ""}"><span>${b}</span><div class="track"><div class="fill" style="width:${(f.p[i] * 100).toFixed(1)}%"></div></div><span>${(f.p[i] * 100).toFixed(0)}%</span></div>`).join("");
+  $("h-value").textContent = fmt(f.v); $("h-rew").textContent = (f.r >= 0 ? "+" : "") + fmt(f.r);
+  vHist.push(f.v); rHist.push(f.r); if (vHist.length > 200) { vHist.shift(); rHist.shift(); }
+}
+function animate(ts) {
+  if (heroQueue.length) {
+    if (speed === 0) { const f = heroQueue[heroQueue.length - 1]; heroQueue.length = 0; drawHero(f); }
+    else {
+      const period = META.frames_per_action / META.fps * 1000 / speed;
+      if (ts - lastHeroDraw >= period) { lastHeroDraw = ts; drawHero(heroQueue.shift()); }
+    }
+    spark($("h-vspark"), vHist, "#5ab0ff"); spark($("h-rspark"), rHist, "#f7c948");
+  }
+  requestAnimationFrame(animate);
+}
+
+/* ---------------- host ---------------- */
+function renderHost(h) {
+  if (!h || (!h.cpu_per_core && !h.gpus)) return;
+  let html = "";
+  if (h.cpu_per_core) {
+    const avg = h.cpu_per_core.reduce((a, b) => a + b, 0) / h.cpu_per_core.length;
+    html += `<div><div class="kv"><span>CPU · ${h.cpu_per_core.length} threads · ${avg.toFixed(0)}% · RAM ${fmt(h.mem_pct)}%</span></div><div id="cores">${
+      h.cpu_per_core.map(v => `<div style="height:${Math.max(2, v * .4)}px;background:${v > 85 ? "#9bbc0f" : "#306230"}"></div>`).join("")}</div></div>`;
+  }
+  for (const g of h.gpus || []) {
+    const mem = 100 * g.mem_used / g.mem_total;
+    html += `<div class="gpu"><div class="kv"><span>GPU${g.index} ${g.name}</span><b>${g.temp}°C</b></div>
+      <div class="kv"><span>util</span><b>${g.util}%</b></div><div class="track"><div class="fill" style="width:${g.util}%"></div></div>
+      <div class="kv"><span>memory</span><b>${(g.mem_used / 1024).toFixed(1)} / ${(g.mem_total / 1024).toFixed(0)} GB</b></div><div class="track"><div class="fill" style="width:${mem}%;background:var(--violet)"></div></div></div>`;
+  }
+  $("host").innerHTML = html;
+}
+
+/* ---------------- wiring ---------------- */
+async function getJSON(u) { const r = await fetch(u, { cache: "no-store" }); if (!r.ok) throw new Error(r.status); return r.json(); }
+async function pollState() { try { renderState(await getJSON("/api/state")); } catch (e) { $("status").textContent = "NO LINK"; $("status").className = "badge offline"; } setTimeout(pollState, 2000); }
+async function pollLive() { try { if (META) renderLive(await getJSON("/api/live?since=" + since)); } catch (e) {} setTimeout(pollLive, 250); }
+async function pollHost() { try { renderHost(await getJSON("/api/host")); } catch (e) {} setTimeout(pollHost, 3000); }
+function focus(env) { fetch(`/api/focus?env=${env}`); heroQueue.length = 0; since = 0; vHist = []; rHist = []; }
+document.addEventListener("click", (ev) => {
+  const t = ev.target.closest("[data-env]"); if (t && !t.classList.contains("spd")) focus(+t.dataset.env);
+});
+$("b-follow").onclick = () => { fetch("/api/focus?follow=1"); $("b-follow").classList.add("on"); };
+$("b-mask").onclick = (e) => { showMask = !showMask; e.target.classList.toggle("on", showMask); if (heroLast) drawHero(heroLast); };
+$("b-sal").onclick = (e) => { showSal = !showSal; e.target.classList.toggle("on", showSal); if (heroLast) drawHero(heroLast); };
+for (const b of document.querySelectorAll(".spd")) b.onclick = () => {
+  speed = +b.dataset.speed; document.querySelectorAll(".spd").forEach(x => x.classList.toggle("on", x === b)); };
+$("stop").onclick = () => { if (confirm("Checkpoint and stop this training run?")) fetch("/api/stop?confirm=1"); };
+buildCharts(); pollState(); pollLive(); pollHost(); requestAnimationFrame(animate);
+window.addEventListener("resize", () => STATE && renderState(STATE));
+</script>
+</body>
+</html>

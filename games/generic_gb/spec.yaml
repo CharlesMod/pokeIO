@@ -1,0 +1,41 @@
+# Pixels-only spec for ANY Game Boy ROM: no RAM knowledge at all.
+#
+# This is the honest generality baseline. Exploration comes only from
+# count-based novelty over coarse screen hashes. There is no visited mask,
+# no progress terms, and no swarm (there is no score to rank states by). Expect it
+# to be far weaker than a spec with a position and progress fields. Use it to
+# measure how much each game-specific field buys, and as a starting point when
+# writing a new game's spec.
+#
+#   python -m pokeio train --spec games/generic_gb/spec.yaml --set spec=... \
+#     (edit `rom` below, or copy this file to games/<your_game>/spec.yaml)
+
+name: generic_gb
+platform: gameboy
+rom: roms/super_mario_land.gb
+
+start:
+  states: []              # empty: start from power-on (the title screen)
+
+controls:
+  buttons: [down, left, right, up, a, b, start]
+  frames_per_action: 12   # action games want finer control than RPGs (24)
+  press_frames: 8
+
+screen:
+  downsample: 2
+  levels: 4
+
+rewards:
+  exploration:
+    screen_novelty_weight: 0.02
+    screen_hash_grid: [9, 10]
+
+swarm:
+  enabled: false
+
+episode:
+  memory_reset_steps: 20000
+  memory_reset_jitter: 2000
+  hard_reset_steps: 20000   # no progress signal to keep runs on track: restart periodically
+  start_jitter_frames: 120
