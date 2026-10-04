@@ -115,7 +115,23 @@ def _layout(obs_spec: ObsSpec, n: int):
     return layout, off
 
 
+class WorkerError(RuntimeError):
+    pass
+
+
 def _worker(wid, spec, env_ids, seed, shm_name, layout, conn, cpu):
+    try:
+        _worker_loop(wid, spec, env_ids, seed, shm_name, layout, conn, cpu)
+    except Exception:
+        import traceback
+
+        try:
+            conn.send(("__error__", f"worker {wid} (envs {env_ids}):\n{traceback.format_exc()}"))
+        except Exception:
+            pass
+
+
+def _worker_loop(wid, spec, env_ids, seed, shm_name, layout, conn, cpu):
     if cpu is not None and hasattr(os, "sched_setaffinity"):
         try:
             os.sched_setaffinity(0, {cpu})
@@ -234,7 +250,13 @@ class ProcVec:
             conns = [self.conns[w] for w in self.inflight]
             for c in wait(conns):
                 w = self._conn_to_worker[id(c)]
-                self.ready.append((w, c.recv()))
+                try:
+                    msg = c.recv()
+                except EOFError:
+                    raise WorkerError(f"worker {w} died (exit code {self.procs[w].exitcode})") from None
+                if isinstance(msg, tuple) and msg and msg[0] == "__error__":
+                    raise WorkerError(msg[1])
+                self.ready.append((w, msg))
                 self.inflight.discard(w)
         batch, self.ready = self.ready[:target], self.ready[target:]
         self.current = [w for w, _ in batch]

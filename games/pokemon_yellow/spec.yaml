@@ -92,6 +92,8 @@ rewards:
     - {name: caught, kind: bitcount, field: pokedex_owned, weight: 1.0}
     - {name: levels, kind: sum_softcap, field: party_levels, count_field: party_count,
        knee: 22, slope: 0.25, weight: 0.5, swarm: false}
+    # Farmable (take damage, heal: Pleines' Leech Seed hack). Keep the weight small; watch
+    # `episode/r/heal` on the wall.
     - {name: heal, kind: ratio_gain, field: party_hp, denom: party_max_hp,
        count_field: party_count, weight: 1.0}
 

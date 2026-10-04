@@ -237,6 +237,8 @@ tr.click { cursor: pointer; } tr.click:hover { background: var(--panel2); }
 
 <script>
 "use strict";
+const TOKEN = "__POKEIO_TOKEN__";
+const ctl = (u) => fetch(u, { headers: { "X-Pokeio-Token": TOKEN } });
 const $ = (id) => document.getElementById(id);
 const SERIES = ["#9bbc0f", "#5ab0ff", "#f7c948", "#ff6b4a", "#b18cff", "#4dd6c1", "#ff8fd0", "#c9d36a", "#8aa0ff", "#ffa94d"];
 let META = null, STATE = null, PALETTE = [[15,56,15],[48,98,48],[139,172,15],[155,188,15]];
@@ -543,16 +545,16 @@ async function getJSON(u) { const r = await fetch(u, { cache: "no-store" }); if 
 async function pollState() { try { renderState(await getJSON("/api/state")); } catch (e) { $("status").textContent = "NO LINK"; $("status").className = "badge offline"; } setTimeout(pollState, 2000); }
 async function pollLive() { try { if (META) renderLive(await getJSON("/api/live?since=" + since)); } catch (e) {} setTimeout(pollLive, 250); }
 async function pollHost() { try { renderHost(await getJSON("/api/host")); } catch (e) {} setTimeout(pollHost, 3000); }
-function focus(env) { fetch(`/api/focus?env=${env}`); heroQueue.length = 0; since = 0; vHist = []; rHist = []; }
+function focus(env) { ctl(`/api/focus?env=${env}`); heroQueue.length = 0; since = 0; vHist = []; rHist = []; }
 document.addEventListener("click", (ev) => {
   const t = ev.target.closest("[data-env]"); if (t && !t.classList.contains("spd")) focus(+t.dataset.env);
 });
-$("b-follow").onclick = () => { fetch("/api/focus?follow=1"); $("b-follow").classList.add("on"); };
+$("b-follow").onclick = () => { ctl("/api/focus?follow=1"); $("b-follow").classList.add("on"); };
 $("b-mask").onclick = (e) => { showMask = !showMask; e.target.classList.toggle("on", showMask); if (heroLast) drawHero(heroLast); };
 $("b-sal").onclick = (e) => { showSal = !showSal; e.target.classList.toggle("on", showSal); if (heroLast) drawHero(heroLast); };
 for (const b of document.querySelectorAll(".spd")) b.onclick = () => {
   speed = +b.dataset.speed; document.querySelectorAll(".spd").forEach(x => x.classList.toggle("on", x === b)); };
-$("stop").onclick = () => { if (confirm("Checkpoint and stop this training run?")) fetch("/api/stop?confirm=1"); };
+$("stop").onclick = () => { if (confirm("Checkpoint and stop this training run?")) ctl("/api/stop?confirm=1"); };
 buildCharts(); pollState(); pollLive(); pollHost(); requestAnimationFrame(animate);
 window.addEventListener("resize", () => STATE && renderState(STATE));
 </script>

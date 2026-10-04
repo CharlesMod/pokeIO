@@ -10,6 +10,9 @@ measure what the *policy* can do from scratch:
   * mean distinct cells / rooms / return;
   * optional ``blind`` mode zeroes the screen channel. If milestone rates don't
     drop, the policy isn't using vision (the failure mode of pokeIO v1).
+
+With ``workers > 0`` the env count is ``workers * (episodes // workers)`` and
+cells/rooms means are omitted (they're read from in-process envs).
 """
 
 from __future__ import annotations

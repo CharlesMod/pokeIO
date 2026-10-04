@@ -104,6 +104,10 @@ def _merge(obj: Any, data: dict[str, Any], where: str = "") -> None:
         cur = getattr(obj, k)
         if is_dataclass(cur):
             _merge(cur, v, f"{where}{k}.")
+        elif isinstance(v, str) and not isinstance(cur, str):
+            setattr(obj, k, _coerce(cur, v))  # e.g. YAML reads `lr: 2e-4` as a string
+        elif isinstance(cur, float) and isinstance(v, int) and not isinstance(v, bool):
+            setattr(obj, k, float(v))
         else:
             setattr(obj, k, v)
 

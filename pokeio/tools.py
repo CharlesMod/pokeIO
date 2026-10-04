@@ -185,6 +185,8 @@ def record(spec: GameSpec, checkpoint: str | Path, out_dir: str | Path, steps: i
             start = torch.zeros(1, device=dev)
             a = int(logits.argmax(-1)) if greedy else int(torch.distributions.Categorical(logits=logits).sample())
             obs, r, d, info = env.step(a)
+            if d:
+                start = torch.ones(1, device=dev)
             if t % every == 0:
                 save_png(out / f"frame_{t:06d}.png", env.render_rgb())
             trace.write(json.dumps({"t": t, "action": env.buttons[a], "reward": r, "value": float(value),

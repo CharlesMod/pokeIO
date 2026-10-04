@@ -199,7 +199,9 @@ class Trainer:
         while True:
             if queue:
                 b, fresh = queue.pop(), False
-            elif (ptr < T).any():
+            elif (ptr < T).any() or awaiting.any():
+                # keep receiving until every in-flight step has landed: full rows
+                # are held (bootstrap + first obs of the next rollout)
                 b, fresh = self.vec.recv(), True
             else:
                 break
@@ -292,9 +294,10 @@ class Trainer:
         for t in reversed(range(self.T)):
             nv = nextV if t == self.T - 1 else V[t + 1]
             delta = self.buf_rew[t] + tc.gamma * nv * nonterm[t] - V[t]
-            last = delta + tc.gamma * tc.gae_lambda * nonterm[t] * last
+            # a swarm swap (valid=0) is a truncation: zero advantage there, and
+            # nothing from it leaks into earlier steps
+            last = (delta + tc.gamma * tc.gae_lambda * nonterm[t] * last) * self.buf_valid[t]
             adv[t] = last
-        adv *= self.buf_valid
         returns = adv + V
         return adv, returns
 
@@ -303,10 +306,15 @@ class Trainer:
         adv, returns = self.advantages()
         valid = self.buf_valid
         if tc.value_norm:
+            # re-express rollout values in the updated scale so value clipping
+            # compares like with like
+            old_values = self.vnorm.denormalize(self.buf_val)
             self.vnorm.update(returns[valid > 0])
             targets = self.vnorm.normalize(returns)
+            old_values = self.vnorm.normalize(old_values)
         else:
             targets = returns
+            old_values = self.buf_val
         if tc.anneal_lr:
             frac = max(0.0, 1.0 - self.global_step / tc.total_steps)
             for g in self.opt.param_groups:
@@ -346,7 +354,7 @@ class Trainer:
                 newv = newv.float()
                 tgt = targets[tt, nn_]
                 if tc.vf_clip > 0:
-                    oldv = self.buf_val[tt, nn_]
+                    oldv = old_values[tt, nn_]
                     vclip = oldv + (newv - oldv).clamp(-tc.vf_clip, tc.vf_clip)
                     vl = torch.max((newv - tgt) ** 2, (vclip - tgt) ** 2)
                 else:

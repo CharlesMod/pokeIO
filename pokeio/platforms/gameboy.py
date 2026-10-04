@@ -34,8 +34,8 @@ class GameBoy:
         if spec.symbols is not None and spec.symbols.exists():
             kwargs["symbols"] = str(spec.symbols)
         self._pyboy = PyBoy(str(spec.rom), **kwargs)
-        if not headless:
-            self._pyboy.set_emulation_speed(int(spec.platform_options.get("speed", 6)))
+        # 0 = unlimited. PyBoy defaults to real time (1x) even without a window.
+        self._pyboy.set_emulation_speed(0 if headless else int(spec.platform_options.get("speed", 6)))
         self._mem = self._pyboy.memory
 
     def press(self, button: str) -> None:

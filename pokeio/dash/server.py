@@ -13,12 +13,15 @@ over Tailscale). Endpoints:
     GET /api/live?since=N wall frames + focused-agent frames newer than N + saliency
     GET /api/focus?env=N  focus an agent  (?follow=1 to follow the frontier again)
     GET /api/stop?confirm=1  graceful stop: checkpoint, then exit
+    (focus/stop require the X-Pokeio-Token header that the served page embeds, so a
+    random web page or <img> tag can't drive the run)
     GET /api/host         CPU per core / GPU utilisation (psutil / nvidia-smi if present)
 """
 
 from __future__ import annotations
 
 import json
+import secrets
 import subprocess
 import threading
 import time
@@ -87,6 +90,9 @@ class _Offline:
 
 
 def _handler(hub, host: _Host):
+    token = secrets.token_hex(16)
+    page = (STATIC / "wall.html").read_text().replace("__POKEIO_TOKEN__", token).encode()
+
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):  # quiet
             pass
@@ -106,8 +112,12 @@ def _handler(hub, host: _Host):
             u = urlparse(self.path)
             q = {k: v[0] for k, v in parse_qs(u.query).items()}
             try:
+                control = u.path in ("/api/focus", "/api/stop")
+                if control and self.headers.get("X-Pokeio-Token") != token:
+                    self._send(403, b"missing or bad X-Pokeio-Token", "text/plain")
+                    return
                 if u.path in ("/", "/index.html", "/wall.html"):
-                    self._send(200, (STATIC / "wall.html").read_bytes(), "text/html; charset=utf-8")
+                    self._send(200, page, "text/html; charset=utf-8")
                 elif u.path == "/api/state":
                     self._json(hub.snapshot_state())
                 elif u.path == "/api/live":

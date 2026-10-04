@@ -216,7 +216,12 @@ class GameSpec:
             str(self.screen.downsample),
             str(self.screen.levels),
             str(self.position is not None),
-            ";".join(f"{v.field}:{v.kind}:{v.num}:{v.embed}" for v in self.vector),
+            ";".join(
+                f"{v.field}:{v.kind}:{v.num}:{v.embed}:"
+                f"{self.memory[v.field].length or self.memory[v.field].count}"
+                for v in self.vector
+                if v.field in self.memory
+            ),
         ]
         return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
 

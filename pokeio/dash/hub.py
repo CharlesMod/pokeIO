@@ -112,6 +112,7 @@ class LiveHub:
                 best = int(np.argmax(self.scores))
                 if self.scores[best] > self.scores[self.hero]:  # hysteresis: no flicker on ties
                     self.hero = best
+                    self.hero_ring.clear()
             for j, e in enumerate(ids.tolist()):
                 if e in self.wall_set or e == self.hero:
                     rec = {

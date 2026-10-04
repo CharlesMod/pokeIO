@@ -130,7 +130,12 @@ class Memory:
                 if byte < len(raw) and raw[byte] & (1 << bit):
                     n -= 1
             return n
-        return int(sum(int(v).bit_count() for v in self.array(name)))
+        n = int(sum(int(v).bit_count() for v in self.array(name)))
+        vals = self.array(name)
+        for elem, bit in ignore_bits or []:
+            if elem < len(vals) and int(vals[elem]) & (1 << bit):
+                n -= 1
+        return n
 
     def write(self, name: str, value: int) -> None:
         self.p.write(self.addr[name], [int(value) & 0xFF])
@@ -142,7 +147,7 @@ class Memory:
                 raw = self._raw(c.field)
                 return bool(raw[c.index // 8] & (1 << (c.index % 8)))
             return bool(self.get(c.field) & (1 << c.index))
-        v = self.get(c.field)
+        v = self.get(c.field, c.index)
         op = c.op
         if op == "nonzero":
             return v != 0

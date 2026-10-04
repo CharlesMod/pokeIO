@@ -132,15 +132,20 @@ class GameEnv:
             cats=cats,
             n_actions=len(self.buttons),
         )
+        missing = [str(s) for s in spec.start_states if not Path(s).exists()]
+        if missing and env_id == 0:
+            print(f"[env] WARNING: start states not found, booting from power-on: {missing}", flush=True)
         self._start_states = [Path(s).read_bytes() for s in spec.start_states if Path(s).exists()]
+        # power-on snapshot: what a reset returns to when there is no start state
+        self._boot_state = None if self._start_states else self.p.save_state()
         self.frontier_state: bytes | None = None  # set by the swarm
         self.t = 0  # global step counter of this env (never reset; memory clock)
         self._reset_counters()
 
     # ------------------------------------------------------------------ state
     def _reset_counters(self) -> None:
-        self.ep_step = 0
-        self.mem_step = 0
+        self.ep_step = 0  # since the last emulator reset (drives hard/stall resets)
+        self.mem_step = 0  # since the last memory wipe (= the logged mini-episode)
         self.mem_horizon = self._jitter(self.spec.episode.memory_reset_steps)
         self.last_reward_step = 0
         self.prev_action = -1
@@ -169,6 +174,8 @@ class GameEnv:
         self.interact.wipe()
         self.screen_novelty.wipe()
         self.mem_step = 0
+        self.ep_return = 0.0
+        self.reward_parts = {}
         self.mem_horizon = self._jitter(self.spec.episode.memory_reset_steps)
 
     def reset(self, state: bytes | None = None) -> dict[str, np.ndarray]:
@@ -177,6 +184,8 @@ class GameEnv:
             state = self.frontier_state
         if state is None and self._start_states:
             state = self.rng.choice(self._start_states)
+        if state is None:
+            state = self._boot_state
         if state is not None:
             self.p.load_state(state)
         self.mem.invalidate()
@@ -258,7 +267,10 @@ class GameEnv:
                 parts["explore"] = ex.cell_weight * gain
             if ex.interaction_weight > 0 and button in ex.interaction_buttons:
                 moved = before_pos != self._pos
-                hit = self.interact.observe(*self._pos, self.facing, moved, before_levels, self._levels)
+                # text that was auto-advanced (waits > 0) is a visible reaction even if
+                # the final frame looks like the one before the press
+                after = self._levels if not waits else np.full_like(self._levels, 255)
+                hit = self.interact.observe(*self._pos, self.facing, moved, before_levels, after)
                 if hit:
                     parts["interact"] = ex.interaction_weight * hit
         if ex.screen_novelty_weight > 0:
@@ -306,7 +318,7 @@ class GameEnv:
     def episode_stats(self) -> dict:
         return {
             "return": self.ep_return,
-            "length": self.ep_step,
+            "length": self.mem_step,
             "cells": self.cells.unique,
             "rooms": len(self.cells.rooms),
             "milestones": dict(self.progress.reached),

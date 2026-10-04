@@ -43,7 +43,7 @@ class SwarmCoordinator:
         if not f or not self.cfg.enabled:
             return
         score = float(f["score"])
-        if score <= self.best_score:
+        if score < self.best_score + self.cfg.min_delta:  # -inf + delta stays -inf
             return
         if self.candidate is None or score > self.candidate[0]:
             self.candidate = (score, f["state"], int(info["env_id"]))
