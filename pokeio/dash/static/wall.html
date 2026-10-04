@@ -381,6 +381,7 @@ function renderState(s) {
   const st = s.status || "training"; const b = $("status");
   b.textContent = st === "offline" ? "OFFLINE" : st === "stopping" ? "STOPPING" : "LIVE";
   b.className = "badge " + (st === "offline" ? "offline" : st === "stopping" ? "stopping" : "live");
+  $("stop").style.display = st === "offline" ? "none" : "";
   $("s-steps").textContent = fmt(s.global_step);
   $("s-play").textContent = dur(s.global_step * META.frames_per_action / META.fps);
   $("s-sps").textContent = fmt(s.sps);
@@ -458,8 +459,10 @@ function renderState(s) {
   });
 
   // reward anatomy
-  const rk = [...new Set(H.flatMap(h => Object.keys(h).filter(k => k.startsWith("episode/r/"))))].sort();
-  stackChart($("c-reward"), xs, rk.map(k => H.map(h => h[k] || 0)), rk.map((_, i) => SERIES[i % SERIES.length]), false);
+  // only updates where a mini-episode ended carry episode/r/* (others would plot as false zeros)
+  const RH = H.filter(h => Object.keys(h).some(k => k.startsWith("episode/r/")));
+  const rk = [...new Set(RH.flatMap(h => Object.keys(h).filter(k => k.startsWith("episode/r/"))))].sort();
+  stackChart($("c-reward"), RH.map(h => h.step), rk.map(k => RH.map(h => h[k] || 0)), rk.map((_, i) => SERIES[i % SERIES.length]), false);
   $("reward-legend").innerHTML = rk.map((k, i) => `<span><i style="background:${SERIES[i % SERIES.length]}"></i>${k.slice(10)}</span>`).join("");
 
   // actions
@@ -489,7 +492,7 @@ function renderLive(d) {
   if (d.saliency) saliency = d.saliency;
   const fr = d.hero_frames || [];
   if (fr.length) { since = fr[fr.length - 1].seq; heroQueue.push(...fr); if (heroQueue.length > 600) heroQueue.splice(0, heroQueue.length - 600); }
-  $("hero-sub").textContent = `agent #${d.hero}${d.follow ? " · following frontier" : ""}`;
+  $("hero-sub").textContent = d.hero == null ? "" : `agent #${d.hero}${d.follow ? " · following frontier" : ""}${d.status === "offline" ? " · last moments" : ""}`;
   if (d.status) { $("status").textContent = d.status === "offline" ? "OFFLINE" : d.status === "stopping" ? "STOPPING" : "LIVE"; }
 }
 function drawHero(f) {
@@ -542,8 +545,9 @@ function renderHost(h) {
 
 /* ---------------- wiring ---------------- */
 async function getJSON(u) { const r = await fetch(u, { cache: "no-store" }); if (!r.ok) throw new Error(r.status); return r.json(); }
-async function pollState() { try { renderState(await getJSON("/api/state")); } catch (e) { $("status").textContent = "NO LINK"; $("status").className = "badge offline"; } setTimeout(pollState, 2000); }
-async function pollLive() { try { if (META) renderLive(await getJSON("/api/live?since=" + since)); } catch (e) {} setTimeout(pollLive, 250); }
+let linkDown = false;  // back off while the trainer is gone instead of hammering a dead port
+async function pollState() { try { renderState(await getJSON("/api/state")); linkDown = false; } catch (e) { linkDown = true; $("status").textContent = "NO LINK"; $("status").className = "badge offline"; } setTimeout(pollState, linkDown ? 5000 : 2000); }
+async function pollLive() { let offline = false; try { if (META && !linkDown) { const d = await getJSON("/api/live?since=" + since); offline = d.status === "offline"; renderLive(d); } } catch (e) {} setTimeout(pollLive, linkDown || offline ? 3000 : 250); }
 async function pollHost() { try { renderHost(await getJSON("/api/host")); } catch (e) {} setTimeout(pollHost, 3000); }
 function focus(env) { ctl(`/api/focus?env=${env}`); heroQueue.length = 0; since = 0; vHist = []; rHist = []; }
 document.addEventListener("click", (ev) => {

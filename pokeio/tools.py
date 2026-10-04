@@ -39,7 +39,8 @@ def obs_to_image(env: GameEnv, obs: dict) -> np.ndarray:
     os_ = env.obs_spec
     chans = [unpack(obs["pixels"][c], os_.pixel_bpp) for c in range(os_.pixels[0])]
     scale = 255 // max(os_.levels - 1, 1)
-    return np.concatenate([255 - (c.astype(np.int32) * scale).clip(0, 255) for c in chans], axis=1).astype(np.uint8)
+    # quantize() maps bright -> high level, so no inversion (visited-mask cells show bright)
+    return np.concatenate([(c.astype(np.int32) * scale).clip(0, 255) for c in chans], axis=1).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------

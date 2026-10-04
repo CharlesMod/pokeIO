@@ -9,7 +9,9 @@ Pleines et al. 2025). It drops v1's neuroevolution and v2's foveal-only percepti
 The design rationale is in [docs/puffer-lessons.md](docs/puffer-lessons.md) and
 [docs/sota-review-2026-10.md](docs/sota-review-2026-10.md).
 
-> **Status:** this code has not been run yet. The Phase 0 bring-up checklist is in [TODO.md](TODO.md).
+> **Status:** the engine, trainer, wall, eval and tools have been validated end to end on the gridworld
+> fake console (macOS, CPU, Python 3.12, torch 2.14). The Game Boy / PyBoy path has not been run against
+> a ROM yet. The Phase 0 bring-up checklist is in [TODO.md](TODO.md).
 
 ## How it works
 

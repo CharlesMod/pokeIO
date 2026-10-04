@@ -71,16 +71,26 @@ class _Offline:
     def __init__(self, run_dir: Path):
         self.run_dir = run_dir
 
-    def snapshot_state(self) -> dict:
+    def _load(self) -> dict:
         try:
-            d = json.loads((self.run_dir / "dash_state.json").read_text())
-            d["status"] = "offline"
-            return d
+            return json.loads((self.run_dir / "dash_state.json").read_text())
         except Exception:
-            return {"status": "offline", "error": f"no dash_state.json in {self.run_dir}"}
+            return {"error": f"no dash_state.json in {self.run_dir}"}
+
+    def snapshot_state(self) -> dict:
+        d = self._load()
+        d.pop("live", None)
+        d["status"] = "offline"
+        return d
 
     def snapshot_live(self, since: int = 0) -> dict:
-        return {"status": "offline", "wall": {}, "hero_frames": []}
+        """The last persisted wall frames, and the focus replay once (frames newer than ``since``)."""
+        live = self._load().get("live") or {"wall": {}, "hero_frames": []}
+        for f in live.get("wall", {}).values():
+            f.pop("flash", None)
+        live["hero_frames"] = [f for f in live.get("hero_frames", []) if f["seq"] > since]
+        live["status"] = "offline"
+        return live
 
     def focus(self, env, follow) -> None:
         pass

@@ -4,10 +4,12 @@
 with no demos and no pretrained weights. Pokémon Yellow is the current challenge, not the product.
 The v1/v2 roadmap is archived in docs/archive/.
 
-## Phase 0: bring-up on the training box (nothing here has been executed yet)
+## Phase 0: bring-up on the training box
+Validated on a laptop (macOS, CPU, gridworld): tests, smoke training, live + offline wall, STOP,
+resume, eval (serial/workers/greedy/blind), bench, probe, record. Everything below that needs a ROM or GPU is still open.
 - [ ] `pip install -e .[dev,tb]` with torch ≤ 2.14 (cu126). Check `torch.cuda.get_arch_list()` includes sm_60.
-- [ ] `pytest`: all tests are ROM-free (gridworld fake console). Fix whatever the first run turns up.
-- [ ] `python -m pokeio train --spec games/gridworld/spec.yaml --config configs/smoke.yaml`; open the wall on :8600.
+- [ ] `pytest` on the training box (32 pass on the laptop; all ROM-free).
+- [x] `python -m pokeio train --spec games/gridworld/spec.yaml --config configs/smoke.yaml`; open the wall on :8600 (laptop: ~650 sps CPU, all 3 milestones in ~6k steps).
 - [ ] Yellow ROM in `roms/`. Run `python -m pokeio make-state --spec games/pokemon_yellow/spec.yaml`, then check `roms/yellow_newgame.png`.
 - [ ] `python -m pokeio probe --spec games/pokemon_yellow/spec.yaml`. Confirm the `[D]` addresses: HP/max HP plausible after getting Pikachu, options byte = text speed, Pokédex popcount 0 then 1. Calibrate `player_cell_px` from `probe/start_obs.png`.
 - [ ] Build `roms/pokeyellow.sym` (pret/pokeyellow `make`) to enable `wait_while` text skipping.

@@ -264,20 +264,26 @@ class LiveHub:
             }
 
     def snapshot_live(self, since: int = 0) -> dict:
+        return self._live(since, consume_flash=True, max_hero=120)
+
+    def _live(self, since: int, consume_flash: bool, max_hero: int) -> dict:
         with self.lock:
             wall = {}
             for e, f in self.frames.items():
                 wall[e] = {**{k: v for k, v in f.items() if k != "pix"}, "pix": _b64(f["pix"])}
-                f.pop("flash", None)
+                if consume_flash:
+                    f.pop("flash", None)
             hero = [{**{k: v for k, v in r.items() if k != "pix"}, "pix": _b64(r["pix"])}
                     for r in self.hero_ring if r["seq"] > since]
             return {"global_step": self.global_step, "sps": self.sps, "hero": self.hero,
-                    "follow": self.follow_frontier, "wall": wall, "hero_frames": hero[-120:],
+                    "follow": self.follow_frontier, "wall": wall, "hero_frames": hero[-max_hero:],
                     "saliency": self.saliency, "status": self.status}
 
     def save(self) -> None:
-        """Persist the state snapshot so `python -m pokeio dash --run` can show it offline."""
+        """Persist the state snapshot so `python -m pokeio dash --run` can show it offline,
+        plus the last wall frames and a short focus-agent replay (~4 KB per frame)."""
         snap = self.snapshot_state()
+        snap["live"] = self._live(0, consume_flash=False, max_hero=60)
         tmp = self.run_dir / "dash_state.json.tmp"
         with open(tmp, "w") as f:
             json.dump(snap, f)

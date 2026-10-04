@@ -11,8 +11,9 @@ measure what the *policy* can do from scratch:
   * optional ``blind`` mode zeroes the screen channel. If milestone rates don't
     drop, the policy isn't using vision (the failure mode of pokeIO v1).
 
-With ``workers > 0`` the env count is ``workers * (episodes // workers)`` and
-cells/rooms means are omitted (they're read from in-process envs).
+With ``workers > 0`` the env count is ``workers * (episodes // workers)``.
+Cells/rooms are counted from each step's ``aux`` (room, x, y), so they work
+for in-process and worker envs alike; specs without a position report none.
 """
 
 from __future__ import annotations
@@ -67,7 +68,7 @@ def evaluate(
     n = vec.num_envs
     reached: list[dict[str, int]] = [dict() for _ in range(n)]
     returns = np.zeros(n)
-    last_ep: list[dict] = [{} for _ in range(n)]
+    seen: list[set[tuple[int, int, int]]] = [set() for _ in range(n)]
     dev = torch.device(device)
     H, C = policy.initial_state(n, dev)
     starts = torch.ones(n, device=dev)
@@ -80,8 +81,9 @@ def evaluate(
             for info in b.infos:
                 for m, s in info.get("milestones", {}).items():
                     reached[info["env_id"]].setdefault(m, s)
-                if "episode" in info:
-                    last_ep[info["env_id"]] = info["episode"]
+            for i, aux in zip(ids, b.obs["aux"]):
+                if aux[0] >= 0:
+                    seen[i].add((int(aux[0]), int(aux[1]), int(aux[2])))
             obs = {k: torch.from_numpy(b.obs[k]).to(dev) for k in POLICY_KEYS}
             if blind:
                 obs["pixels"][:, 0] = 0
@@ -92,8 +94,6 @@ def evaluate(
             starts[idt] = 0
             a = logits.argmax(-1) if greedy else torch.distributions.Categorical(logits=logits).sample()
             vec.send(a.cpu().numpy().astype(np.int32), ids)
-        if hasattr(vec, "envs"):
-            last_ep = [e.episode_stats() for e in vec.envs]
     finally:
         vec.close()
 
@@ -109,10 +109,9 @@ def evaluate(
             "median_steps": float(np.median(when)) if when else None,
         }
     out["return_mean"] = float(returns.mean())
-    for k in ("cells", "rooms"):
-        vals = [e[k] for e in last_ep if k in e]
-        if vals:
-            out[f"{k}_mean"] = float(np.mean(vals))
+    if any(seen):
+        out["cells_mean"] = float(np.mean([len(c) for c in seen]))
+        out["rooms_mean"] = float(np.mean([len({r for r, _, _ in c}) for c in seen]))
     return out
 
 
@@ -121,8 +120,10 @@ def print_report(r: dict) -> None:
     for m, d in r["milestones"].items():
         ms = "-" if d["median_steps"] is None else f"{d['median_steps']:.0f}"
         print(f"  {m:28s} {d['rate']*100:5.1f}%  [{d['ci95'][0]*100:4.0f},{d['ci95'][1]*100:4.0f}]  median {ms}")
-    print(f"  return {r['return_mean']:.2f}  cells {r.get('cells_mean', float('nan')):.0f}  "
-          f"rooms {r.get('rooms_mean', float('nan')):.1f}")
+    line = f"  return {r['return_mean']:.2f}"
+    if "cells_mean" in r:
+        line += f"  cells {r['cells_mean']:.0f}  rooms {r['rooms_mean']:.1f}"
+    print(line)
 
 
 def save_report(r: dict, path: str | Path) -> None:

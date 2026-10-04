@@ -449,9 +449,11 @@ class Trainer:
         self.ep_stats.clear()
         self.logger.log(self.global_step, data)
         firsts = ", ".join(f"{m}@{s:.2e}" for m, s in sorted(self.milestone_first.items(), key=lambda x: x[1]))
+        ret = f"{data['episode/return']:8.2f}" if "episode/return" in data else f"{'-':>8}"
+        cells = f"{data['episode/cells']:6.0f}" if "episode/cells" in data else f"{'-':>6}"
         print(
             f"upd {self.update_i:5d} | step {self.global_step:.3e} | sps {sps:7.0f} | "
-            f"ret {data.get('episode/return', float('nan')):8.2f} | cells {data.get('episode/cells', float('nan')):6.0f} | "
+            f"ret {ret} | cells {cells} | "
             f"kl {stats.get('approx_kl', 0):.4f} | ev {stats.get('explained_variance', 0):+.2f} | "
             f"swarm {self.swarm.migrations} | {firsts}",
             flush=True,
